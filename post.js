@@ -28,22 +28,18 @@ function dataResult (o) {
 }
 
 
-var seedlength	= 512;
-var seed		= dataAllocate(crypto.getRandomValues(new Uint8Array(seedlength)));
-Module.ccall('init', 'number', ['number', 'number'], [dataArgument(seed), seedlength]);
-dataResult(seed);
+Module.ccall('randombytes_stir', 'void');
 
 
-var keypair	= Module.cwrap('keypair', 'number', ['number', 'number']);
-var encrypt	= Module.cwrap('encrypt', 'number', ['number', 'number', 'number', 'number', 'number']);
-var decrypt	= Module.cwrap('decrypt', 'number', ['number', 'number', 'number', 'number', 'number']);
+var keypair	= Module.cwrap('sphincsjs_keypair', 'number', ['number', 'number']);
+var sign	= Module.cwrap('sphincsjs_sign', 'number', ['number', 'number', 'number', 'number', 'number']);
+var open	= Module.cwrap('sphincsjs_open', 'number', ['number', 'number', 'number', 'number', 'number']);
 
 
 var sphincs	= {
-	publicKeyLength: Module.ccall('publen', 'number'),
-	privateKeyLength: Module.ccall('privlen', 'number'),
-	encryptedDataLength: Module.ccall('enclen', 'number'),
-	decryptedDataLength: Module.ccall('declen', 'number'),
+	publicKeyLength: Module.ccall('sphincsjs_public_key_bytes', 'number'),
+	privateKeyLength: Module.ccall('sphincsjs_secret_key_bytes', 'number'),
+	signatureLength: Module.ccall('sphincsjs_signature_bytes', 'number'),
 
 	keyPair: function () {
 		var pub		= dataAllocate(sphincs.publicKeyLength);
@@ -59,50 +55,41 @@ var sphincs	= {
 			privateKey: dataResult(priv)
 		});
 	},
-	encrypt: function (message, publicKey) {
-		var msg	= dataAllocate(message);
-		var pub	= dataAllocate(publicKey);
-		var enc	= dataAllocate(sphincs.encryptedDataLength);
+	sign: function (message, privateKey) {
+		var msg		= dataAllocate(message);
+		var priv	= dataAllocate(privateKey);
+		var signed	= dataAllocate(msg.data.length + sphincs.signatureLength);
 
-		var returnValue	= encrypt(
+		var returnValue	= sign(
+			dataArgument(signed),
+			signed.data.length,
 			dataArgument(msg),
 			msg.data.length,
-			dataArgument(pub),
-			pub.data.length,
-			dataArgument(enc)
+			dataArgument(priv)
 		);
 
 		dataResult(msg);
-		dataResult(pub);
-
-		return dataReturn(returnValue, dataResult(enc));
-	},
-	decrypt: function (message, privateKey) {
-		var enc		= dataAllocate(message);
-		var priv	= dataAllocate(privateKey);
-		var dec		= dataAllocate(sphincs.decryptedDataLength);
-
-		var returnValue	= decrypt(
-			dataArgument(enc),
-			enc.data.length,
-			dataArgument(priv),
-			priv.data.length,
-			dataArgument(dec)
-		);
-
-		dataResult(enc);
 		dataResult(priv);
 
-		if (returnValue >= 0) {
-			return new Uint8Array(
-				dataResult(dec).buffer,
-				0,
-				returnValue
-			);
-		}
-		else {
-			dataReturn(-returnValue);
-		}
+		return dataReturn(returnValue, dataResult(signed));
+	},
+	open: function (message, publicKey) {
+		var signed	= dataAllocate(message);
+		var pub		= dataAllocate(publicKey);
+		var opened	= dataAllocate(signed.data.length - sphincs.signatureLength);
+
+		var returnValue	= open(
+			dataArgument(opened),
+			opened.data.length,
+			dataArgument(signed),
+			signed.data.length,
+			dataArgument(pub)
+		);
+
+		dataResult(signed);
+		dataResult(pub);
+
+		return dataReturn(returnValue, dataResult(opened));
 	}
 };
 
