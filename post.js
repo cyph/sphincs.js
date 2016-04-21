@@ -17,7 +17,7 @@ function dataReturn (returnValue, result) {
 		return result;
 	}
 	else {
-		throw new Error('NTRU error: ' + returnValue);
+		throw new Error('SPHINCS error: ' + returnValue);
 	}
 }
 
@@ -39,15 +39,15 @@ var encrypt	= Module.cwrap('encrypt', 'number', ['number', 'number', 'number', '
 var decrypt	= Module.cwrap('decrypt', 'number', ['number', 'number', 'number', 'number', 'number']);
 
 
-var ntru	= {
+var sphincs	= {
 	publicKeyLength: Module.ccall('publen', 'number'),
 	privateKeyLength: Module.ccall('privlen', 'number'),
 	encryptedDataLength: Module.ccall('enclen', 'number'),
 	decryptedDataLength: Module.ccall('declen', 'number'),
 
 	keyPair: function () {
-		var pub		= dataAllocate(ntru.publicKeyLength);
-		var priv	= dataAllocate(ntru.privateKeyLength);
+		var pub		= dataAllocate(sphincs.publicKeyLength);
+		var priv	= dataAllocate(sphincs.privateKeyLength);
 
 		var returnValue	= keypair(
 			dataArgument(pub),
@@ -62,7 +62,7 @@ var ntru	= {
 	encrypt: function (message, publicKey) {
 		var msg	= dataAllocate(message);
 		var pub	= dataAllocate(publicKey);
-		var enc	= dataAllocate(ntru.encryptedDataLength);
+		var enc	= dataAllocate(sphincs.encryptedDataLength);
 
 		var returnValue	= encrypt(
 			dataArgument(msg),
@@ -80,7 +80,7 @@ var ntru	= {
 	decrypt: function (message, privateKey) {
 		var enc		= dataAllocate(message);
 		var priv	= dataAllocate(privateKey);
-		var dec		= dataAllocate(ntru.decryptedDataLength);
+		var dec		= dataAllocate(sphincs.decryptedDataLength);
 
 		var returnValue	= decrypt(
 			dataArgument(enc),
@@ -108,8 +108,8 @@ var ntru	= {
 
 
 
-return ntru;
+return sphincs;
 
 }());
 
-self.ntru	= ntru;
+self.sphincs	= sphincs;

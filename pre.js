@@ -1,1 +1,1 @@
-var ntru = (function () { 
+var sphincs = (function () { 

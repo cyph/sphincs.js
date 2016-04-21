@@ -1,15 +1,20 @@
 all:
-	rm -rf dist NTRUEncrypt 2> /dev/null
+	rm -rf dist sphincs 2> /dev/null
 	mkdir dist
-	git clone https://github.com/NTRUOpenSourceProject/NTRUEncrypt.git
+
+	wget http://hyperelliptic.org/ebats/supercop-20141124.tar.bz2
+	bunzip2 < supercop-20141124.tar.bz2 | tar -xf -
+	mv supercop-20141124/crypto_sign/sphincs256/ref sphincs
+	rm -rf supercop*
+
 	emcc -O3 --llvm-opts 0 --memory-init-file 0 \
-		-Dparams=NTRU_EES439EP1 \
 		-INTRUEncrypt/include -INTRUEncrypt/src \
-		NTRUEncrypt/src/*.c ntru.c \
+		NTRUEncrypt/src/*.c sphincs.c \
 		-s EXPORTED_FUNCTIONS="['_keypair', '_encrypt', '_decrypt', '_init', '_publen', '_privlen', '_enclen', '_declen']" \
 		--pre-js pre.js --post-js post.js \
-		-o dist/ntru.js
-	rm -rf NTRUEncrypt
+		-o dist/sphincs.js
+
+	rm -rf sphincs
 
 clean:
-	rm -rf dist NTRUEncrypt
+	rm -rf dist sphincs
