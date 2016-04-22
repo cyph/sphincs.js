@@ -1,17 +1,5 @@
 ;
 
-function dataAllocate (n) {
-	var data		= new Uint8Array(n);
-	var nDataBytes	= data.length * data.BYTES_PER_ELEMENT;
-	var dataHeap	= new Uint8Array(Module.HEAPU8.buffer, Module._malloc(nDataBytes), nDataBytes);
-	dataHeap.set(new Uint8Array(data.buffer));
-	return {data: data, dataHeap: dataHeap};
-}
-
-function dataArgument (o) {
-    return o.dataHeap.byteOffset;
-}
-
 function dataReturn (returnValue, result) {
 	if (returnValue === 0) {
 		return result;
@@ -21,75 +9,96 @@ function dataReturn (returnValue, result) {
 	}
 }
 
-function dataResult (o) {
-	var result	= new Uint8Array(o.dataHeap);
-	Module._free(o.dataHeap.byteOffset);
-	return result;
+function dataResult (buffer, bytes) {
+	return new Uint8Array(
+		new Uint8Array(Module.HEAPU8.buffer, buffer, bytes)
+	);
 }
 
 
-Module.ccall('randombytes_stir', 'void');
-
-
-var keypair	= Module.cwrap('sphincsjs_keypair', 'number', ['number', 'number']);
-var sign	= Module.cwrap('sphincsjs_sign', 'number', ['number', 'number', 'number', 'number', 'number']);
-var open	= Module.cwrap('sphincsjs_open', 'number', ['number', 'number', 'number', 'number', 'number']);
+Module._sodium_init();
 
 
 var sphincs	= {
-	publicKeyLength: Module.ccall('sphincsjs_public_key_bytes', 'number'),
-	privateKeyLength: Module.ccall('sphincsjs_secret_key_bytes', 'number'),
-	signatureLength: Module.ccall('sphincsjs_signature_bytes', 'number'),
+	publicKeyLength: Module._sphincsjs_public_key_bytes(),
+	privateKeyLength: Module._sphincsjs_secret_key_bytes(),
+	signatureLength: Module._sphincsjs_signature_bytes(),
 
 	keyPair: function () {
-		var pub		= dataAllocate(sphincs.publicKeyLength);
-		var priv	= dataAllocate(sphincs.privateKeyLength);
+		var publicKeyBuffer		= Module._malloc(sphincs.publicKeyLength);
+		var privateKeyBuffer	= Module._malloc(sphincs.privateKeyLength);
 
-		var returnValue	= keypair(
-			dataArgument(pub),
-			dataArgument(priv)
-		);
+		try {
+			var returnValue	= Module._crypto_sign_sphincs_keypair(
+				publicKeyBuffer,
+				privateKeyBuffer
+			);
 
-		return dataReturn(returnValue, {
-			publicKey: dataResult(pub),
-			privateKey: dataResult(priv)
-		});
+			return dataReturn(returnValue, {
+				publicKey: dataResult(publicKeyBuffer, sphincs.publicKeyLength),
+				privateKey: dataResult(privateKeyBuffer, sphincs.privateKeyLength)
+			});
+		}
+		finally {
+			Module._free(publicKeyBuffer);
+			Module._free(privateKeyBuffer);
+		}
 	},
+
 	sign: function (message, privateKey) {
-		var msg		= dataAllocate(message);
-		var priv	= dataAllocate(privateKey);
-		var signed	= dataAllocate(msg.data.length + sphincs.signatureLength);
+		var signedLength		= message.length + sphincs.signatureLength;
 
-		var returnValue	= sign(
-			dataArgument(signed),
-			signed.data.length,
-			dataArgument(msg),
-			msg.data.length,
-			dataArgument(priv)
-		);
+		var signedBuffer		= Module._malloc(signedLength);
+		var messageBuffer		= Module._malloc(message.length);
+		var privateKeyBuffer	= Module._malloc(privateKey.length);
 
-		dataResult(msg);
-		dataResult(priv);
+		Module.writeArrayToMemory(message, messageBuffer);
+		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
 
-		return dataReturn(returnValue, dataResult(signed));
+		try {
+			var returnValue	= Module._crypto_sign_sphincs(
+				signedBuffer,
+				0,
+				messageBuffer,
+				message.length,
+				privateKeyBuffer
+			);
+
+			return dataReturn(returnValue, dataResult(signedBuffer, signedLength));
+		}
+		finally {
+			Module._free(signedBuffer);
+			Module._free(messageBuffer);
+			Module._free(privateKeyBuffer);
+		}
 	},
-	open: function (message, publicKey) {
-		var signed	= dataAllocate(message);
-		var pub		= dataAllocate(publicKey);
-		var opened	= dataAllocate(signed.data.length - sphincs.signatureLength);
 
-		var returnValue	= open(
-			dataArgument(opened),
-			opened.data.length,
-			dataArgument(signed),
-			signed.data.length,
-			dataArgument(pub)
-		);
+	open: function (signed, publicKey) {
+		var openedLength	= signed.length - sphincs.signatureLength;
 
-		dataResult(signed);
-		dataResult(pub);
+		var openedBuffer	= Module._malloc(openedLength);
+		var signedBuffer	= Module._malloc(signed.length);
+		var publicKeyBuffer	= Module._malloc(publicKey.length);
 
-		return dataReturn(returnValue, dataResult(opened));
+		Module.writeArrayToMemory(signed, signedBuffer);
+		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
+
+		try {
+			var returnValue	= Module._crypto_sign_sphincs_open(
+				openedBuffer,
+				0,
+				signedBuffer,
+				signed.length,
+				publicKeyBuffer
+			);
+
+			return dataReturn(returnValue, dataResult(openedBuffer, openedLength));
+		}
+		finally {
+			Module._free(openedBuffer);
+			Module._free(signedBuffer);
+			Module._free(publicKeyBuffer);
+		}
 	}
 };
 
