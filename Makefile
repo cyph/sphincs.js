@@ -25,11 +25,9 @@ all:
 
 	sed -i 's|crypto_sign|crypto_sign_sphincs|g' c_src/crypto_sign/sphincs256/ref/sign.c
 	sed -i 's|crypto_sign_sphincs.h|crypto_sign.h|g' c_src/crypto_sign/sphincs256/ref/sign.c
-
-	# ls c_src/crypto_sign/sphincs256/ref/* | xargs -I% sed -i 's|CRYPTO_PUBLICKEYBYTES|SPHINCS_PUBLICKEYBYTES|g' %
-	# ls c_src/crypto_sign/sphincs256/ref/* | xargs -I% sed -i 's|CRYPTO_SECRETKEYBYTES|SPHINCS_SECRETKEYBYTES|g' %
-	# ls c_src/crypto_sign/sphincs256/ref/* | xargs -I% sed -i 's|CRYPTO_BYTES|SPHINCS_BYTES|g' %
-	# ls c_src/crypto_sign/sphincs256/ref/* | xargs -I% sed -i 's|blake512|blake256|g' %
+	cat c_src/crypto_sign/sphincs256/ref/sign.c | \
+		perl -pe 's/(crypto_sign_sphincs.*unsigned long )long ([a-z])/\1\2/g' > sphincs_sign.c.new
+	mv sphincs_sign.c.new c_src/crypto_sign/sphincs256/ref/sign.c
 
 	git clone https://github.com/ahf/sphincs.git erlang-binding
 	mv erlang-binding/c_src/crypto_core/templates c_src/
@@ -39,12 +37,12 @@ all:
 
 	bash -c ' \
 		args="$$(echo " \
-			--llvm-lto 1 --memory-init-file 0 \
-			-s TOTAL_MEMORY=35000000 -s RESERVED_FUNCTION_POINTERS=8 \
+			--memory-init-file 0 \
+			-s TOTAL_MEMORY=104900000 -s TOTAL_STACK=52443072 \
 			-s NO_DYNAMIC_EXECUTION=1 -s RUNNING_JS_OPTS=1 -s ASSERTIONS=0 \
 			-s AGGRESSIVE_VARIABLE_ELIMINATION=1 -s ALIASING_FUNCTION_POINTERS=1 \
 			-s FUNCTION_POINTER_ALIGNMENT=1 -s DISABLE_EXCEPTION_CATCHING=1 \
-			-s NO_FILESYSTEM=1 \
+			 -s RESERVED_FUNCTION_POINTERS=8 -s NO_FILESYSTEM=1 \
 			-Ilibsodium/src/libsodium/include/sodium \
 			-Iopenssl/include \
 			-Ic_src -Ic_src/include -Ic_src/templates -Ic_src/crypto_stream/chacha12/e/ref \
