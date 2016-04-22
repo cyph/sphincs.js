@@ -16,7 +16,7 @@ function dataResult (buffer, bytes) {
 }
 
 
-Module._sodium_init();
+Module._randombytes_stir();
 
 
 var sphincs	= {
@@ -49,6 +49,7 @@ var sphincs	= {
 		var signedLength		= message.length + sphincs.signatureLength;
 
 		var signedBuffer		= Module._malloc(signedLength);
+		// var signedLengthBuffer	= Module._malloc(256);
 		var messageBuffer		= Module._malloc(message.length);
 		var privateKeyBuffer	= Module._malloc(privateKey.length);
 
@@ -58,7 +59,7 @@ var sphincs	= {
 		try {
 			var returnValue	= Module._crypto_sign_sphincs(
 				signedBuffer,
-				0,
+				0, // signedLengthBuffer,
 				messageBuffer,
 				message.length,
 				privateKeyBuffer
@@ -68,6 +69,7 @@ var sphincs	= {
 		}
 		finally {
 			Module._free(signedBuffer);
+			// Module._free(signedLengthBuffer);
 			Module._free(messageBuffer);
 			Module._free(privateKeyBuffer);
 		}
@@ -77,6 +79,7 @@ var sphincs	= {
 		var openedLength	= signed.length - sphincs.signatureLength;
 
 		var openedBuffer	= Module._malloc(openedLength);
+		// var openedLengthBuffer	= Module._malloc(256);
 		var signedBuffer	= Module._malloc(signed.length);
 		var publicKeyBuffer	= Module._malloc(publicKey.length);
 
@@ -86,7 +89,7 @@ var sphincs	= {
 		try {
 			var returnValue	= Module._crypto_sign_sphincs_open(
 				openedBuffer,
-				0,
+				0, // openedLengthBuffer,
 				signedBuffer,
 				signed.length,
 				publicKeyBuffer
@@ -96,6 +99,7 @@ var sphincs	= {
 		}
 		finally {
 			Module._free(openedBuffer);
+			// Module._free(openedLengthBuffer);
 			Module._free(signedBuffer);
 			Module._free(publicKeyBuffer);
 		}
