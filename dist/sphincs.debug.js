@@ -19489,7 +19489,7 @@ var sphincs	= {
 
 		var signedBuffer		= Module._malloc(signedLength);
 		var messageBuffer		= Module._malloc(message.length);
-		var privateKeyBuffer	= Module._malloc(privateKey.length);
+		var privateKeyBuffer	= Module._malloc(sphincs.privateKeyLength);
 
 		Module.writeArrayToMemory(message, messageBuffer);
 		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
@@ -19512,12 +19512,20 @@ var sphincs	= {
 		}
 	},
 
+	signDetached: function (message, privateKey) {
+		return new Uint8Array(
+			sphincs.sign(message, privateKey).buffer,
+			0,
+			sphincs.signatureLength
+		);
+	},
+
 	open: function (signed, publicKey) {
 		var openedLength	= signed.length - sphincs.signatureLength;
 
 		var openedBuffer	= Module._malloc(openedLength);
 		var signedBuffer	= Module._malloc(signed.length);
-		var publicKeyBuffer	= Module._malloc(publicKey.length);
+		var publicKeyBuffer	= Module._malloc(sphincs.publicKeyLength);
 
 		Module.writeArrayToMemory(signed, signedBuffer);
 		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
@@ -19537,6 +19545,23 @@ var sphincs	= {
 			dataFree(openedBuffer);
 			dataFree(signedBuffer);
 			dataFree(publicKeyBuffer);
+		}
+	},
+
+	verifyDetached: function (signature, message, publicKey) {
+		var signed	= new Uint8Array(sphincs.signatureLength + message.length);
+		signed.set(signature);
+		signed.set(message, sphincs.signatureLength);
+
+		try {
+			sphincs.open(signed, publicKey);
+			return true; 
+		}
+		catch (_) {
+			return false;
+		}
+		finally {
+			dataFree(signed);
 		}
 	}
 };
