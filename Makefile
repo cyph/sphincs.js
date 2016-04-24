@@ -6,7 +6,7 @@ all:
 	cd libsodium ; emconfigure ./configure --enable-minimal --disable-shared
 
 	git clone -b OpenSSL_1_0_2-stable https://github.com/openssl/openssl.git
-	cd openssl ; emconfigure ./config
+	cd openssl ; emconfigure ./config no-asm no-threads no-shared no-dso no-sse2
 
 	wget http://hyperelliptic.org/ebats/supercop-20141124.tar.bz2
 	bunzip2 < supercop-20141124.tar.bz2 | tar -xf -

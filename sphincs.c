@@ -1,5 +1,6 @@
 #include "crypto_sign/sphincs256/ref/api.h"
 
+
 int sphincsjs_public_key_bytes () {
 	return CRYPTO_PUBLICKEYBYTES;
 }
