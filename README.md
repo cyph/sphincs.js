@@ -6,6 +6,10 @@ The [SPHINCS](https://sphincs.cr.yp.to) post-quantum cryptographic signing schem
 compiled to pure JavaScript using [Emscripten](https://github.com/kripken/emscripten).
 A simple wrapper is provided to make SPHINCS easy to use in Web applications.
 
+N.B. Unless interoperability with other SPHINCS implementations is a hard requirement,
+it is recommended to use [supersphincs.js](https://github.com/cyph/supersphincs.js)
+instead of this.
+
 ## Example Usage
 
 	var keyPair		= sphincs.keyPair();
