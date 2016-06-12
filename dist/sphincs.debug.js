@@ -1151,8 +1151,8 @@ function enlargeMemory() {
 }
 
 
-var TOTAL_STACK = Module['TOTAL_STACK'] || 52443072;
-var TOTAL_MEMORY = Module['TOTAL_MEMORY'] || 104900000;
+var TOTAL_STACK = Module['TOTAL_STACK'] || 13107200;
+var TOTAL_MEMORY = Module['TOTAL_MEMORY'] || 26214400;
 
 var totalMemory = 64*1024;
 while (totalMemory < TOTAL_MEMORY || totalMemory < 2*TOTAL_STACK) {
@@ -15472,17 +15472,17 @@ function _zerobytes($r,$0,$1) {
 function _sphincsjs_public_key_bytes() {
  var label = 0, sp = 0;
  sp = STACKTOP;
- return 1056; //@line 4 "sphincs.c"
+ return 1056; //@line 5 "sphincs.c"
 }
 function _sphincsjs_secret_key_bytes() {
  var label = 0, sp = 0;
  sp = STACKTOP;
- return 1088; //@line 8 "sphincs.c"
+ return 1088; //@line 9 "sphincs.c"
 }
 function _sphincsjs_signature_bytes() {
  var label = 0, sp = 0;
  sp = STACKTOP;
- return 41000; //@line 12 "sphincs.c"
+ return 41000; //@line 13 "sphincs.c"
 }
 function ___errno_location() {
  var $$0 = 0, $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, label = 0, sp = 0;
