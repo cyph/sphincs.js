@@ -12,11 +12,30 @@ instead of this.
 
 ## Example Usage
 
-	var keyPair		= sphincs.keyPair();
-	var message		= new Uint8Array([104, 101, 108, 108, 111, 0]); // "hello"
+	const keyPair /*: {privateKey: Uint8Array; publicKey: Uint8Array} */ =
+		sphincs.keyPair()
+	;
 
-	var signed		= sphincs.sign(message, keyPair.privateKey);
-	var verified	= sphincs.open(signed, keyPair.publicKey); // same as message
+	const message /*: Uint8Array */ =
+		new Uint8Array([104, 101, 108, 108, 111, 0]) // "hello"
+	;
+
+	/* Combined signatures */
+
+	const signed /*: Uint8Array */ =
+		sphincs.sign(message, keyPair.privateKey)
+	;
+
+	const verified /*: Uint8Array */ =
+		sphincs.open(signed, keyPair.publicKey) // same as message
+	;
+
+	/* Detached signatures */
 	
-	var signature	= sphincs.signDetached(message, keyPair.privateKey);
-	var isValid		= sphincs.verifyDetached(signature, message, keyPair.publicKey); // true
+	const signature /*: Uint8Array */ =
+		sphincs.signDetached(message, keyPair.privateKey)
+	;
+
+	const isValid /*: boolean */ =
+		sphincs.verifyDetached(signature, message, keyPair.publicKey) // true
+	;
