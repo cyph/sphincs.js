@@ -68,6 +68,8 @@ all:
 		bash -c "emcc -O0 -g4 $$args -o dist/sphincs.debug.js"; \
 	'
 
+	sed -i 's|require(|eval("require")(|g' dist/sphincs.js
+
 	rm -rf c_src libsodium openssl
 
 clean:
