@@ -18364,6 +18364,13 @@ return sphincs;
 
 }());
 
-self.sphincs	= sphincs;
+
+if (typeof module !== 'undefined' && module.exports) {
+	sphincs.sphincs	= sphincs;
+	module.exports	= sphincs;
+}
+else {
+	self.sphincs	= sphincs;
+}
 
 //# sourceMappingURL=sphincs.debug.js.map
