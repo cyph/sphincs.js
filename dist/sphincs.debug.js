@@ -140,6 +140,12 @@ else if (ENVIRONMENT_IS_SHELL) {
     Module['arguments'] = arguments;
   }
 
+  if (typeof quit === 'function') {
+    Module['quit'] = function(status, toThrow) {
+      quit(status);
+    }
+  }
+
 }
 else if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   Module['read'] = function read(url) {
@@ -148,6 +154,16 @@ else if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
     xhr.send(null);
     return xhr.responseText;
   };
+
+  if (ENVIRONMENT_IS_WORKER) {
+    Module['readBinary'] = function read(url) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, false);
+      xhr.responseType = 'arraybuffer';
+      xhr.send(null);
+      return xhr.response;
+    };
+  }
 
   Module['readAsync'] = function readAsync(url, onload, onerror) {
     var xhr = new XMLHttpRequest();
@@ -218,6 +234,11 @@ if (!Module['arguments']) {
 if (!Module['thisProgram']) {
   Module['thisProgram'] = './this.program';
 }
+if (!Module['quit']) {
+  Module['quit'] = function(status, toThrow) {
+    throw toThrow;
+  }
+}
 
 // *** Environment setup code ***
 
@@ -260,6 +281,7 @@ moduleOverrides = undefined;
 var Runtime = {
   setTempRet0: function (value) {
     tempRet0 = value;
+    return value;
   },
   getTempRet0: function () {
     return tempRet0;
@@ -736,7 +758,7 @@ Module["UTF8ToString"] = UTF8ToString;
 
 // Copies the given Javascript String object 'str' to the given byte array at address 'outIdx',
 // encoded in UTF8 form and null-terminated. The copy will require at most str.length*4+1 bytes of space in the HEAP.
-// Use the function lengthBytesUTF8() to compute the exact number of bytes (excluding null terminator) that this function will write.
+// Use the function lengthBytesUTF8 to compute the exact number of bytes (excluding null terminator) that this function will write.
 // Parameters:
 //   str: the Javascript string to copy.
 //   outU8Array: the array to copy to. Each index in this array is assumed to be one 8-byte element.
@@ -801,7 +823,7 @@ Module["stringToUTF8Array"] = stringToUTF8Array;
 
 // Copies the given Javascript String object 'str' to the emscripten HEAP at address 'outPtr',
 // null-terminated and encoded in UTF8 form. The copy will require at most str.length*4+1 bytes of space in the HEAP.
-// Use the function lengthBytesUTF8() to compute the exact number of bytes (excluding null terminator) that this function will write.
+// Use the function lengthBytesUTF8 to compute the exact number of bytes (excluding null terminator) that this function will write.
 // Returns the number of bytes written, EXCLUDING the null terminator.
 
 function stringToUTF8(str, outPtr, maxBytesToWrite) {
@@ -979,15 +1001,16 @@ function lengthBytesUTF32(str) {
 
 
 function demangle(func) {
-  var hasLibcxxabi = !!Module['___cxa_demangle'];
-  if (hasLibcxxabi) {
+  var __cxa_demangle_func = Module['___cxa_demangle'] || Module['__cxa_demangle'];
+  if (__cxa_demangle_func) {
     try {
-      var s = func.substr(1);
+      var s =
+        func.substr(1);
       var len = lengthBytesUTF8(s)+1;
       var buf = _malloc(len);
       stringToUTF8(s, buf, len);
       var status = _malloc(4);
-      var ret = Module['___cxa_demangle'](buf, 0, 0, status);
+      var ret = __cxa_demangle_func(buf, 0, 0, status);
       if (getValue(status, 'i32') === 0 && ret) {
         return Pointer_stringify(ret);
       }
@@ -1007,7 +1030,13 @@ function demangle(func) {
 }
 
 function demangleAll(text) {
-  return text.replace(/__Z[\w\d_]+/g, function(x) { var y = demangle(x); return x === y ? x : (x + ' [' + y + ']') });
+  var regex =
+    /__Z[\w\d_]+/g;
+  return text.replace(regex,
+    function(x) {
+      var y = demangle(x);
+      return x === y ? x : (x + ' [' + y + ']');
+    });
 }
 
 function jsStackTrace() {
@@ -1036,11 +1065,14 @@ Module["stackTrace"] = stackTrace;
 
 // Memory management
 
-var PAGE_SIZE = 4096;
+var PAGE_SIZE = 16384;
+var WASM_PAGE_SIZE = 65536;
+var ASMJS_PAGE_SIZE = 16777216;
+var MIN_TOTAL_MEMORY = 16777216;
 
-function alignMemoryPage(x) {
-  if (x % 4096 > 0) {
-    x += (4096 - (x % 4096));
+function alignUp(x, multiple) {
+  if (x % multiple > 0) {
+    x += multiple - (x % multiple);
   }
   return x;
 }
@@ -1085,20 +1117,7 @@ function enlargeMemory() {
 
 var TOTAL_STACK = Module['TOTAL_STACK'] || 8388608;
 var TOTAL_MEMORY = Module['TOTAL_MEMORY'] || 16777216;
-
-var WASM_PAGE_SIZE = 64 * 1024;
-
-var totalMemory = WASM_PAGE_SIZE;
-while (totalMemory < TOTAL_MEMORY || totalMemory < 2*TOTAL_STACK) {
-  if (totalMemory < 16*1024*1024) {
-    totalMemory *= 2;
-  } else {
-    totalMemory += 16*1024*1024;
-  }
-}
-if (totalMemory !== TOTAL_MEMORY) {
-  TOTAL_MEMORY = totalMemory;
-}
+if (TOTAL_MEMORY < TOTAL_STACK) Module.printErr('TOTAL_MEMORY should be larger than TOTAL_STACK, was ' + TOTAL_MEMORY + '! (TOTAL_STACK=' + TOTAL_STACK + ')');
 
 // Initialize the runtime's memory
 
@@ -1146,9 +1165,9 @@ function callRuntimeCallbacks(callbacks) {
     var func = callback.func;
     if (typeof func === 'number') {
       if (callback.arg === undefined) {
-        Runtime.dynCall('v', func);
+        Module['dynCall_v'](func);
       } else {
-        Runtime.dynCall('vi', func, [callback.arg]);
+        Module['dynCall_vi'](func, callback.arg);
       }
     } else {
       func(callback.arg === undefined ? null : callback.arg);
@@ -1274,7 +1293,7 @@ function writeStringToMemory(string, buffer, dontAddNull) {
 Module["writeStringToMemory"] = writeStringToMemory;
 
 function writeArrayToMemory(array, buffer) {
-  HEAP8.set(array, buffer);    
+  HEAP8.set(array, buffer);
 }
 Module["writeArrayToMemory"] = writeArrayToMemory;
 
@@ -1408,6 +1427,7 @@ var memoryInitializer = null;
 
 
 
+
 // === Body ===
 
 var ASM_CONSTS = [function() { { return Module.getRandomValue(); } },
@@ -1425,11 +1445,11 @@ function _emscripten_asm_const_v(code) {
 
 STATIC_BASE = 8;
 
-STATICTOP = STATIC_BASE + 2384;
+STATICTOP = STATIC_BASE + 2656;
   /* global initializers */  __ATINIT__.push();
   
 
-/* memory initializer */ allocate([211,8,163,133,136,106,63,36,68,115,112,3,46,138,25,19,208,49,159,41,34,56,9,164,137,108,78,236,152,250,46,8,119,19,208,56,230,33,40,69,108,12,233,52,207,102,84,190,221,80,124,201,183,41,172,192,23,9,71,181,181,213,132,63,27,251,121,137,217,213,22,146,172,181,223,152,166,11,49,209,183,223,26,208,219,114,253,47,150,126,38,106,237,175,225,184,153,127,44,241,69,144,124,186,247,108,145,179,71,153,161,36,22,252,142,133,226,242,1,8,105,78,87,113,216,32,105,99,136,106,63,36,211,8,163,133,46,138,25,19,68,115,112,3,34,56,9,164,208,49,159,41,152,250,46,8,137,108,78,236,230,33,40,69,119,19,208,56,207,102,84,190,108,12,233,52,183,41,172,192,221,80,124,201,181,213,132,63,23,9,71,181,6,7,0,0,123,32,114,101,116,117,114,110,32,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,40,41,59,32,125,0,123,32,105,102,32,40,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,32,61,61,61,32,117,110,100,101,102,105,110,101,100,41,32,123,32,116,114,121,32,123,32,118,97,114,32,119,105,110,100,111,119,95,32,61,32,34,111,98,106,101,99,116,34,32,61,61,61,32,116,121,112,101,111,102,32,119,105,110,100,111,119,32,63,32,119,105,110,100,111,119,32,58,32,115,101,108,102,44,32,99,114,121,112,116,111,95,32,61,32,116,121,112,101,111,102,32,119,105,110,100,111,119,95,46,99,114,121,112,116,111,32,33,61,61,32,34,117,110,100,101,102,105,110,101,100,34,32,63,32,119,105,110,100,111,119,95,46,99,114,121,112,116,111,32,58,32,119,105,110,100,111,119,95,46,109,115,67,114,121,112,116,111,44,32,114,97,110,100,111,109,86,97,108,117,101,115,83,116,97,110,100,97,114,100,32,61,32,102,117,110,99,116,105,111,110,40,41,32,123,32,118,97,114,32,98,117,102,32,61,32,110,101,119,32,85,105,110,116,51,50,65,114,114,97,121,40,49,41,59,32,99,114,121,112,116,111,95,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,115,40,98,117,102,41,59,32,114,101,116,117,114,110,32,98,117,102,91,48,93,32,62,62,62,32,48,59,32,125,59,32,114,97,110,100,111,109,86,97,108,117,101,115,83,116,97,110,100,97,114,100,40,41,59,32,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,32,61,32,114,97,110,100,111,109,86,97,108,117,101,115,83,116,97,110,100,97,114,100,59,32,125,32,99,97,116,99,104,32,40,101,41,32,123,32,116,114,121,32,123,32,118,97,114,32,99,114,121,112,116,111,32,61,32,114,101,113,117,105,114,101,40,39,99,114,121,112,116,111,39,41,44,32,114,97,110,100,111,109,86,97,108,117,101,78,111,100,101,74,83,32,61,32,102,117,110,99,116,105,111,110,40,41,32,123,32,118,97,114,32,98,117,102,32,61,32,99,114,121,112,116,111,46,114,97,110,100,111,109,66,121,116,101,115,40,52,41,59,32,114,101,116,117,114,110,32,40,98,117,102,91,48,93,32,60,60,32,50,52,32,124,32,98,117,102,91,49,93,32,60,60,32,49,54,32,124,32,98,117,102,91,50,93,32,60,60,32,56,32,124,32,98,117,102,91,51,93,41,32,62,62,62,32,48,59,32,125,59,32,114,97,110,100,111,109,86,97,108,117,101,78,111,100,101,74,83,40,41,59,32,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,32,61,32,114,97,110,100,111,109,86,97,108,117,101,78,111,100,101,74,83,59,32,125,32,99,97,116,99,104,32,40,101,41,32,123,32,116,104,114,111,119,32,39,78,111,32,115,101,99,117,114,101,32,114,97,110,100,111,109,32,110,117,109,98,101,114,32,103,101,110,101,114,97,116,111,114,32,102,111,117,110,100,39,59,32,125,32,125,32,125,32,125,0,98,117,102,95,108,101,110,32,60,61,32,83,73,90,69,95,77,65,88,0,108,105,98,115,111,100,105,117,109,47,115,114,99,47,108,105,98,115,111,100,105,117,109,47,114,97,110,100,111,109,98,121,116,101,115,47,114,97,110,100,111,109,98,121,116,101,115,46,99,0,114,97,110,100,111,109,98,121,116,101,115,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13,2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9,12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11,13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10,6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5,10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13,2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9,12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11,13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10,6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5,10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13,2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9,12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11,13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10,6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5,10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,101,120,112,97,110,100,32,49,54,45,98,121,116,101,32,107,101,120,112,97,110,100,32,51,50,45,98,121,116,101,32,107,101,120,112,97,110,100,32,51,50,45,98,121,116,101,32,116,111,32,54,52,45,98,121,116,101,32,115,116,97,116,101,33,0], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE);
+/* memory initializer */ allocate([211,8,163,133,136,106,63,36,68,115,112,3,46,138,25,19,208,49,159,41,34,56,9,164,137,108,78,236,152,250,46,8,119,19,208,56,230,33,40,69,108,12,233,52,207,102,84,190,221,80,124,201,183,41,172,192,23,9,71,181,181,213,132,63,27,251,121,137,217,213,22,146,172,181,223,152,166,11,49,209,183,223,26,208,219,114,253,47,150,126,38,106,237,175,225,184,153,127,44,241,69,144,124,186,247,108,145,179,71,153,161,36,22,252,142,133,226,242,1,8,105,78,87,113,216,32,105,99,136,106,63,36,211,8,163,133,46,138,25,19,68,115,112,3,34,56,9,164,208,49,159,41,152,250,46,8,137,108,78,236,230,33,40,69,119,19,208,56,207,102,84,190,108,12,233,52,183,41,172,192,221,80,124,201,181,213,132,63,23,9,71,181,250,7,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,72,8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,123,32,114,101,116,117,114,110,32,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,40,41,59,32,125,0,123,32,105,102,32,40,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,32,61,61,61,32,117,110,100,101,102,105,110,101,100,41,32,123,32,116,114,121,32,123,32,118,97,114,32,119,105,110,100,111,119,95,32,61,32,34,111,98,106,101,99,116,34,32,61,61,61,32,116,121,112,101,111,102,32,119,105,110,100,111,119,32,63,32,119,105,110,100,111,119,32,58,32,115,101,108,102,44,32,99,114,121,112,116,111,95,32,61,32,116,121,112,101,111,102,32,119,105,110,100,111,119,95,46,99,114,121,112,116,111,32,33,61,61,32,34,117,110,100,101,102,105,110,101,100,34,32,63,32,119,105,110,100,111,119,95,46,99,114,121,112,116,111,32,58,32,119,105,110,100,111,119,95,46,109,115,67,114,121,112,116,111,44,32,114,97,110,100,111,109,86,97,108,117,101,115,83,116,97,110,100,97,114,100,32,61,32,102,117,110,99,116,105,111,110,40,41,32,123,32,118,97,114,32,98,117,102,32,61,32,110,101,119,32,85,105,110,116,51,50,65,114,114,97,121,40,49,41,59,32,99,114,121,112,116,111,95,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,115,40,98,117,102,41,59,32,114,101,116,117,114,110,32,98,117,102,91,48,93,32,62,62,62,32,48,59,32,125,59,32,114,97,110,100,111,109,86,97,108,117,101,115,83,116,97,110,100,97,114,100,40,41,59,32,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,32,61,32,114,97,110,100,111,109,86,97,108,117,101,115,83,116,97,110,100,97,114,100,59,32,125,32,99,97,116,99,104,32,40,101,41,32,123,32,116,114,121,32,123,32,118,97,114,32,99,114,121,112,116,111,32,61,32,114,101,113,117,105,114,101,40,39,99,114,121,112,116,111,39,41,44,32,114,97,110,100,111,109,86,97,108,117,101,78,111,100,101,74,83,32,61,32,102,117,110,99,116,105,111,110,40,41,32,123,32,118,97,114,32,98,117,102,32,61,32,99,114,121,112,116,111,46,114,97,110,100,111,109,66,121,116,101,115,40,52,41,59,32,114,101,116,117,114,110,32,40,98,117,102,91,48,93,32,60,60,32,50,52,32,124,32,98,117,102,91,49,93,32,60,60,32,49,54,32,124,32,98,117,102,91,50,93,32,60,60,32,56,32,124,32,98,117,102,91,51,93,41,32,62,62,62,32,48,59,32,125,59,32,114,97,110,100,111,109,86,97,108,117,101,78,111,100,101,74,83,40,41,59,32,77,111,100,117,108,101,46,103,101,116,82,97,110,100,111,109,86,97,108,117,101,32,61,32,114,97,110,100,111,109,86,97,108,117,101,78,111,100,101,74,83,59,32,125,32,99,97,116,99,104,32,40,101,41,32,123,32,116,104,114,111,119,32,39,78,111,32,115,101,99,117,114,101,32,114,97,110,100,111,109,32,110,117,109,98,101,114,32,103,101,110,101,114,97,116,111,114,32,102,111,117,110,100,39,59,32,125,32,125,32,125,32,125,0,98,117,102,95,108,101,110,32,60,61,32,83,73,90,69,95,77,65,88,0,108,105,98,115,111,100,105,117,109,47,115,114,99,47,108,105,98,115,111,100,105,117,109,47,114,97,110,100,111,109,98,121,116,101,115,47,114,97,110,100,111,109,98,121,116,101,115,46,99,0,114,97,110,100,111,109,98,121,116,101,115,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13,2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9,12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11,13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10,6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5,10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13,2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9,12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11,13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10,6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5,10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3,11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4,7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8,9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13,2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9,12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11,13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10,6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5,10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0,128,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,101,120,112,97,110,100,32,51,50,45,98,121,116,101,32,107,101,120,112,97,110,100,32,49,54,45,98,121,116,101,32,107,101,120,112,97,110,100,32,51,50,45,98,121,116,101,32,116,111,32,54,52,45,98,121,116,101,32,115,116,97,116,101,33,0], "i8", ALLOC_NONE, Runtime.GLOBAL_BASE);
 
 
 
@@ -1542,9 +1562,6 @@ function copyTempDouble(ptr) {
   Module["___uremdi3"] = ___uremdi3;
 
   var _emscripten_asm_const_int=true;
-
-   
-  Module["_pthread_self"] = _pthread_self;
 DYNAMICTOP_PTR = allocate(1, "i32", ALLOC_STATIC);
 
 STACK_BASE = STACKTOP = Runtime.alignMemory(STATICTOP);
@@ -1561,7 +1578,7 @@ staticSealed = true; // seal the static portion of memory
 
 Module.asmGlobalArg = { "Math": Math, "Int8Array": Int8Array, "Int16Array": Int16Array, "Int32Array": Int32Array, "Uint8Array": Uint8Array, "Uint16Array": Uint16Array, "Uint32Array": Uint32Array, "Float32Array": Float32Array, "Float64Array": Float64Array, "NaN": NaN, "Infinity": Infinity };
 
-Module.asmLibraryArg = { "abort": abort, "assert": assert, "enlargeMemory": enlargeMemory, "getTotalMemory": getTotalMemory, "abortOnCannotGrowMemory": abortOnCannotGrowMemory, "_emscripten_asm_const_i": _emscripten_asm_const_i, "_abort": _abort, "___setErrNo": ___setErrNo, "_llvm_stacksave": _llvm_stacksave, "_emscripten_memcpy_big": _emscripten_memcpy_big, "_emscripten_asm_const_v": _emscripten_asm_const_v, "_llvm_stackrestore": _llvm_stackrestore, "___assert_fail": ___assert_fail, "STACKTOP": STACKTOP, "STACK_MAX": STACK_MAX, "DYNAMICTOP_PTR": DYNAMICTOP_PTR, "tempDoublePtr": tempDoublePtr, "ABORT": ABORT, "cttz_i8": cttz_i8 };
+Module.asmLibraryArg = { "abort": abort, "assert": assert, "enlargeMemory": enlargeMemory, "getTotalMemory": getTotalMemory, "abortOnCannotGrowMemory": abortOnCannotGrowMemory, "_emscripten_asm_const_i": _emscripten_asm_const_i, "_abort": _abort, "___setErrNo": ___setErrNo, "_llvm_stacksave": _llvm_stacksave, "_emscripten_memcpy_big": _emscripten_memcpy_big, "_emscripten_asm_const_v": _emscripten_asm_const_v, "_llvm_stackrestore": _llvm_stackrestore, "___assert_fail": ___assert_fail, "DYNAMICTOP_PTR": DYNAMICTOP_PTR, "tempDoublePtr": tempDoublePtr, "ABORT": ABORT, "STACKTOP": STACKTOP, "STACK_MAX": STACK_MAX, "cttz_i8": cttz_i8 };
 // EMSCRIPTEN_START_ASM
 var asm = (function(global, env, buffer) {
   'almost asm';
@@ -1577,11 +1594,11 @@ var asm = (function(global, env, buffer) {
   var HEAPF64 = new global.Float64Array(buffer);
 
 
-  var STACKTOP=env.STACKTOP|0;
-  var STACK_MAX=env.STACK_MAX|0;
   var DYNAMICTOP_PTR=env.DYNAMICTOP_PTR|0;
   var tempDoublePtr=env.tempDoublePtr|0;
   var ABORT=env.ABORT|0;
+  var STACKTOP=env.STACKTOP|0;
+  var STACK_MAX=env.STACK_MAX|0;
   var cttz_i8=env.cttz_i8|0;
 
   var __THREW__ = 0;
@@ -1670,14 +1687,14 @@ function getTempRet0() {
 function _randombytes_random() {
  var $0 = 0, label = 0, sp = 0;
  sp = STACKTOP;
- $0 = _emscripten_asm_const_i(0)|0; //@line 70 "libsodium/src/libsodium/randombytes/randombytes.c"
- return ($0|0); //@line 70 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $0 = _emscripten_asm_const_i(0)|0; //@line 78 "libsodium/src/libsodium/randombytes/randombytes.c"
+ return ($0|0); //@line 78 "libsodium/src/libsodium/randombytes/randombytes.c"
 }
 function _randombytes_stir() {
  var label = 0, sp = 0;
  sp = STACKTOP;
- _emscripten_asm_const_v(1); //@line 85 "libsodium/src/libsodium/randombytes/randombytes.c"
- return; //@line 113 "libsodium/src/libsodium/randombytes/randombytes.c"
+ _emscripten_asm_const_v(1); //@line 93 "libsodium/src/libsodium/randombytes/randombytes.c"
+ return; //@line 121 "libsodium/src/libsodium/randombytes/randombytes.c"
 }
 function _randombytes_buf($0,$1) {
  $0 = $0|0;
@@ -1687,27 +1704,27 @@ function _randombytes_buf($0,$1) {
  STACKTOP = STACKTOP + 16|0;
  $2 = $0;
  $3 = $1;
- $6 = $2; //@line 151 "libsodium/src/libsodium/randombytes/randombytes.c"
- $4 = $6; //@line 151 "libsodium/src/libsodium/randombytes/randombytes.c"
- $5 = 0; //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $6 = $2; //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $4 = $6; //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $5 = 0; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
  while(1) {
-  $7 = $5; //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $8 = $3; //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $9 = ($7>>>0)<($8>>>0); //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $7 = $5; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $8 = $3; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $9 = ($7>>>0)<($8>>>0); //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
   if (!($9)) {
    break;
   }
-  $10 = (_randombytes_random()|0); //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $11 = $10&255; //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $12 = $5; //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $13 = $4; //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $14 = (($13) + ($12)|0); //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
-  HEAP8[$14>>0] = $11; //@line 155 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $15 = $5; //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $16 = (($15) + 1)|0; //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $5 = $16; //@line 154 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $10 = (_randombytes_random()|0); //@line 159 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $11 = $10&255; //@line 159 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $12 = $4; //@line 159 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $13 = $5; //@line 159 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $14 = (($12) + ($13)|0); //@line 159 "libsodium/src/libsodium/randombytes/randombytes.c"
+  HEAP8[$14>>0] = $11; //@line 159 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $15 = $5; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $16 = (($15) + 1)|0; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $5 = $16; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
  }
- STACKTOP = sp;return; //@line 158 "libsodium/src/libsodium/randombytes/randombytes.c"
+ STACKTOP = sp;return; //@line 162 "libsodium/src/libsodium/randombytes/randombytes.c"
 }
 function _randombytes($0,$1,$2) {
  $0 = $0|0;
@@ -1725,30 +1742,30 @@ function _randombytes($0,$1,$2) {
  $7 = (($5) + 4)|0;
  $8 = $7;
  HEAP32[$8>>2] = $2;
- $9 = $4; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $10 = $9; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $11 = HEAP32[$10>>2]|0; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $12 = (($9) + 4)|0; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $13 = $12; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $14 = HEAP32[$13>>2]|0; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $15 = ($14>>>0)<(0); //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $16 = ($11>>>0)<=(4294967295); //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $17 = ($14|0)==(0); //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $18 = $17 & $16; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
- $19 = $15 | $18; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $9 = $4; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $10 = $9; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $11 = HEAP32[$10>>2]|0; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $12 = (($9) + 4)|0; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $13 = $12; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $14 = HEAP32[$13>>2]|0; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $15 = ($14>>>0)<(0); //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $16 = ($11>>>0)<=(4294967295); //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $17 = ($14|0)==(0); //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $18 = $17 & $16; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+ $19 = $15 | $18; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
  if ($19) {
-  $20 = $3; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $21 = $4; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $22 = $21; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $23 = HEAP32[$22>>2]|0; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $24 = (($21) + 4)|0; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $25 = $24; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  $26 = HEAP32[$25>>2]|0; //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  _randombytes_buf($20,$23); //@line 173 "libsodium/src/libsodium/randombytes/randombytes.c"
-  STACKTOP = sp;return; //@line 174 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $20 = $3; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $21 = $4; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $22 = $21; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $23 = HEAP32[$22>>2]|0; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $24 = (($21) + 4)|0; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $25 = $24; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  $26 = HEAP32[$25>>2]|0; //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  _randombytes_buf($20,$23); //@line 201 "libsodium/src/libsodium/randombytes/randombytes.c"
+  STACKTOP = sp;return; //@line 202 "libsodium/src/libsodium/randombytes/randombytes.c"
  } else {
-  ___assert_fail((947|0),(967|0),172,(1017|0)); //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
-  // unreachable; //@line 172 "libsodium/src/libsodium/randombytes/randombytes.c"
+  ___assert_fail((1191|0),(1211|0),200,(1261|0)); //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
+  // unreachable; //@line 200 "libsodium/src/libsodium/randombytes/randombytes.c"
  }
 }
 function _blake256_compress($0,$1) {
@@ -1803,7 +1820,7 @@ function _blake256_compress($0,$1) {
  var $929 = 0, $93 = 0, $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0, $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0;
  var $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0, $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0;
  var $965 = 0, $966 = 0, $967 = 0, $968 = 0, $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0, $974 = 0, $975 = 0, $976 = 0, $977 = 0, $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0;
- var $983 = 0, $984 = 0, $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, $994 = 0, label = 0, sp = 0;
+ var $983 = 0, $984 = 0, $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 144|0;
  $4 = sp + 72|0;
@@ -1861,12 +1878,12 @@ function _blake256_compress($0,$1) {
  while(1) {
   $46 = $6; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
   $47 = ($46>>>0)<(8); //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
+  $48 = $2;
   if (!($47)) {
    break;
   }
-  $48 = $6; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
-  $49 = $2; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
-  $50 = (($49) + ($48<<2)|0); //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
+  $49 = $6; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
+  $50 = (($48) + ($49<<2)|0); //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
   $51 = HEAP32[$50>>2]|0; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
   $52 = $6; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
   $53 = (($4) + ($52<<2)|0); //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
@@ -1875,1045 +1892,1044 @@ function _blake256_compress($0,$1) {
   $55 = (($54) + 1)|0; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
   $6 = $55; //@line 71 "c_src/crypto_hash/blake256/ref/hash.c"
  }
- $56 = $2; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
- $57 = ((($56)) + 32|0); //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
- $58 = HEAP32[$57>>2]|0; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
- $59 = $58 ^ 608135816; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
- $60 = ((($4)) + 32|0); //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$60>>2] = $59; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
- $61 = $2; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- $62 = ((($61)) + 32|0); //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- $63 = ((($62)) + 4|0); //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- $64 = HEAP32[$63>>2]|0; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- $65 = $64 ^ -2052912941; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- $66 = ((($4)) + 36|0); //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$66>>2] = $65; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
- $67 = $2; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- $68 = ((($67)) + 32|0); //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- $69 = ((($68)) + 8|0); //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- $70 = HEAP32[$69>>2]|0; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- $71 = $70 ^ 320440878; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- $72 = ((($4)) + 40|0); //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$72>>2] = $71; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
- $73 = $2; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- $74 = ((($73)) + 32|0); //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- $75 = ((($74)) + 12|0); //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- $76 = HEAP32[$75>>2]|0; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- $77 = $76 ^ 57701188; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- $78 = ((($4)) + 44|0); //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$78>>2] = $77; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
- $79 = ((($4)) + 48|0); //@line 76 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$79>>2] = -1542899678; //@line 76 "c_src/crypto_hash/blake256/ref/hash.c"
- $80 = ((($4)) + 52|0); //@line 77 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$80>>2] = 698298832; //@line 77 "c_src/crypto_hash/blake256/ref/hash.c"
- $81 = ((($4)) + 56|0); //@line 78 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$81>>2] = 137296536; //@line 78 "c_src/crypto_hash/blake256/ref/hash.c"
- $82 = ((($4)) + 60|0); //@line 79 "c_src/crypto_hash/blake256/ref/hash.c"
- HEAP32[$82>>2] = -330404727; //@line 79 "c_src/crypto_hash/blake256/ref/hash.c"
- $83 = $2; //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
- $84 = ((($83)) + 60|0); //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
- $85 = HEAP32[$84>>2]|0; //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
- $86 = ($85|0)==(0); //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
- if ($86) {
-  $87 = $2; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  $88 = ((($87)) + 48|0); //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  $89 = HEAP32[$88>>2]|0; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  $90 = ((($4)) + 48|0); //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  $91 = HEAP32[$90>>2]|0; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  $92 = $91 ^ $89; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$90>>2] = $92; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
-  $93 = $2; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  $94 = ((($93)) + 48|0); //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  $95 = HEAP32[$94>>2]|0; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  $96 = ((($4)) + 52|0); //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  $97 = HEAP32[$96>>2]|0; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  $98 = $97 ^ $95; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$96>>2] = $98; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
-  $99 = $2; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $100 = ((($99)) + 48|0); //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $101 = ((($100)) + 4|0); //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $102 = HEAP32[$101>>2]|0; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $103 = ((($4)) + 56|0); //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $104 = HEAP32[$103>>2]|0; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $105 = $104 ^ $102; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$103>>2] = $105; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
-  $106 = $2; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  $107 = ((($106)) + 48|0); //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  $108 = ((($107)) + 4|0); //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  $109 = HEAP32[$108>>2]|0; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  $110 = ((($4)) + 60|0); //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  $111 = HEAP32[$110>>2]|0; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  $112 = $111 ^ $109; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$110>>2] = $112; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+ $56 = ((($48)) + 32|0); //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
+ $57 = HEAP32[$56>>2]|0; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
+ $58 = $57 ^ 608135816; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
+ $59 = ((($4)) + 32|0); //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$59>>2] = $58; //@line 72 "c_src/crypto_hash/blake256/ref/hash.c"
+ $60 = $2; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ $61 = ((($60)) + 32|0); //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ $62 = ((($61)) + 4|0); //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ $63 = HEAP32[$62>>2]|0; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ $64 = $63 ^ -2052912941; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ $65 = ((($4)) + 36|0); //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$65>>2] = $64; //@line 73 "c_src/crypto_hash/blake256/ref/hash.c"
+ $66 = $2; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ $67 = ((($66)) + 32|0); //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ $68 = ((($67)) + 8|0); //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ $69 = HEAP32[$68>>2]|0; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ $70 = $69 ^ 320440878; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ $71 = ((($4)) + 40|0); //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$71>>2] = $70; //@line 74 "c_src/crypto_hash/blake256/ref/hash.c"
+ $72 = $2; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ $73 = ((($72)) + 32|0); //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ $74 = ((($73)) + 12|0); //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ $75 = HEAP32[$74>>2]|0; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ $76 = $75 ^ 57701188; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ $77 = ((($4)) + 44|0); //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$77>>2] = $76; //@line 75 "c_src/crypto_hash/blake256/ref/hash.c"
+ $78 = ((($4)) + 48|0); //@line 76 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$78>>2] = -1542899678; //@line 76 "c_src/crypto_hash/blake256/ref/hash.c"
+ $79 = ((($4)) + 52|0); //@line 77 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$79>>2] = 698298832; //@line 77 "c_src/crypto_hash/blake256/ref/hash.c"
+ $80 = ((($4)) + 56|0); //@line 78 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$80>>2] = 137296536; //@line 78 "c_src/crypto_hash/blake256/ref/hash.c"
+ $81 = ((($4)) + 60|0); //@line 79 "c_src/crypto_hash/blake256/ref/hash.c"
+ HEAP32[$81>>2] = -330404727; //@line 79 "c_src/crypto_hash/blake256/ref/hash.c"
+ $82 = $2; //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
+ $83 = ((($82)) + 60|0); //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
+ $84 = HEAP32[$83>>2]|0; //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
+ $85 = ($84|0)==(0); //@line 80 "c_src/crypto_hash/blake256/ref/hash.c"
+ if ($85) {
+  $86 = $2; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  $87 = ((($86)) + 48|0); //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  $88 = HEAP32[$87>>2]|0; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  $89 = ((($4)) + 48|0); //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  $90 = HEAP32[$89>>2]|0; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  $91 = $90 ^ $88; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$89>>2] = $91; //@line 81 "c_src/crypto_hash/blake256/ref/hash.c"
+  $92 = $2; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  $93 = ((($92)) + 48|0); //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  $94 = HEAP32[$93>>2]|0; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  $95 = ((($4)) + 52|0); //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  $96 = HEAP32[$95>>2]|0; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  $97 = $96 ^ $94; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$95>>2] = $97; //@line 82 "c_src/crypto_hash/blake256/ref/hash.c"
+  $98 = $2; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $99 = ((($98)) + 48|0); //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $100 = ((($99)) + 4|0); //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $101 = HEAP32[$100>>2]|0; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $102 = ((($4)) + 56|0); //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $103 = HEAP32[$102>>2]|0; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $104 = $103 ^ $101; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$102>>2] = $104; //@line 83 "c_src/crypto_hash/blake256/ref/hash.c"
+  $105 = $2; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  $106 = ((($105)) + 48|0); //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  $107 = ((($106)) + 4|0); //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  $108 = HEAP32[$107>>2]|0; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  $109 = ((($4)) + 60|0); //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  $110 = HEAP32[$109>>2]|0; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  $111 = $110 ^ $108; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$109>>2] = $111; //@line 84 "c_src/crypto_hash/blake256/ref/hash.c"
  }
  $6 = 0; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
  while(1) {
-  $113 = $6; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
-  $114 = ($113>>>0)<(14); //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
-  if (!($114)) {
+  $112 = $6; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
+  $113 = ($112>>>0)<(14); //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
+  if (!($113)) {
    break;
   }
-  $115 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $116 = (1029 + ($115<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $117 = HEAP8[$116>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $118 = $117&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $119 = (($5) + ($118<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $120 = HEAP32[$119>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $121 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $122 = (1029 + ($121<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $123 = ((($122)) + 1|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $124 = HEAP8[$123>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $125 = $124&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $126 = (136 + ($125<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $127 = HEAP32[$126>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $128 = $120 ^ $127; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $129 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $130 = HEAP32[$129>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $131 = (($128) + ($130))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $132 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $133 = (($132) + ($131))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$4>>2] = $133; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $134 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $135 = HEAP32[$134>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $136 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $137 = $135 ^ $136; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $138 = $137 << 16; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $139 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $140 = HEAP32[$139>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $141 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $142 = $140 ^ $141; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $143 = $142 >>> 16; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $144 = $138 | $143; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $114 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $115 = (1273 + ($114<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $116 = HEAP8[$115>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $117 = $116&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $118 = (($5) + ($117<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $119 = HEAP32[$118>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $120 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $121 = (1273 + ($120<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $122 = ((($121)) + 1|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $123 = HEAP8[$122>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $124 = $123&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $125 = (136 + ($124<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $126 = HEAP32[$125>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $127 = $119 ^ $126; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $128 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $129 = HEAP32[$128>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $130 = (($127) + ($129))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $131 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $132 = (($131) + ($130))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$4>>2] = $132; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $133 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $134 = HEAP32[$133>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $135 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $136 = $134 ^ $135; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $137 = $136 << 16; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $138 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $139 = HEAP32[$138>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $140 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $141 = $139 ^ $140; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $142 = $141 >>> 16; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $143 = $137 | $142; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $144 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$144>>2] = $143; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
   $145 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$145>>2] = $144; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $146 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $147 = HEAP32[$146>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $148 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $149 = HEAP32[$148>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $150 = (($149) + ($147))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$148>>2] = $150; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $151 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $152 = HEAP32[$151>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $153 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $154 = HEAP32[$153>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $155 = $152 ^ $154; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $156 = $155 << 20; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $157 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $158 = HEAP32[$157>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $159 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $160 = HEAP32[$159>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $161 = $158 ^ $160; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $162 = $161 >>> 12; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $163 = $156 | $162; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $164 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$164>>2] = $163; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $165 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $166 = (1029 + ($165<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $167 = ((($166)) + 1|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $168 = HEAP8[$167>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $169 = $168&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $170 = (($5) + ($169<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $171 = HEAP32[$170>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $172 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $173 = (1029 + ($172<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $174 = HEAP8[$173>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $175 = $174&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $176 = (136 + ($175<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $177 = HEAP32[$176>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $178 = $171 ^ $177; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $179 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $180 = HEAP32[$179>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $181 = (($178) + ($180))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $182 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $183 = (($182) + ($181))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$4>>2] = $183; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $184 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $185 = HEAP32[$184>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $186 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $187 = $185 ^ $186; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $188 = $187 << 24; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $189 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $190 = HEAP32[$189>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $191 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $192 = $190 ^ $191; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $193 = $192 >>> 8; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $194 = $188 | $193; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $146 = HEAP32[$145>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $147 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $148 = HEAP32[$147>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $149 = (($148) + ($146))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$147>>2] = $149; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $150 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $151 = HEAP32[$150>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $152 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $153 = HEAP32[$152>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $154 = $151 ^ $153; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $155 = $154 << 20; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $156 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $157 = HEAP32[$156>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $158 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $159 = HEAP32[$158>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $160 = $157 ^ $159; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $161 = $160 >>> 12; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $162 = $155 | $161; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $163 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$163>>2] = $162; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $164 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $165 = (1273 + ($164<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $166 = ((($165)) + 1|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $167 = HEAP8[$166>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $168 = $167&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $169 = (($5) + ($168<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $170 = HEAP32[$169>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $171 = $6; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $172 = (1273 + ($171<<4)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $173 = HEAP8[$172>>0]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $174 = $173&255; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $175 = (136 + ($174<<2)|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $176 = HEAP32[$175>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $177 = $170 ^ $176; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $178 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $179 = HEAP32[$178>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $180 = (($177) + ($179))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $181 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $182 = (($181) + ($180))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$4>>2] = $182; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $183 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $184 = HEAP32[$183>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $185 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $186 = $184 ^ $185; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $187 = $186 << 24; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $188 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $189 = HEAP32[$188>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $190 = HEAP32[$4>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $191 = $189 ^ $190; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $192 = $191 >>> 8; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $193 = $187 | $192; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $194 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$194>>2] = $193; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
   $195 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$195>>2] = $194; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $196 = ((($4)) + 48|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $197 = HEAP32[$196>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $198 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $199 = HEAP32[$198>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $200 = (($199) + ($197))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$198>>2] = $200; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $201 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $202 = HEAP32[$201>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $203 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $204 = HEAP32[$203>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $205 = $202 ^ $204; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $206 = $205 << 25; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $207 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $208 = HEAP32[$207>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $209 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $210 = HEAP32[$209>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $211 = $208 ^ $210; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $212 = $211 >>> 7; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $213 = $206 | $212; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $214 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$214>>2] = $213; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
-  $215 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $216 = (1029 + ($215<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $217 = ((($216)) + 2|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $218 = HEAP8[$217>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $219 = $218&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $220 = (($5) + ($219<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $221 = HEAP32[$220>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $222 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $223 = (1029 + ($222<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $224 = ((($223)) + 3|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $225 = HEAP8[$224>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $226 = $225&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $227 = (136 + ($226<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $228 = HEAP32[$227>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $229 = $221 ^ $228; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $230 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $231 = HEAP32[$230>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $232 = (($229) + ($231))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $233 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $234 = HEAP32[$233>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $235 = (($234) + ($232))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$233>>2] = $235; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $236 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $237 = HEAP32[$236>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $238 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $239 = HEAP32[$238>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $240 = $237 ^ $239; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $241 = $240 << 16; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $242 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $243 = HEAP32[$242>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $244 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $245 = HEAP32[$244>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $246 = $243 ^ $245; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $247 = $246 >>> 16; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $248 = $241 | $247; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $196 = HEAP32[$195>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $197 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $198 = HEAP32[$197>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $199 = (($198) + ($196))|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$197>>2] = $199; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $200 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $201 = HEAP32[$200>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $202 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $203 = HEAP32[$202>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $204 = $201 ^ $203; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $205 = $204 << 25; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $206 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $207 = HEAP32[$206>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $208 = ((($4)) + 32|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $209 = HEAP32[$208>>2]|0; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $210 = $207 ^ $209; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $211 = $210 >>> 7; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $212 = $205 | $211; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $213 = ((($4)) + 16|0); //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$213>>2] = $212; //@line 88 "c_src/crypto_hash/blake256/ref/hash.c"
+  $214 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $215 = (1273 + ($214<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $216 = ((($215)) + 2|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $217 = HEAP8[$216>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $218 = $217&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $219 = (($5) + ($218<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $220 = HEAP32[$219>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $221 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $222 = (1273 + ($221<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $223 = ((($222)) + 3|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $224 = HEAP8[$223>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $225 = $224&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $226 = (136 + ($225<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $227 = HEAP32[$226>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $228 = $220 ^ $227; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $229 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $230 = HEAP32[$229>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $231 = (($228) + ($230))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $232 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $233 = HEAP32[$232>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $234 = (($233) + ($231))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$232>>2] = $234; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $235 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $236 = HEAP32[$235>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $237 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $238 = HEAP32[$237>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $239 = $236 ^ $238; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $240 = $239 << 16; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $241 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $242 = HEAP32[$241>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $243 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $244 = HEAP32[$243>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $245 = $242 ^ $244; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $246 = $245 >>> 16; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $247 = $240 | $246; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $248 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$248>>2] = $247; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
   $249 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$249>>2] = $248; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $250 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $251 = HEAP32[$250>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $252 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $253 = HEAP32[$252>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $254 = (($253) + ($251))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$252>>2] = $254; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $255 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $256 = HEAP32[$255>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $257 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $258 = HEAP32[$257>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $259 = $256 ^ $258; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $260 = $259 << 20; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $261 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $262 = HEAP32[$261>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $263 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $264 = HEAP32[$263>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $265 = $262 ^ $264; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $266 = $265 >>> 12; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $267 = $260 | $266; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $268 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$268>>2] = $267; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $269 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $270 = (1029 + ($269<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $271 = ((($270)) + 3|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $272 = HEAP8[$271>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $273 = $272&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $274 = (($5) + ($273<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $275 = HEAP32[$274>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $276 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $277 = (1029 + ($276<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $278 = ((($277)) + 2|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $279 = HEAP8[$278>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $280 = $279&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $281 = (136 + ($280<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $282 = HEAP32[$281>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $283 = $275 ^ $282; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $284 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $285 = HEAP32[$284>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $286 = (($283) + ($285))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $287 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $288 = HEAP32[$287>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $289 = (($288) + ($286))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$287>>2] = $289; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $290 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $291 = HEAP32[$290>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $292 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $293 = HEAP32[$292>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $294 = $291 ^ $293; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $295 = $294 << 24; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $296 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $297 = HEAP32[$296>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $298 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $299 = HEAP32[$298>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $300 = $297 ^ $299; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $301 = $300 >>> 8; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $302 = $295 | $301; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $250 = HEAP32[$249>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $251 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $252 = HEAP32[$251>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $253 = (($252) + ($250))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$251>>2] = $253; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $254 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $255 = HEAP32[$254>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $256 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $257 = HEAP32[$256>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $258 = $255 ^ $257; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $259 = $258 << 20; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $260 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $261 = HEAP32[$260>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $262 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $263 = HEAP32[$262>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $264 = $261 ^ $263; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $265 = $264 >>> 12; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $266 = $259 | $265; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $267 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$267>>2] = $266; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $268 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $269 = (1273 + ($268<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $270 = ((($269)) + 3|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $271 = HEAP8[$270>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $272 = $271&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $273 = (($5) + ($272<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $274 = HEAP32[$273>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $275 = $6; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $276 = (1273 + ($275<<4)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $277 = ((($276)) + 2|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $278 = HEAP8[$277>>0]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $279 = $278&255; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $280 = (136 + ($279<<2)|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $281 = HEAP32[$280>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $282 = $274 ^ $281; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $283 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $284 = HEAP32[$283>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $285 = (($282) + ($284))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $286 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $287 = HEAP32[$286>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $288 = (($287) + ($285))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$286>>2] = $288; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $289 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $290 = HEAP32[$289>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $291 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $292 = HEAP32[$291>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $293 = $290 ^ $292; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $294 = $293 << 24; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $295 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $296 = HEAP32[$295>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $297 = ((($4)) + 4|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $298 = HEAP32[$297>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $299 = $296 ^ $298; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $300 = $299 >>> 8; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $301 = $294 | $300; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $302 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$302>>2] = $301; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
   $303 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$303>>2] = $302; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $304 = ((($4)) + 52|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $305 = HEAP32[$304>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $306 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $307 = HEAP32[$306>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $308 = (($307) + ($305))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$306>>2] = $308; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $309 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $310 = HEAP32[$309>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $311 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $312 = HEAP32[$311>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $313 = $310 ^ $312; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $314 = $313 << 25; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $315 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $316 = HEAP32[$315>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $317 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $318 = HEAP32[$317>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $319 = $316 ^ $318; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $320 = $319 >>> 7; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $321 = $314 | $320; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $322 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$322>>2] = $321; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
-  $323 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $324 = (1029 + ($323<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $325 = ((($324)) + 4|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $326 = HEAP8[$325>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $327 = $326&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $328 = (($5) + ($327<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $329 = HEAP32[$328>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $330 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $331 = (1029 + ($330<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $332 = ((($331)) + 5|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $333 = HEAP8[$332>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $334 = $333&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $335 = (136 + ($334<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $336 = HEAP32[$335>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $337 = $329 ^ $336; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $338 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $339 = HEAP32[$338>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $340 = (($337) + ($339))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $341 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $342 = HEAP32[$341>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $343 = (($342) + ($340))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$341>>2] = $343; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $344 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $345 = HEAP32[$344>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $346 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $347 = HEAP32[$346>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $348 = $345 ^ $347; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $349 = $348 << 16; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $350 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $351 = HEAP32[$350>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $352 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $353 = HEAP32[$352>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $354 = $351 ^ $353; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $355 = $354 >>> 16; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $356 = $349 | $355; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $304 = HEAP32[$303>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $305 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $306 = HEAP32[$305>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $307 = (($306) + ($304))|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$305>>2] = $307; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $308 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $309 = HEAP32[$308>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $310 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $311 = HEAP32[$310>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $312 = $309 ^ $311; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $313 = $312 << 25; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $314 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $315 = HEAP32[$314>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $316 = ((($4)) + 36|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $317 = HEAP32[$316>>2]|0; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $318 = $315 ^ $317; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $319 = $318 >>> 7; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $320 = $313 | $319; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $321 = ((($4)) + 20|0); //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$321>>2] = $320; //@line 89 "c_src/crypto_hash/blake256/ref/hash.c"
+  $322 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $323 = (1273 + ($322<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $324 = ((($323)) + 4|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $325 = HEAP8[$324>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $326 = $325&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $327 = (($5) + ($326<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $328 = HEAP32[$327>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $329 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $330 = (1273 + ($329<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $331 = ((($330)) + 5|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $332 = HEAP8[$331>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $333 = $332&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $334 = (136 + ($333<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $335 = HEAP32[$334>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $336 = $328 ^ $335; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $337 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $338 = HEAP32[$337>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $339 = (($336) + ($338))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $340 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $341 = HEAP32[$340>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $342 = (($341) + ($339))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$340>>2] = $342; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $343 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $344 = HEAP32[$343>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $345 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $346 = HEAP32[$345>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $347 = $344 ^ $346; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $348 = $347 << 16; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $349 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $350 = HEAP32[$349>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $351 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $352 = HEAP32[$351>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $353 = $350 ^ $352; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $354 = $353 >>> 16; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $355 = $348 | $354; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $356 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$356>>2] = $355; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
   $357 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$357>>2] = $356; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $358 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $359 = HEAP32[$358>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $360 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $361 = HEAP32[$360>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $362 = (($361) + ($359))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$360>>2] = $362; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $363 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $364 = HEAP32[$363>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $365 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $366 = HEAP32[$365>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $367 = $364 ^ $366; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $368 = $367 << 20; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $369 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $370 = HEAP32[$369>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $371 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $372 = HEAP32[$371>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $373 = $370 ^ $372; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $374 = $373 >>> 12; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $375 = $368 | $374; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $376 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$376>>2] = $375; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $377 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $378 = (1029 + ($377<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $379 = ((($378)) + 5|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $380 = HEAP8[$379>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $381 = $380&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $382 = (($5) + ($381<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $383 = HEAP32[$382>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $384 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $385 = (1029 + ($384<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $386 = ((($385)) + 4|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $387 = HEAP8[$386>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $388 = $387&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $389 = (136 + ($388<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $390 = HEAP32[$389>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $391 = $383 ^ $390; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $392 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $393 = HEAP32[$392>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $394 = (($391) + ($393))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $395 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $396 = HEAP32[$395>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $397 = (($396) + ($394))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$395>>2] = $397; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $398 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $399 = HEAP32[$398>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $400 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $401 = HEAP32[$400>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $402 = $399 ^ $401; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $403 = $402 << 24; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $404 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $405 = HEAP32[$404>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $406 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $407 = HEAP32[$406>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $408 = $405 ^ $407; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $409 = $408 >>> 8; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $410 = $403 | $409; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $358 = HEAP32[$357>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $359 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $360 = HEAP32[$359>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $361 = (($360) + ($358))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$359>>2] = $361; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $362 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $363 = HEAP32[$362>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $364 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $365 = HEAP32[$364>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $366 = $363 ^ $365; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $367 = $366 << 20; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $368 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $369 = HEAP32[$368>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $370 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $371 = HEAP32[$370>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $372 = $369 ^ $371; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $373 = $372 >>> 12; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $374 = $367 | $373; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $375 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$375>>2] = $374; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $376 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $377 = (1273 + ($376<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $378 = ((($377)) + 5|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $379 = HEAP8[$378>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $380 = $379&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $381 = (($5) + ($380<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $382 = HEAP32[$381>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $383 = $6; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $384 = (1273 + ($383<<4)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $385 = ((($384)) + 4|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $386 = HEAP8[$385>>0]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $387 = $386&255; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $388 = (136 + ($387<<2)|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $389 = HEAP32[$388>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $390 = $382 ^ $389; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $391 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $392 = HEAP32[$391>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $393 = (($390) + ($392))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $394 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $395 = HEAP32[$394>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $396 = (($395) + ($393))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$394>>2] = $396; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $397 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $398 = HEAP32[$397>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $399 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $400 = HEAP32[$399>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $401 = $398 ^ $400; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $402 = $401 << 24; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $403 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $404 = HEAP32[$403>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $405 = ((($4)) + 8|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $406 = HEAP32[$405>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $407 = $404 ^ $406; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $408 = $407 >>> 8; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $409 = $402 | $408; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $410 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$410>>2] = $409; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
   $411 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$411>>2] = $410; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $412 = ((($4)) + 56|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $413 = HEAP32[$412>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $414 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $415 = HEAP32[$414>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $416 = (($415) + ($413))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$414>>2] = $416; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $417 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $418 = HEAP32[$417>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $419 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $420 = HEAP32[$419>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $421 = $418 ^ $420; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $422 = $421 << 25; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $423 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $424 = HEAP32[$423>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $425 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $426 = HEAP32[$425>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $427 = $424 ^ $426; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $428 = $427 >>> 7; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $429 = $422 | $428; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $430 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$430>>2] = $429; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
-  $431 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $432 = (1029 + ($431<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $433 = ((($432)) + 6|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $434 = HEAP8[$433>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $435 = $434&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $436 = (($5) + ($435<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $437 = HEAP32[$436>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $438 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $439 = (1029 + ($438<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $440 = ((($439)) + 7|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $441 = HEAP8[$440>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $442 = $441&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $443 = (136 + ($442<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $444 = HEAP32[$443>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $445 = $437 ^ $444; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $446 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $447 = HEAP32[$446>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $448 = (($445) + ($447))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $449 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $450 = HEAP32[$449>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $451 = (($450) + ($448))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$449>>2] = $451; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $452 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $453 = HEAP32[$452>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $454 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $455 = HEAP32[$454>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $456 = $453 ^ $455; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $457 = $456 << 16; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $458 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $459 = HEAP32[$458>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $460 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $461 = HEAP32[$460>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $462 = $459 ^ $461; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $463 = $462 >>> 16; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $464 = $457 | $463; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $412 = HEAP32[$411>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $413 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $414 = HEAP32[$413>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $415 = (($414) + ($412))|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$413>>2] = $415; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $416 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $417 = HEAP32[$416>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $418 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $419 = HEAP32[$418>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $420 = $417 ^ $419; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $421 = $420 << 25; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $422 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $423 = HEAP32[$422>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $424 = ((($4)) + 40|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $425 = HEAP32[$424>>2]|0; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $426 = $423 ^ $425; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $427 = $426 >>> 7; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $428 = $421 | $427; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $429 = ((($4)) + 24|0); //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$429>>2] = $428; //@line 90 "c_src/crypto_hash/blake256/ref/hash.c"
+  $430 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $431 = (1273 + ($430<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $432 = ((($431)) + 6|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $433 = HEAP8[$432>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $434 = $433&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $435 = (($5) + ($434<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $436 = HEAP32[$435>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $437 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $438 = (1273 + ($437<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $439 = ((($438)) + 7|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $440 = HEAP8[$439>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $441 = $440&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $442 = (136 + ($441<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $443 = HEAP32[$442>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $444 = $436 ^ $443; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $445 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $446 = HEAP32[$445>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $447 = (($444) + ($446))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $448 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $449 = HEAP32[$448>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $450 = (($449) + ($447))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$448>>2] = $450; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $451 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $452 = HEAP32[$451>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $453 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $454 = HEAP32[$453>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $455 = $452 ^ $454; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $456 = $455 << 16; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $457 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $458 = HEAP32[$457>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $459 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $460 = HEAP32[$459>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $461 = $458 ^ $460; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $462 = $461 >>> 16; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $463 = $456 | $462; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $464 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$464>>2] = $463; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
   $465 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$465>>2] = $464; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $466 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $467 = HEAP32[$466>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $468 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $469 = HEAP32[$468>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $470 = (($469) + ($467))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$468>>2] = $470; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $471 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $472 = HEAP32[$471>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $473 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $474 = HEAP32[$473>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $475 = $472 ^ $474; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $476 = $475 << 20; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $477 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $478 = HEAP32[$477>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $479 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $480 = HEAP32[$479>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $481 = $478 ^ $480; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $482 = $481 >>> 12; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $483 = $476 | $482; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $484 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$484>>2] = $483; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $485 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $486 = (1029 + ($485<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $487 = ((($486)) + 7|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $488 = HEAP8[$487>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $489 = $488&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $490 = (($5) + ($489<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $491 = HEAP32[$490>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $492 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $493 = (1029 + ($492<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $494 = ((($493)) + 6|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $495 = HEAP8[$494>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $496 = $495&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $497 = (136 + ($496<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $498 = HEAP32[$497>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $499 = $491 ^ $498; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $500 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $501 = HEAP32[$500>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $502 = (($499) + ($501))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $503 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $504 = HEAP32[$503>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $505 = (($504) + ($502))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$503>>2] = $505; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $506 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $507 = HEAP32[$506>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $508 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $509 = HEAP32[$508>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $510 = $507 ^ $509; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $511 = $510 << 24; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $512 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $513 = HEAP32[$512>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $514 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $515 = HEAP32[$514>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $516 = $513 ^ $515; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $517 = $516 >>> 8; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $518 = $511 | $517; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $466 = HEAP32[$465>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $467 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $468 = HEAP32[$467>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $469 = (($468) + ($466))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$467>>2] = $469; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $470 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $471 = HEAP32[$470>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $472 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $473 = HEAP32[$472>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $474 = $471 ^ $473; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $475 = $474 << 20; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $476 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $477 = HEAP32[$476>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $478 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $479 = HEAP32[$478>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $480 = $477 ^ $479; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $481 = $480 >>> 12; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $482 = $475 | $481; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $483 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$483>>2] = $482; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $484 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $485 = (1273 + ($484<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $486 = ((($485)) + 7|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $487 = HEAP8[$486>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $488 = $487&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $489 = (($5) + ($488<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $490 = HEAP32[$489>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $491 = $6; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $492 = (1273 + ($491<<4)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $493 = ((($492)) + 6|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $494 = HEAP8[$493>>0]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $495 = $494&255; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $496 = (136 + ($495<<2)|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $497 = HEAP32[$496>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $498 = $490 ^ $497; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $499 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $500 = HEAP32[$499>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $501 = (($498) + ($500))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $502 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $503 = HEAP32[$502>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $504 = (($503) + ($501))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$502>>2] = $504; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $505 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $506 = HEAP32[$505>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $507 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $508 = HEAP32[$507>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $509 = $506 ^ $508; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $510 = $509 << 24; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $511 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $512 = HEAP32[$511>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $513 = ((($4)) + 12|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $514 = HEAP32[$513>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $515 = $512 ^ $514; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $516 = $515 >>> 8; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $517 = $510 | $516; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $518 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$518>>2] = $517; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
   $519 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$519>>2] = $518; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $520 = ((($4)) + 60|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $521 = HEAP32[$520>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $522 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $523 = HEAP32[$522>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $524 = (($523) + ($521))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$522>>2] = $524; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $525 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $526 = HEAP32[$525>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $527 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $528 = HEAP32[$527>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $529 = $526 ^ $528; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $530 = $529 << 25; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $531 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $532 = HEAP32[$531>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $533 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $534 = HEAP32[$533>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $535 = $532 ^ $534; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $536 = $535 >>> 7; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $537 = $530 | $536; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $538 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$538>>2] = $537; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
-  $539 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $540 = (1029 + ($539<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $541 = ((($540)) + 14|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $542 = HEAP8[$541>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $543 = $542&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $544 = (($5) + ($543<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $545 = HEAP32[$544>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $546 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $547 = (1029 + ($546<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $548 = ((($547)) + 15|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $549 = HEAP8[$548>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $550 = $549&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $551 = (136 + ($550<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $552 = HEAP32[$551>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $553 = $545 ^ $552; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $554 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $555 = HEAP32[$554>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $556 = (($553) + ($555))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $557 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $558 = HEAP32[$557>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $559 = (($558) + ($556))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$557>>2] = $559; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $560 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $561 = HEAP32[$560>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $562 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $563 = HEAP32[$562>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $564 = $561 ^ $563; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $565 = $564 << 16; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $566 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $567 = HEAP32[$566>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $568 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $569 = HEAP32[$568>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $570 = $567 ^ $569; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $571 = $570 >>> 16; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $572 = $565 | $571; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $520 = HEAP32[$519>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $521 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $522 = HEAP32[$521>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $523 = (($522) + ($520))|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$521>>2] = $523; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $524 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $525 = HEAP32[$524>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $526 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $527 = HEAP32[$526>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $528 = $525 ^ $527; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $529 = $528 << 25; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $530 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $531 = HEAP32[$530>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $532 = ((($4)) + 44|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $533 = HEAP32[$532>>2]|0; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $534 = $531 ^ $533; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $535 = $534 >>> 7; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $536 = $529 | $535; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $537 = ((($4)) + 28|0); //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$537>>2] = $536; //@line 91 "c_src/crypto_hash/blake256/ref/hash.c"
+  $538 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $539 = (1273 + ($538<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $540 = ((($539)) + 14|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $541 = HEAP8[$540>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $542 = $541&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $543 = (($5) + ($542<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $544 = HEAP32[$543>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $545 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $546 = (1273 + ($545<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $547 = ((($546)) + 15|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $548 = HEAP8[$547>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $549 = $548&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $550 = (136 + ($549<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $551 = HEAP32[$550>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $552 = $544 ^ $551; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $553 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $554 = HEAP32[$553>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $555 = (($552) + ($554))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $556 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $557 = HEAP32[$556>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $558 = (($557) + ($555))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$556>>2] = $558; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $559 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $560 = HEAP32[$559>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $561 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $562 = HEAP32[$561>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $563 = $560 ^ $562; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $564 = $563 << 16; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $565 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $566 = HEAP32[$565>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $567 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $568 = HEAP32[$567>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $569 = $566 ^ $568; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $570 = $569 >>> 16; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $571 = $564 | $570; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $572 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$572>>2] = $571; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
   $573 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$573>>2] = $572; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $574 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $575 = HEAP32[$574>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $576 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $577 = HEAP32[$576>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $578 = (($577) + ($575))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$576>>2] = $578; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $579 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $580 = HEAP32[$579>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $581 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $582 = HEAP32[$581>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $583 = $580 ^ $582; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $584 = $583 << 20; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $585 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $586 = HEAP32[$585>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $587 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $588 = HEAP32[$587>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $589 = $586 ^ $588; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $590 = $589 >>> 12; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $591 = $584 | $590; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $592 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$592>>2] = $591; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $593 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $594 = (1029 + ($593<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $595 = ((($594)) + 15|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $596 = HEAP8[$595>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $597 = $596&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $598 = (($5) + ($597<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $599 = HEAP32[$598>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $600 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $601 = (1029 + ($600<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $602 = ((($601)) + 14|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $603 = HEAP8[$602>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $604 = $603&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $605 = (136 + ($604<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $606 = HEAP32[$605>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $607 = $599 ^ $606; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $608 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $609 = HEAP32[$608>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $610 = (($607) + ($609))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $611 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $612 = HEAP32[$611>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $613 = (($612) + ($610))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$611>>2] = $613; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $614 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $615 = HEAP32[$614>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $616 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $617 = HEAP32[$616>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $618 = $615 ^ $617; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $619 = $618 << 24; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $620 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $621 = HEAP32[$620>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $622 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $623 = HEAP32[$622>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $624 = $621 ^ $623; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $625 = $624 >>> 8; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $626 = $619 | $625; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $574 = HEAP32[$573>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $575 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $576 = HEAP32[$575>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $577 = (($576) + ($574))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$575>>2] = $577; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $578 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $579 = HEAP32[$578>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $580 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $581 = HEAP32[$580>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $582 = $579 ^ $581; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $583 = $582 << 20; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $584 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $585 = HEAP32[$584>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $586 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $587 = HEAP32[$586>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $588 = $585 ^ $587; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $589 = $588 >>> 12; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $590 = $583 | $589; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $591 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$591>>2] = $590; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $592 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $593 = (1273 + ($592<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $594 = ((($593)) + 15|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $595 = HEAP8[$594>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $596 = $595&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $597 = (($5) + ($596<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $598 = HEAP32[$597>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $599 = $6; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $600 = (1273 + ($599<<4)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $601 = ((($600)) + 14|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $602 = HEAP8[$601>>0]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $603 = $602&255; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $604 = (136 + ($603<<2)|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $605 = HEAP32[$604>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $606 = $598 ^ $605; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $607 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $608 = HEAP32[$607>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $609 = (($606) + ($608))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $610 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $611 = HEAP32[$610>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $612 = (($611) + ($609))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$610>>2] = $612; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $613 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $614 = HEAP32[$613>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $615 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $616 = HEAP32[$615>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $617 = $614 ^ $616; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $618 = $617 << 24; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $619 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $620 = HEAP32[$619>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $621 = ((($4)) + 12|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $622 = HEAP32[$621>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $623 = $620 ^ $622; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $624 = $623 >>> 8; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $625 = $618 | $624; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $626 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$626>>2] = $625; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
   $627 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$627>>2] = $626; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $628 = ((($4)) + 56|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $629 = HEAP32[$628>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $630 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $631 = HEAP32[$630>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $632 = (($631) + ($629))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$630>>2] = $632; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $633 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $634 = HEAP32[$633>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $635 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $636 = HEAP32[$635>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $637 = $634 ^ $636; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $638 = $637 << 25; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $639 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $640 = HEAP32[$639>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $641 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $642 = HEAP32[$641>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $643 = $640 ^ $642; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $644 = $643 >>> 7; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $645 = $638 | $644; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $646 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$646>>2] = $645; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
-  $647 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $648 = (1029 + ($647<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $649 = ((($648)) + 12|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $650 = HEAP8[$649>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $651 = $650&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $652 = (($5) + ($651<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $653 = HEAP32[$652>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $654 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $655 = (1029 + ($654<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $656 = ((($655)) + 13|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $657 = HEAP8[$656>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $658 = $657&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $659 = (136 + ($658<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $660 = HEAP32[$659>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $661 = $653 ^ $660; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $662 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $663 = HEAP32[$662>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $664 = (($661) + ($663))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $665 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $666 = HEAP32[$665>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $667 = (($666) + ($664))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$665>>2] = $667; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $668 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $669 = HEAP32[$668>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $670 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $671 = HEAP32[$670>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $672 = $669 ^ $671; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $673 = $672 << 16; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $674 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $675 = HEAP32[$674>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $676 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $677 = HEAP32[$676>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $678 = $675 ^ $677; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $679 = $678 >>> 16; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $680 = $673 | $679; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $628 = HEAP32[$627>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $629 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $630 = HEAP32[$629>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $631 = (($630) + ($628))|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$629>>2] = $631; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $632 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $633 = HEAP32[$632>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $634 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $635 = HEAP32[$634>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $636 = $633 ^ $635; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $637 = $636 << 25; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $638 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $639 = HEAP32[$638>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $640 = ((($4)) + 36|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $641 = HEAP32[$640>>2]|0; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $642 = $639 ^ $641; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $643 = $642 >>> 7; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $644 = $637 | $643; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $645 = ((($4)) + 16|0); //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$645>>2] = $644; //@line 92 "c_src/crypto_hash/blake256/ref/hash.c"
+  $646 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $647 = (1273 + ($646<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $648 = ((($647)) + 12|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $649 = HEAP8[$648>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $650 = $649&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $651 = (($5) + ($650<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $652 = HEAP32[$651>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $653 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $654 = (1273 + ($653<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $655 = ((($654)) + 13|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $656 = HEAP8[$655>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $657 = $656&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $658 = (136 + ($657<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $659 = HEAP32[$658>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $660 = $652 ^ $659; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $661 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $662 = HEAP32[$661>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $663 = (($660) + ($662))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $664 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $665 = HEAP32[$664>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $666 = (($665) + ($663))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$664>>2] = $666; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $667 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $668 = HEAP32[$667>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $669 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $670 = HEAP32[$669>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $671 = $668 ^ $670; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $672 = $671 << 16; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $673 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $674 = HEAP32[$673>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $675 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $676 = HEAP32[$675>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $677 = $674 ^ $676; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $678 = $677 >>> 16; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $679 = $672 | $678; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $680 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$680>>2] = $679; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
   $681 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$681>>2] = $680; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $682 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $683 = HEAP32[$682>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $684 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $685 = HEAP32[$684>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $686 = (($685) + ($683))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$684>>2] = $686; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $687 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $688 = HEAP32[$687>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $689 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $690 = HEAP32[$689>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $691 = $688 ^ $690; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $692 = $691 << 20; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $693 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $694 = HEAP32[$693>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $695 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $696 = HEAP32[$695>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $697 = $694 ^ $696; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $698 = $697 >>> 12; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $699 = $692 | $698; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $700 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$700>>2] = $699; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $701 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $702 = (1029 + ($701<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $703 = ((($702)) + 13|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $704 = HEAP8[$703>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $705 = $704&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $706 = (($5) + ($705<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $707 = HEAP32[$706>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $708 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $709 = (1029 + ($708<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $710 = ((($709)) + 12|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $711 = HEAP8[$710>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $712 = $711&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $713 = (136 + ($712<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $714 = HEAP32[$713>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $715 = $707 ^ $714; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $716 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $717 = HEAP32[$716>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $718 = (($715) + ($717))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $719 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $720 = HEAP32[$719>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $721 = (($720) + ($718))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$719>>2] = $721; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $722 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $723 = HEAP32[$722>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $724 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $725 = HEAP32[$724>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $726 = $723 ^ $725; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $727 = $726 << 24; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $728 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $729 = HEAP32[$728>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $730 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $731 = HEAP32[$730>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $732 = $729 ^ $731; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $733 = $732 >>> 8; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $734 = $727 | $733; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $682 = HEAP32[$681>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $683 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $684 = HEAP32[$683>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $685 = (($684) + ($682))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$683>>2] = $685; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $686 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $687 = HEAP32[$686>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $688 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $689 = HEAP32[$688>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $690 = $687 ^ $689; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $691 = $690 << 20; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $692 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $693 = HEAP32[$692>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $694 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $695 = HEAP32[$694>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $696 = $693 ^ $695; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $697 = $696 >>> 12; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $698 = $691 | $697; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $699 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$699>>2] = $698; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $700 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $701 = (1273 + ($700<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $702 = ((($701)) + 13|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $703 = HEAP8[$702>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $704 = $703&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $705 = (($5) + ($704<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $706 = HEAP32[$705>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $707 = $6; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $708 = (1273 + ($707<<4)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $709 = ((($708)) + 12|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $710 = HEAP8[$709>>0]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $711 = $710&255; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $712 = (136 + ($711<<2)|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $713 = HEAP32[$712>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $714 = $706 ^ $713; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $715 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $716 = HEAP32[$715>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $717 = (($714) + ($716))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $718 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $719 = HEAP32[$718>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $720 = (($719) + ($717))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$718>>2] = $720; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $721 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $722 = HEAP32[$721>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $723 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $724 = HEAP32[$723>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $725 = $722 ^ $724; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $726 = $725 << 24; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $727 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $728 = HEAP32[$727>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $729 = ((($4)) + 8|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $730 = HEAP32[$729>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $731 = $728 ^ $730; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $732 = $731 >>> 8; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $733 = $726 | $732; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $734 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$734>>2] = $733; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
   $735 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$735>>2] = $734; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $736 = ((($4)) + 52|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $737 = HEAP32[$736>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $738 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $739 = HEAP32[$738>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $740 = (($739) + ($737))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$738>>2] = $740; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $741 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $742 = HEAP32[$741>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $743 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $744 = HEAP32[$743>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $745 = $742 ^ $744; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $746 = $745 << 25; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $747 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $748 = HEAP32[$747>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $749 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $750 = HEAP32[$749>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $751 = $748 ^ $750; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $752 = $751 >>> 7; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $753 = $746 | $752; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $754 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$754>>2] = $753; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
-  $755 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $756 = (1029 + ($755<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $757 = ((($756)) + 8|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $758 = HEAP8[$757>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $759 = $758&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $760 = (($5) + ($759<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $761 = HEAP32[$760>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $762 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $763 = (1029 + ($762<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $764 = ((($763)) + 9|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $765 = HEAP8[$764>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $766 = $765&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $767 = (136 + ($766<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $768 = HEAP32[$767>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $769 = $761 ^ $768; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $770 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $771 = HEAP32[$770>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $772 = (($769) + ($771))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $773 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $774 = (($773) + ($772))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$4>>2] = $774; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $775 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $776 = HEAP32[$775>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $777 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $778 = $776 ^ $777; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $779 = $778 << 16; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $780 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $781 = HEAP32[$780>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $782 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $783 = $781 ^ $782; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $784 = $783 >>> 16; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $785 = $779 | $784; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $736 = HEAP32[$735>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $737 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $738 = HEAP32[$737>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $739 = (($738) + ($736))|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$737>>2] = $739; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $740 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $741 = HEAP32[$740>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $742 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $743 = HEAP32[$742>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $744 = $741 ^ $743; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $745 = $744 << 25; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $746 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $747 = HEAP32[$746>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $748 = ((($4)) + 32|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $749 = HEAP32[$748>>2]|0; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $750 = $747 ^ $749; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $751 = $750 >>> 7; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $752 = $745 | $751; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $753 = ((($4)) + 28|0); //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$753>>2] = $752; //@line 93 "c_src/crypto_hash/blake256/ref/hash.c"
+  $754 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $755 = (1273 + ($754<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $756 = ((($755)) + 8|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $757 = HEAP8[$756>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $758 = $757&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $759 = (($5) + ($758<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $760 = HEAP32[$759>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $761 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $762 = (1273 + ($761<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $763 = ((($762)) + 9|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $764 = HEAP8[$763>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $765 = $764&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $766 = (136 + ($765<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $767 = HEAP32[$766>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $768 = $760 ^ $767; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $769 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $770 = HEAP32[$769>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $771 = (($768) + ($770))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $772 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $773 = (($772) + ($771))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$4>>2] = $773; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $774 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $775 = HEAP32[$774>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $776 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $777 = $775 ^ $776; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $778 = $777 << 16; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $779 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $780 = HEAP32[$779>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $781 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $782 = $780 ^ $781; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $783 = $782 >>> 16; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $784 = $778 | $783; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $785 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$785>>2] = $784; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
   $786 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$786>>2] = $785; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $787 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $788 = HEAP32[$787>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $789 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $790 = HEAP32[$789>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $791 = (($790) + ($788))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$789>>2] = $791; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $792 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $793 = HEAP32[$792>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $794 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $795 = HEAP32[$794>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $796 = $793 ^ $795; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $797 = $796 << 20; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $798 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $799 = HEAP32[$798>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $800 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $801 = HEAP32[$800>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $802 = $799 ^ $801; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $803 = $802 >>> 12; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $804 = $797 | $803; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $805 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$805>>2] = $804; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $806 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $807 = (1029 + ($806<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $808 = ((($807)) + 9|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $809 = HEAP8[$808>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $810 = $809&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $811 = (($5) + ($810<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $812 = HEAP32[$811>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $813 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $814 = (1029 + ($813<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $815 = ((($814)) + 8|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $816 = HEAP8[$815>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $817 = $816&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $818 = (136 + ($817<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $819 = HEAP32[$818>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $820 = $812 ^ $819; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $821 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $822 = HEAP32[$821>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $823 = (($820) + ($822))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $824 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $825 = (($824) + ($823))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$4>>2] = $825; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $826 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $827 = HEAP32[$826>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $828 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $829 = $827 ^ $828; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $830 = $829 << 24; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $831 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $832 = HEAP32[$831>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $833 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $834 = $832 ^ $833; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $835 = $834 >>> 8; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $836 = $830 | $835; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $787 = HEAP32[$786>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $788 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $789 = HEAP32[$788>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $790 = (($789) + ($787))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$788>>2] = $790; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $791 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $792 = HEAP32[$791>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $793 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $794 = HEAP32[$793>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $795 = $792 ^ $794; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $796 = $795 << 20; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $797 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $798 = HEAP32[$797>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $799 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $800 = HEAP32[$799>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $801 = $798 ^ $800; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $802 = $801 >>> 12; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $803 = $796 | $802; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $804 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$804>>2] = $803; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $805 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $806 = (1273 + ($805<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $807 = ((($806)) + 9|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $808 = HEAP8[$807>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $809 = $808&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $810 = (($5) + ($809<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $811 = HEAP32[$810>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $812 = $6; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $813 = (1273 + ($812<<4)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $814 = ((($813)) + 8|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $815 = HEAP8[$814>>0]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $816 = $815&255; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $817 = (136 + ($816<<2)|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $818 = HEAP32[$817>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $819 = $811 ^ $818; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $820 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $821 = HEAP32[$820>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $822 = (($819) + ($821))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $823 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $824 = (($823) + ($822))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$4>>2] = $824; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $825 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $826 = HEAP32[$825>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $827 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $828 = $826 ^ $827; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $829 = $828 << 24; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $830 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $831 = HEAP32[$830>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $832 = HEAP32[$4>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $833 = $831 ^ $832; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $834 = $833 >>> 8; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $835 = $829 | $834; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $836 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$836>>2] = $835; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
   $837 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$837>>2] = $836; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $838 = ((($4)) + 60|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $839 = HEAP32[$838>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $840 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $841 = HEAP32[$840>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $842 = (($841) + ($839))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$840>>2] = $842; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $843 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $844 = HEAP32[$843>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $845 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $846 = HEAP32[$845>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $847 = $844 ^ $846; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $848 = $847 << 25; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $849 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $850 = HEAP32[$849>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $851 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $852 = HEAP32[$851>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $853 = $850 ^ $852; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $854 = $853 >>> 7; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $855 = $848 | $854; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $856 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$856>>2] = $855; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
-  $857 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $858 = (1029 + ($857<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $859 = ((($858)) + 10|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $860 = HEAP8[$859>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $861 = $860&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $862 = (($5) + ($861<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $863 = HEAP32[$862>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $864 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $865 = (1029 + ($864<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $866 = ((($865)) + 11|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $867 = HEAP8[$866>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $868 = $867&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $869 = (136 + ($868<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $870 = HEAP32[$869>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $871 = $863 ^ $870; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $872 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $873 = HEAP32[$872>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $874 = (($871) + ($873))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $875 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $876 = HEAP32[$875>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $877 = (($876) + ($874))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$875>>2] = $877; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $878 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $879 = HEAP32[$878>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $880 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $881 = HEAP32[$880>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $882 = $879 ^ $881; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $883 = $882 << 16; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $884 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $885 = HEAP32[$884>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $886 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $887 = HEAP32[$886>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $888 = $885 ^ $887; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $889 = $888 >>> 16; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $890 = $883 | $889; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $838 = HEAP32[$837>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $839 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $840 = HEAP32[$839>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $841 = (($840) + ($838))|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$839>>2] = $841; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $842 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $843 = HEAP32[$842>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $844 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $845 = HEAP32[$844>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $846 = $843 ^ $845; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $847 = $846 << 25; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $848 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $849 = HEAP32[$848>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $850 = ((($4)) + 40|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $851 = HEAP32[$850>>2]|0; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $852 = $849 ^ $851; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $853 = $852 >>> 7; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $854 = $847 | $853; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $855 = ((($4)) + 20|0); //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$855>>2] = $854; //@line 94 "c_src/crypto_hash/blake256/ref/hash.c"
+  $856 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $857 = (1273 + ($856<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $858 = ((($857)) + 10|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $859 = HEAP8[$858>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $860 = $859&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $861 = (($5) + ($860<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $862 = HEAP32[$861>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $863 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $864 = (1273 + ($863<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $865 = ((($864)) + 11|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $866 = HEAP8[$865>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $867 = $866&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $868 = (136 + ($867<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $869 = HEAP32[$868>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $870 = $862 ^ $869; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $871 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $872 = HEAP32[$871>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $873 = (($870) + ($872))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $874 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $875 = HEAP32[$874>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $876 = (($875) + ($873))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$874>>2] = $876; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $877 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $878 = HEAP32[$877>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $879 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $880 = HEAP32[$879>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $881 = $878 ^ $880; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $882 = $881 << 16; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $883 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $884 = HEAP32[$883>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $885 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $886 = HEAP32[$885>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $887 = $884 ^ $886; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $888 = $887 >>> 16; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $889 = $882 | $888; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $890 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$890>>2] = $889; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
   $891 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$891>>2] = $890; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $892 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $893 = HEAP32[$892>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $894 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $895 = HEAP32[$894>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $896 = (($895) + ($893))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$894>>2] = $896; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $897 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $898 = HEAP32[$897>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $899 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $900 = HEAP32[$899>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $901 = $898 ^ $900; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $902 = $901 << 20; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $903 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $904 = HEAP32[$903>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $905 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $906 = HEAP32[$905>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $907 = $904 ^ $906; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $908 = $907 >>> 12; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $909 = $902 | $908; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $910 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$910>>2] = $909; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $911 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $912 = (1029 + ($911<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $913 = ((($912)) + 11|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $914 = HEAP8[$913>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $915 = $914&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $916 = (($5) + ($915<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $917 = HEAP32[$916>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $918 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $919 = (1029 + ($918<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $920 = ((($919)) + 10|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $921 = HEAP8[$920>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $922 = $921&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $923 = (136 + ($922<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $924 = HEAP32[$923>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $925 = $917 ^ $924; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $926 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $927 = HEAP32[$926>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $928 = (($925) + ($927))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $929 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $930 = HEAP32[$929>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $931 = (($930) + ($928))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$929>>2] = $931; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $932 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $933 = HEAP32[$932>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $934 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $935 = HEAP32[$934>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $936 = $933 ^ $935; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $937 = $936 << 24; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $938 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $939 = HEAP32[$938>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $940 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $941 = HEAP32[$940>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $942 = $939 ^ $941; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $943 = $942 >>> 8; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $944 = $937 | $943; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $892 = HEAP32[$891>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $893 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $894 = HEAP32[$893>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $895 = (($894) + ($892))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$893>>2] = $895; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $896 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $897 = HEAP32[$896>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $898 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $899 = HEAP32[$898>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $900 = $897 ^ $899; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $901 = $900 << 20; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $902 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $903 = HEAP32[$902>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $904 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $905 = HEAP32[$904>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $906 = $903 ^ $905; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $907 = $906 >>> 12; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $908 = $901 | $907; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $909 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$909>>2] = $908; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $910 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $911 = (1273 + ($910<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $912 = ((($911)) + 11|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $913 = HEAP8[$912>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $914 = $913&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $915 = (($5) + ($914<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $916 = HEAP32[$915>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $917 = $6; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $918 = (1273 + ($917<<4)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $919 = ((($918)) + 10|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $920 = HEAP8[$919>>0]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $921 = $920&255; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $922 = (136 + ($921<<2)|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $923 = HEAP32[$922>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $924 = $916 ^ $923; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $925 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $926 = HEAP32[$925>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $927 = (($924) + ($926))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $928 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $929 = HEAP32[$928>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $930 = (($929) + ($927))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$928>>2] = $930; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $931 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $932 = HEAP32[$931>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $933 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $934 = HEAP32[$933>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $935 = $932 ^ $934; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $936 = $935 << 24; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $937 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $938 = HEAP32[$937>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $939 = ((($4)) + 4|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $940 = HEAP32[$939>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $941 = $938 ^ $940; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $942 = $941 >>> 8; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $943 = $936 | $942; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $944 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$944>>2] = $943; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
   $945 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$945>>2] = $944; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $946 = ((($4)) + 48|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $947 = HEAP32[$946>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $948 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $949 = HEAP32[$948>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $950 = (($949) + ($947))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$948>>2] = $950; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $951 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $952 = HEAP32[$951>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $953 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $954 = HEAP32[$953>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $955 = $952 ^ $954; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $956 = $955 << 25; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $957 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $958 = HEAP32[$957>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $959 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $960 = HEAP32[$959>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $961 = $958 ^ $960; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $962 = $961 >>> 7; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $963 = $956 | $962; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $964 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$964>>2] = $963; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
-  $965 = $6; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
-  $966 = (($965) + 1)|0; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
-  $6 = $966; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
+  $946 = HEAP32[$945>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $947 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $948 = HEAP32[$947>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $949 = (($948) + ($946))|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$947>>2] = $949; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $950 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $951 = HEAP32[$950>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $952 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $953 = HEAP32[$952>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $954 = $951 ^ $953; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $955 = $954 << 25; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $956 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $957 = HEAP32[$956>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $958 = ((($4)) + 44|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $959 = HEAP32[$958>>2]|0; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $960 = $957 ^ $959; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $961 = $960 >>> 7; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $962 = $955 | $961; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $963 = ((($4)) + 24|0); //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$963>>2] = $962; //@line 95 "c_src/crypto_hash/blake256/ref/hash.c"
+  $964 = $6; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
+  $965 = (($964) + 1)|0; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
+  $6 = $965; //@line 87 "c_src/crypto_hash/blake256/ref/hash.c"
  }
  $6 = 0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
  while(1) {
-  $967 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $968 = ($967>>>0)<(16); //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  if (!($968)) {
+  $966 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $967 = ($966>>>0)<(16); //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  if (!($967)) {
    break;
   }
-  $969 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $970 = (($4) + ($969<<2)|0); //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $971 = HEAP32[$970>>2]|0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $968 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $969 = (($4) + ($968<<2)|0); //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $970 = HEAP32[$969>>2]|0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $971 = $2; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
   $972 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
   $973 = (($972>>>0) % 8)&-1; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $974 = $2; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $975 = (($974) + ($973<<2)|0); //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $976 = HEAP32[$975>>2]|0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $977 = $976 ^ $971; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$975>>2] = $977; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $978 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $979 = (($978) + 1)|0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
-  $6 = $979; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $974 = (($971) + ($973<<2)|0); //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $975 = HEAP32[$974>>2]|0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $976 = $975 ^ $970; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$974>>2] = $976; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $977 = $6; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $978 = (($977) + 1)|0; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
+  $6 = $978; //@line 98 "c_src/crypto_hash/blake256/ref/hash.c"
  }
  $6 = 0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
  while(1) {
-  $980 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $981 = ($980>>>0)<(8); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  if (!($981)) {
+  $979 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $980 = ($979>>>0)<(8); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  if (!($980)) {
    break;
   }
-  $982 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $983 = (($982>>>0) % 4)&-1; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $984 = $2; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $985 = ((($984)) + 32|0); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $986 = (($985) + ($983<<2)|0); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $987 = HEAP32[$986>>2]|0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $981 = $2; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $982 = ((($981)) + 32|0); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $983 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $984 = (($983>>>0) % 4)&-1; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $985 = (($982) + ($984<<2)|0); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $986 = HEAP32[$985>>2]|0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $987 = $2; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
   $988 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $989 = $2; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $990 = (($989) + ($988<<2)|0); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $991 = HEAP32[$990>>2]|0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $992 = $991 ^ $987; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$990>>2] = $992; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $993 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $994 = (($993) + 1)|0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
-  $6 = $994; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $989 = (($987) + ($988<<2)|0); //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $990 = HEAP32[$989>>2]|0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $991 = $990 ^ $986; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  HEAP32[$989>>2] = $991; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $992 = $6; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $993 = (($992) + 1)|0; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
+  $6 = $993; //@line 99 "c_src/crypto_hash/blake256/ref/hash.c"
  }
  STACKTOP = sp;return; //@line 100 "c_src/crypto_hash/blake256/ref/hash.c"
 }
@@ -2982,14 +2998,14 @@ function _blake256_update($0,$1,$2,$3) {
  $1 = $1|0;
  $2 = $2|0;
  $3 = $3|0;
- var $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0;
- var $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0;
- var $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0;
- var $154 = 0, $155 = 0, $156 = 0, $157 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $30 = 0, $31 = 0;
- var $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0;
- var $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0;
- var $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0;
- var $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
+ var $$sink = 0, $$sink2 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
+ var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
+ var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
+ var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $30 = 0;
+ var $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0;
+ var $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0;
+ var $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0;
+ var $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 32|0;
  $6 = sp;
@@ -3147,42 +3163,43 @@ function _blake256_update($0,$1,$2,$3) {
  $127 = ($124|0)==(0); //@line 141 "c_src/crypto_hash/blake256/ref/hash.c"
  $128 = $127 & $126; //@line 141 "c_src/crypto_hash/blake256/ref/hash.c"
  $129 = $125 | $128; //@line 141 "c_src/crypto_hash/blake256/ref/hash.c"
- $130 = $4; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
- if ($129) {
-  $131 = ((($130)) + 64|0); //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $132 = $7; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $133 = (($131) + ($132)|0); //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $134 = $5; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $135 = $6; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $136 = $135; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $137 = HEAP32[$136>>2]|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $138 = (($135) + 4)|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $139 = $138; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $140 = HEAP32[$139>>2]|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $141 = (_bitshift64Lshr(($137|0),($140|0),3)|0); //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $142 = tempRet0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  _memcpy(($133|0),($134|0),($141|0))|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
-  $143 = $7; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $144 = $143 << 3; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $145 = ($144|0)<(0); //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $146 = $145 << 31 >> 31; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $147 = $6; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $148 = $147; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $149 = HEAP32[$148>>2]|0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $150 = (($147) + 4)|0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $151 = $150; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $152 = HEAP32[$151>>2]|0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $153 = (_i64Add(($144|0),($146|0),($149|0),($152|0))|0); //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $154 = tempRet0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $155 = $4; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  $156 = ((($155)) + 56|0); //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$156>>2] = $153; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
-  STACKTOP = sp;return; //@line 146 "c_src/crypto_hash/blake256/ref/hash.c"
- } else {
-  $157 = ((($130)) + 56|0); //@line 145 "c_src/crypto_hash/blake256/ref/hash.c"
-  HEAP32[$157>>2] = 0; //@line 145 "c_src/crypto_hash/blake256/ref/hash.c"
+ $130 = $4;
+ if (!($129)) {
+  $$sink = 0;$$sink2 = $130;
+  $156 = ((($$sink2)) + 56|0);
+  HEAP32[$156>>2] = $$sink;
   STACKTOP = sp;return; //@line 146 "c_src/crypto_hash/blake256/ref/hash.c"
  }
+ $131 = ((($130)) + 64|0); //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $132 = $7; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $133 = (($131) + ($132)|0); //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $134 = $5; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $135 = $6; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $136 = $135; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $137 = HEAP32[$136>>2]|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $138 = (($135) + 4)|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $139 = $138; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $140 = HEAP32[$139>>2]|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $141 = (_bitshift64Lshr(($137|0),($140|0),3)|0); //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $142 = tempRet0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ _memcpy(($133|0),($134|0),($141|0))|0; //@line 142 "c_src/crypto_hash/blake256/ref/hash.c"
+ $143 = $7; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $144 = $143 << 3; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $145 = ($144|0)<(0); //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $146 = $145 << 31 >> 31; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $147 = $6; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $148 = $147; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $149 = HEAP32[$148>>2]|0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $150 = (($147) + 4)|0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $151 = $150; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $152 = HEAP32[$151>>2]|0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $153 = (_i64Add(($144|0),($146|0),($149|0),($152|0))|0); //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $154 = tempRet0; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $155 = $4; //@line 143 "c_src/crypto_hash/blake256/ref/hash.c"
+ $$sink = $153;$$sink2 = $155;
+ $156 = ((($$sink2)) + 56|0);
+ HEAP32[$156>>2] = $$sink;
+ STACKTOP = sp;return; //@line 146 "c_src/crypto_hash/blake256/ref/hash.c"
 }
 function _blake256_final($0,$1) {
  $0 = $0|0;
@@ -3281,7 +3298,7 @@ function _blake256_final($0,$1) {
  $60 = ((($59)) + 56|0); //@line 157 "c_src/crypto_hash/blake256/ref/hash.c"
  $61 = HEAP32[$60>>2]|0; //@line 157 "c_src/crypto_hash/blake256/ref/hash.c"
  $62 = ($61|0)==(440); //@line 157 "c_src/crypto_hash/blake256/ref/hash.c"
- $63 = $2; //@line 158 "c_src/crypto_hash/blake256/ref/hash.c"
+ $63 = $2;
  if ($62) {
   $64 = ((($63)) + 48|0); //@line 158 "c_src/crypto_hash/blake256/ref/hash.c"
   $65 = HEAP32[$64>>2]|0; //@line 158 "c_src/crypto_hash/blake256/ref/hash.c"
@@ -3293,9 +3310,9 @@ function _blake256_final($0,$1) {
   $68 = ((($63)) + 56|0); //@line 162 "c_src/crypto_hash/blake256/ref/hash.c"
   $69 = HEAP32[$68>>2]|0; //@line 162 "c_src/crypto_hash/blake256/ref/hash.c"
   $70 = ($69|0)<(440); //@line 162 "c_src/crypto_hash/blake256/ref/hash.c"
-  $71 = $2; //@line 163 "c_src/crypto_hash/blake256/ref/hash.c"
-  $72 = ((($71)) + 56|0); //@line 163 "c_src/crypto_hash/blake256/ref/hash.c"
-  $73 = HEAP32[$72>>2]|0; //@line 163 "c_src/crypto_hash/blake256/ref/hash.c"
+  $71 = $2;
+  $72 = ((($71)) + 56|0);
+  $73 = HEAP32[$72>>2]|0;
   if ($70) {
    $74 = ($73|0)!=(0); //@line 163 "c_src/crypto_hash/blake256/ref/hash.c"
    if (!($74)) {
@@ -3319,7 +3336,7 @@ function _blake256_final($0,$1) {
    $89 = (440 - ($88))|0; //@line 165 "c_src/crypto_hash/blake256/ref/hash.c"
    $90 = ($89|0)<(0); //@line 165 "c_src/crypto_hash/blake256/ref/hash.c"
    $91 = $90 << 31 >> 31; //@line 165 "c_src/crypto_hash/blake256/ref/hash.c"
-   _blake256_update($85,1253,$89,$91); //@line 165 "c_src/crypto_hash/blake256/ref/hash.c"
+   _blake256_update($85,1497,$89,$91); //@line 165 "c_src/crypto_hash/blake256/ref/hash.c"
   } else {
    $92 = (512 - ($73))|0; //@line 168 "c_src/crypto_hash/blake256/ref/hash.c"
    $93 = $2; //@line 168 "c_src/crypto_hash/blake256/ref/hash.c"
@@ -3334,14 +3351,14 @@ function _blake256_final($0,$1) {
    $101 = (512 - ($100))|0; //@line 169 "c_src/crypto_hash/blake256/ref/hash.c"
    $102 = ($101|0)<(0); //@line 169 "c_src/crypto_hash/blake256/ref/hash.c"
    $103 = $102 << 31 >> 31; //@line 169 "c_src/crypto_hash/blake256/ref/hash.c"
-   _blake256_update($97,1253,$101,$103); //@line 169 "c_src/crypto_hash/blake256/ref/hash.c"
+   _blake256_update($97,1497,$101,$103); //@line 169 "c_src/crypto_hash/blake256/ref/hash.c"
    $104 = $2; //@line 170 "c_src/crypto_hash/blake256/ref/hash.c"
    $105 = ((($104)) + 48|0); //@line 170 "c_src/crypto_hash/blake256/ref/hash.c"
    $106 = HEAP32[$105>>2]|0; //@line 170 "c_src/crypto_hash/blake256/ref/hash.c"
    $107 = (($106) - 440)|0; //@line 170 "c_src/crypto_hash/blake256/ref/hash.c"
    HEAP32[$105>>2] = $107; //@line 170 "c_src/crypto_hash/blake256/ref/hash.c"
    $108 = $2; //@line 171 "c_src/crypto_hash/blake256/ref/hash.c"
-   _blake256_update($108,(1254),440,0); //@line 171 "c_src/crypto_hash/blake256/ref/hash.c"
+   _blake256_update($108,(1498),440,0); //@line 171 "c_src/crypto_hash/blake256/ref/hash.c"
    $109 = $2; //@line 172 "c_src/crypto_hash/blake256/ref/hash.c"
    $110 = ((($109)) + 60|0); //@line 172 "c_src/crypto_hash/blake256/ref/hash.c"
    HEAP32[$110>>2] = 1; //@line 172 "c_src/crypto_hash/blake256/ref/hash.c"
@@ -3778,46 +3795,46 @@ function _blake512_compress($0,$1) {
  var $3015 = 0, $3016 = 0, $3017 = 0, $3018 = 0, $3019 = 0, $302 = 0, $3020 = 0, $3021 = 0, $3022 = 0, $3023 = 0, $3024 = 0, $3025 = 0, $3026 = 0, $3027 = 0, $3028 = 0, $3029 = 0, $303 = 0, $3030 = 0, $3031 = 0, $3032 = 0;
  var $3033 = 0, $3034 = 0, $3035 = 0, $3036 = 0, $3037 = 0, $3038 = 0, $3039 = 0, $304 = 0, $3040 = 0, $3041 = 0, $3042 = 0, $3043 = 0, $3044 = 0, $3045 = 0, $3046 = 0, $3047 = 0, $3048 = 0, $3049 = 0, $305 = 0, $3050 = 0;
  var $3051 = 0, $3052 = 0, $3053 = 0, $3054 = 0, $3055 = 0, $3056 = 0, $3057 = 0, $3058 = 0, $3059 = 0, $306 = 0, $3060 = 0, $3061 = 0, $3062 = 0, $3063 = 0, $3064 = 0, $3065 = 0, $3066 = 0, $3067 = 0, $3068 = 0, $3069 = 0;
- var $307 = 0, $3070 = 0, $3071 = 0, $3072 = 0, $3073 = 0, $3074 = 0, $3075 = 0, $3076 = 0, $3077 = 0, $3078 = 0, $3079 = 0, $308 = 0, $3080 = 0, $3081 = 0, $3082 = 0, $3083 = 0, $3084 = 0, $3085 = 0, $3086 = 0, $309 = 0;
- var $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0;
- var $328 = 0, $329 = 0, $33 = 0, $330 = 0, $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0;
- var $346 = 0, $347 = 0, $348 = 0, $349 = 0, $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0;
- var $364 = 0, $365 = 0, $366 = 0, $367 = 0, $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0;
- var $382 = 0, $383 = 0, $384 = 0, $385 = 0, $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0;
- var $40 = 0, $400 = 0, $401 = 0, $402 = 0, $403 = 0, $404 = 0, $405 = 0, $406 = 0, $407 = 0, $408 = 0, $409 = 0, $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0, $415 = 0, $416 = 0, $417 = 0;
- var $418 = 0, $419 = 0, $42 = 0, $420 = 0, $421 = 0, $422 = 0, $423 = 0, $424 = 0, $425 = 0, $426 = 0, $427 = 0, $428 = 0, $429 = 0, $43 = 0, $430 = 0, $431 = 0, $432 = 0, $433 = 0, $434 = 0, $435 = 0;
- var $436 = 0, $437 = 0, $438 = 0, $439 = 0, $44 = 0, $440 = 0, $441 = 0, $442 = 0, $443 = 0, $444 = 0, $445 = 0, $446 = 0, $447 = 0, $448 = 0, $449 = 0, $45 = 0, $450 = 0, $451 = 0, $452 = 0, $453 = 0;
- var $454 = 0, $455 = 0, $456 = 0, $457 = 0, $458 = 0, $459 = 0, $46 = 0, $460 = 0, $461 = 0, $462 = 0, $463 = 0, $464 = 0, $465 = 0, $466 = 0, $467 = 0, $468 = 0, $469 = 0, $47 = 0, $470 = 0, $471 = 0;
- var $472 = 0, $473 = 0, $474 = 0, $475 = 0, $476 = 0, $477 = 0, $478 = 0, $479 = 0, $48 = 0, $480 = 0, $481 = 0, $482 = 0, $483 = 0, $484 = 0, $485 = 0, $486 = 0, $487 = 0, $488 = 0, $489 = 0, $49 = 0;
- var $490 = 0, $491 = 0, $492 = 0, $493 = 0, $494 = 0, $495 = 0, $496 = 0, $497 = 0, $498 = 0, $499 = 0, $5 = 0, $50 = 0, $500 = 0, $501 = 0, $502 = 0, $503 = 0, $504 = 0, $505 = 0, $506 = 0, $507 = 0;
- var $508 = 0, $509 = 0, $51 = 0, $510 = 0, $511 = 0, $512 = 0, $513 = 0, $514 = 0, $515 = 0, $516 = 0, $517 = 0, $518 = 0, $519 = 0, $52 = 0, $520 = 0, $521 = 0, $522 = 0, $523 = 0, $524 = 0, $525 = 0;
- var $526 = 0, $527 = 0, $528 = 0, $529 = 0, $53 = 0, $530 = 0, $531 = 0, $532 = 0, $533 = 0, $534 = 0, $535 = 0, $536 = 0, $537 = 0, $538 = 0, $539 = 0, $54 = 0, $540 = 0, $541 = 0, $542 = 0, $543 = 0;
- var $544 = 0, $545 = 0, $546 = 0, $547 = 0, $548 = 0, $549 = 0, $55 = 0, $550 = 0, $551 = 0, $552 = 0, $553 = 0, $554 = 0, $555 = 0, $556 = 0, $557 = 0, $558 = 0, $559 = 0, $56 = 0, $560 = 0, $561 = 0;
- var $562 = 0, $563 = 0, $564 = 0, $565 = 0, $566 = 0, $567 = 0, $568 = 0, $569 = 0, $57 = 0, $570 = 0, $571 = 0, $572 = 0, $573 = 0, $574 = 0, $575 = 0, $576 = 0, $577 = 0, $578 = 0, $579 = 0, $58 = 0;
- var $580 = 0, $581 = 0, $582 = 0, $583 = 0, $584 = 0, $585 = 0, $586 = 0, $587 = 0, $588 = 0, $589 = 0, $59 = 0, $590 = 0, $591 = 0, $592 = 0, $593 = 0, $594 = 0, $595 = 0, $596 = 0, $597 = 0, $598 = 0;
- var $599 = 0, $6 = 0, $60 = 0, $600 = 0, $601 = 0, $602 = 0, $603 = 0, $604 = 0, $605 = 0, $606 = 0, $607 = 0, $608 = 0, $609 = 0, $61 = 0, $610 = 0, $611 = 0, $612 = 0, $613 = 0, $614 = 0, $615 = 0;
- var $616 = 0, $617 = 0, $618 = 0, $619 = 0, $62 = 0, $620 = 0, $621 = 0, $622 = 0, $623 = 0, $624 = 0, $625 = 0, $626 = 0, $627 = 0, $628 = 0, $629 = 0, $63 = 0, $630 = 0, $631 = 0, $632 = 0, $633 = 0;
- var $634 = 0, $635 = 0, $636 = 0, $637 = 0, $638 = 0, $639 = 0, $64 = 0, $640 = 0, $641 = 0, $642 = 0, $643 = 0, $644 = 0, $645 = 0, $646 = 0, $647 = 0, $648 = 0, $649 = 0, $65 = 0, $650 = 0, $651 = 0;
- var $652 = 0, $653 = 0, $654 = 0, $655 = 0, $656 = 0, $657 = 0, $658 = 0, $659 = 0, $66 = 0, $660 = 0, $661 = 0, $662 = 0, $663 = 0, $664 = 0, $665 = 0, $666 = 0, $667 = 0, $668 = 0, $669 = 0, $67 = 0;
- var $670 = 0, $671 = 0, $672 = 0, $673 = 0, $674 = 0, $675 = 0, $676 = 0, $677 = 0, $678 = 0, $679 = 0, $68 = 0, $680 = 0, $681 = 0, $682 = 0, $683 = 0, $684 = 0, $685 = 0, $686 = 0, $687 = 0, $688 = 0;
- var $689 = 0, $69 = 0, $690 = 0, $691 = 0, $692 = 0, $693 = 0, $694 = 0, $695 = 0, $696 = 0, $697 = 0, $698 = 0, $699 = 0, $7 = 0, $70 = 0, $700 = 0, $701 = 0, $702 = 0, $703 = 0, $704 = 0, $705 = 0;
- var $706 = 0, $707 = 0, $708 = 0, $709 = 0, $71 = 0, $710 = 0, $711 = 0, $712 = 0, $713 = 0, $714 = 0, $715 = 0, $716 = 0, $717 = 0, $718 = 0, $719 = 0, $72 = 0, $720 = 0, $721 = 0, $722 = 0, $723 = 0;
- var $724 = 0, $725 = 0, $726 = 0, $727 = 0, $728 = 0, $729 = 0, $73 = 0, $730 = 0, $731 = 0, $732 = 0, $733 = 0, $734 = 0, $735 = 0, $736 = 0, $737 = 0, $738 = 0, $739 = 0, $74 = 0, $740 = 0, $741 = 0;
- var $742 = 0, $743 = 0, $744 = 0, $745 = 0, $746 = 0, $747 = 0, $748 = 0, $749 = 0, $75 = 0, $750 = 0, $751 = 0, $752 = 0, $753 = 0, $754 = 0, $755 = 0, $756 = 0, $757 = 0, $758 = 0, $759 = 0, $76 = 0;
- var $760 = 0, $761 = 0, $762 = 0, $763 = 0, $764 = 0, $765 = 0, $766 = 0, $767 = 0, $768 = 0, $769 = 0, $77 = 0, $770 = 0, $771 = 0, $772 = 0, $773 = 0, $774 = 0, $775 = 0, $776 = 0, $777 = 0, $778 = 0;
- var $779 = 0, $78 = 0, $780 = 0, $781 = 0, $782 = 0, $783 = 0, $784 = 0, $785 = 0, $786 = 0, $787 = 0, $788 = 0, $789 = 0, $79 = 0, $790 = 0, $791 = 0, $792 = 0, $793 = 0, $794 = 0, $795 = 0, $796 = 0;
- var $797 = 0, $798 = 0, $799 = 0, $8 = 0, $80 = 0, $800 = 0, $801 = 0, $802 = 0, $803 = 0, $804 = 0, $805 = 0, $806 = 0, $807 = 0, $808 = 0, $809 = 0, $81 = 0, $810 = 0, $811 = 0, $812 = 0, $813 = 0;
- var $814 = 0, $815 = 0, $816 = 0, $817 = 0, $818 = 0, $819 = 0, $82 = 0, $820 = 0, $821 = 0, $822 = 0, $823 = 0, $824 = 0, $825 = 0, $826 = 0, $827 = 0, $828 = 0, $829 = 0, $83 = 0, $830 = 0, $831 = 0;
- var $832 = 0, $833 = 0, $834 = 0, $835 = 0, $836 = 0, $837 = 0, $838 = 0, $839 = 0, $84 = 0, $840 = 0, $841 = 0, $842 = 0, $843 = 0, $844 = 0, $845 = 0, $846 = 0, $847 = 0, $848 = 0, $849 = 0, $85 = 0;
- var $850 = 0, $851 = 0, $852 = 0, $853 = 0, $854 = 0, $855 = 0, $856 = 0, $857 = 0, $858 = 0, $859 = 0, $86 = 0, $860 = 0, $861 = 0, $862 = 0, $863 = 0, $864 = 0, $865 = 0, $866 = 0, $867 = 0, $868 = 0;
- var $869 = 0, $87 = 0, $870 = 0, $871 = 0, $872 = 0, $873 = 0, $874 = 0, $875 = 0, $876 = 0, $877 = 0, $878 = 0, $879 = 0, $88 = 0, $880 = 0, $881 = 0, $882 = 0, $883 = 0, $884 = 0, $885 = 0, $886 = 0;
- var $887 = 0, $888 = 0, $889 = 0, $89 = 0, $890 = 0, $891 = 0, $892 = 0, $893 = 0, $894 = 0, $895 = 0, $896 = 0, $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0, $901 = 0, $902 = 0, $903 = 0;
- var $904 = 0, $905 = 0, $906 = 0, $907 = 0, $908 = 0, $909 = 0, $91 = 0, $910 = 0, $911 = 0, $912 = 0, $913 = 0, $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0, $92 = 0, $920 = 0, $921 = 0;
- var $922 = 0, $923 = 0, $924 = 0, $925 = 0, $926 = 0, $927 = 0, $928 = 0, $929 = 0, $93 = 0, $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0;
- var $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0;
- var $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0, $965 = 0, $966 = 0, $967 = 0, $968 = 0, $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0, $974 = 0, $975 = 0, $976 = 0;
- var $977 = 0, $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0, $983 = 0, $984 = 0, $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, $994 = 0;
- var $995 = 0, $996 = 0, $997 = 0, $998 = 0, $999 = 0, label = 0, sp = 0;
+ var $307 = 0, $3070 = 0, $3071 = 0, $3072 = 0, $3073 = 0, $3074 = 0, $3075 = 0, $3076 = 0, $3077 = 0, $3078 = 0, $3079 = 0, $308 = 0, $3080 = 0, $3081 = 0, $3082 = 0, $3083 = 0, $3084 = 0, $3085 = 0, $309 = 0, $31 = 0;
+ var $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0, $328 = 0;
+ var $329 = 0, $33 = 0, $330 = 0, $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0, $346 = 0;
+ var $347 = 0, $348 = 0, $349 = 0, $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0, $364 = 0;
+ var $365 = 0, $366 = 0, $367 = 0, $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0, $382 = 0;
+ var $383 = 0, $384 = 0, $385 = 0, $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0, $40 = 0;
+ var $400 = 0, $401 = 0, $402 = 0, $403 = 0, $404 = 0, $405 = 0, $406 = 0, $407 = 0, $408 = 0, $409 = 0, $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0, $415 = 0, $416 = 0, $417 = 0, $418 = 0;
+ var $419 = 0, $42 = 0, $420 = 0, $421 = 0, $422 = 0, $423 = 0, $424 = 0, $425 = 0, $426 = 0, $427 = 0, $428 = 0, $429 = 0, $43 = 0, $430 = 0, $431 = 0, $432 = 0, $433 = 0, $434 = 0, $435 = 0, $436 = 0;
+ var $437 = 0, $438 = 0, $439 = 0, $44 = 0, $440 = 0, $441 = 0, $442 = 0, $443 = 0, $444 = 0, $445 = 0, $446 = 0, $447 = 0, $448 = 0, $449 = 0, $45 = 0, $450 = 0, $451 = 0, $452 = 0, $453 = 0, $454 = 0;
+ var $455 = 0, $456 = 0, $457 = 0, $458 = 0, $459 = 0, $46 = 0, $460 = 0, $461 = 0, $462 = 0, $463 = 0, $464 = 0, $465 = 0, $466 = 0, $467 = 0, $468 = 0, $469 = 0, $47 = 0, $470 = 0, $471 = 0, $472 = 0;
+ var $473 = 0, $474 = 0, $475 = 0, $476 = 0, $477 = 0, $478 = 0, $479 = 0, $48 = 0, $480 = 0, $481 = 0, $482 = 0, $483 = 0, $484 = 0, $485 = 0, $486 = 0, $487 = 0, $488 = 0, $489 = 0, $49 = 0, $490 = 0;
+ var $491 = 0, $492 = 0, $493 = 0, $494 = 0, $495 = 0, $496 = 0, $497 = 0, $498 = 0, $499 = 0, $5 = 0, $50 = 0, $500 = 0, $501 = 0, $502 = 0, $503 = 0, $504 = 0, $505 = 0, $506 = 0, $507 = 0, $508 = 0;
+ var $509 = 0, $51 = 0, $510 = 0, $511 = 0, $512 = 0, $513 = 0, $514 = 0, $515 = 0, $516 = 0, $517 = 0, $518 = 0, $519 = 0, $52 = 0, $520 = 0, $521 = 0, $522 = 0, $523 = 0, $524 = 0, $525 = 0, $526 = 0;
+ var $527 = 0, $528 = 0, $529 = 0, $53 = 0, $530 = 0, $531 = 0, $532 = 0, $533 = 0, $534 = 0, $535 = 0, $536 = 0, $537 = 0, $538 = 0, $539 = 0, $54 = 0, $540 = 0, $541 = 0, $542 = 0, $543 = 0, $544 = 0;
+ var $545 = 0, $546 = 0, $547 = 0, $548 = 0, $549 = 0, $55 = 0, $550 = 0, $551 = 0, $552 = 0, $553 = 0, $554 = 0, $555 = 0, $556 = 0, $557 = 0, $558 = 0, $559 = 0, $56 = 0, $560 = 0, $561 = 0, $562 = 0;
+ var $563 = 0, $564 = 0, $565 = 0, $566 = 0, $567 = 0, $568 = 0, $569 = 0, $57 = 0, $570 = 0, $571 = 0, $572 = 0, $573 = 0, $574 = 0, $575 = 0, $576 = 0, $577 = 0, $578 = 0, $579 = 0, $58 = 0, $580 = 0;
+ var $581 = 0, $582 = 0, $583 = 0, $584 = 0, $585 = 0, $586 = 0, $587 = 0, $588 = 0, $589 = 0, $59 = 0, $590 = 0, $591 = 0, $592 = 0, $593 = 0, $594 = 0, $595 = 0, $596 = 0, $597 = 0, $598 = 0, $599 = 0;
+ var $6 = 0, $60 = 0, $600 = 0, $601 = 0, $602 = 0, $603 = 0, $604 = 0, $605 = 0, $606 = 0, $607 = 0, $608 = 0, $609 = 0, $61 = 0, $610 = 0, $611 = 0, $612 = 0, $613 = 0, $614 = 0, $615 = 0, $616 = 0;
+ var $617 = 0, $618 = 0, $619 = 0, $62 = 0, $620 = 0, $621 = 0, $622 = 0, $623 = 0, $624 = 0, $625 = 0, $626 = 0, $627 = 0, $628 = 0, $629 = 0, $63 = 0, $630 = 0, $631 = 0, $632 = 0, $633 = 0, $634 = 0;
+ var $635 = 0, $636 = 0, $637 = 0, $638 = 0, $639 = 0, $64 = 0, $640 = 0, $641 = 0, $642 = 0, $643 = 0, $644 = 0, $645 = 0, $646 = 0, $647 = 0, $648 = 0, $649 = 0, $65 = 0, $650 = 0, $651 = 0, $652 = 0;
+ var $653 = 0, $654 = 0, $655 = 0, $656 = 0, $657 = 0, $658 = 0, $659 = 0, $66 = 0, $660 = 0, $661 = 0, $662 = 0, $663 = 0, $664 = 0, $665 = 0, $666 = 0, $667 = 0, $668 = 0, $669 = 0, $67 = 0, $670 = 0;
+ var $671 = 0, $672 = 0, $673 = 0, $674 = 0, $675 = 0, $676 = 0, $677 = 0, $678 = 0, $679 = 0, $68 = 0, $680 = 0, $681 = 0, $682 = 0, $683 = 0, $684 = 0, $685 = 0, $686 = 0, $687 = 0, $688 = 0, $689 = 0;
+ var $69 = 0, $690 = 0, $691 = 0, $692 = 0, $693 = 0, $694 = 0, $695 = 0, $696 = 0, $697 = 0, $698 = 0, $699 = 0, $7 = 0, $70 = 0, $700 = 0, $701 = 0, $702 = 0, $703 = 0, $704 = 0, $705 = 0, $706 = 0;
+ var $707 = 0, $708 = 0, $709 = 0, $71 = 0, $710 = 0, $711 = 0, $712 = 0, $713 = 0, $714 = 0, $715 = 0, $716 = 0, $717 = 0, $718 = 0, $719 = 0, $72 = 0, $720 = 0, $721 = 0, $722 = 0, $723 = 0, $724 = 0;
+ var $725 = 0, $726 = 0, $727 = 0, $728 = 0, $729 = 0, $73 = 0, $730 = 0, $731 = 0, $732 = 0, $733 = 0, $734 = 0, $735 = 0, $736 = 0, $737 = 0, $738 = 0, $739 = 0, $74 = 0, $740 = 0, $741 = 0, $742 = 0;
+ var $743 = 0, $744 = 0, $745 = 0, $746 = 0, $747 = 0, $748 = 0, $749 = 0, $75 = 0, $750 = 0, $751 = 0, $752 = 0, $753 = 0, $754 = 0, $755 = 0, $756 = 0, $757 = 0, $758 = 0, $759 = 0, $76 = 0, $760 = 0;
+ var $761 = 0, $762 = 0, $763 = 0, $764 = 0, $765 = 0, $766 = 0, $767 = 0, $768 = 0, $769 = 0, $77 = 0, $770 = 0, $771 = 0, $772 = 0, $773 = 0, $774 = 0, $775 = 0, $776 = 0, $777 = 0, $778 = 0, $779 = 0;
+ var $78 = 0, $780 = 0, $781 = 0, $782 = 0, $783 = 0, $784 = 0, $785 = 0, $786 = 0, $787 = 0, $788 = 0, $789 = 0, $79 = 0, $790 = 0, $791 = 0, $792 = 0, $793 = 0, $794 = 0, $795 = 0, $796 = 0, $797 = 0;
+ var $798 = 0, $799 = 0, $8 = 0, $80 = 0, $800 = 0, $801 = 0, $802 = 0, $803 = 0, $804 = 0, $805 = 0, $806 = 0, $807 = 0, $808 = 0, $809 = 0, $81 = 0, $810 = 0, $811 = 0, $812 = 0, $813 = 0, $814 = 0;
+ var $815 = 0, $816 = 0, $817 = 0, $818 = 0, $819 = 0, $82 = 0, $820 = 0, $821 = 0, $822 = 0, $823 = 0, $824 = 0, $825 = 0, $826 = 0, $827 = 0, $828 = 0, $829 = 0, $83 = 0, $830 = 0, $831 = 0, $832 = 0;
+ var $833 = 0, $834 = 0, $835 = 0, $836 = 0, $837 = 0, $838 = 0, $839 = 0, $84 = 0, $840 = 0, $841 = 0, $842 = 0, $843 = 0, $844 = 0, $845 = 0, $846 = 0, $847 = 0, $848 = 0, $849 = 0, $85 = 0, $850 = 0;
+ var $851 = 0, $852 = 0, $853 = 0, $854 = 0, $855 = 0, $856 = 0, $857 = 0, $858 = 0, $859 = 0, $86 = 0, $860 = 0, $861 = 0, $862 = 0, $863 = 0, $864 = 0, $865 = 0, $866 = 0, $867 = 0, $868 = 0, $869 = 0;
+ var $87 = 0, $870 = 0, $871 = 0, $872 = 0, $873 = 0, $874 = 0, $875 = 0, $876 = 0, $877 = 0, $878 = 0, $879 = 0, $88 = 0, $880 = 0, $881 = 0, $882 = 0, $883 = 0, $884 = 0, $885 = 0, $886 = 0, $887 = 0;
+ var $888 = 0, $889 = 0, $89 = 0, $890 = 0, $891 = 0, $892 = 0, $893 = 0, $894 = 0, $895 = 0, $896 = 0, $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0, $901 = 0, $902 = 0, $903 = 0, $904 = 0;
+ var $905 = 0, $906 = 0, $907 = 0, $908 = 0, $909 = 0, $91 = 0, $910 = 0, $911 = 0, $912 = 0, $913 = 0, $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0, $92 = 0, $920 = 0, $921 = 0, $922 = 0;
+ var $923 = 0, $924 = 0, $925 = 0, $926 = 0, $927 = 0, $928 = 0, $929 = 0, $93 = 0, $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0, $940 = 0;
+ var $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0, $959 = 0;
+ var $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0, $965 = 0, $966 = 0, $967 = 0, $968 = 0, $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0, $974 = 0, $975 = 0, $976 = 0, $977 = 0;
+ var $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0, $983 = 0, $984 = 0, $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, $994 = 0, $995 = 0;
+ var $996 = 0, $997 = 0, $998 = 0, $999 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 272|0;
  $4 = sp + 136|0;
@@ -4010,17 +4027,17 @@ function _blake512_compress($0,$1) {
   $175 = ($172|0)==(0); //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
   $176 = $175 & $174; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
   $177 = $173 | $176; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $178 = $2;
   if (!($177)) {
    break;
   }
-  $178 = $6; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $179 = $178; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $180 = HEAP32[$179>>2]|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $181 = (($178) + 4)|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $182 = $181; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $183 = HEAP32[$182>>2]|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $184 = $2; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
-  $185 = (($184) + ($180<<3)|0); //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $179 = $6; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $180 = $179; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $181 = HEAP32[$180>>2]|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $182 = (($179) + 4)|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $183 = $182; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $184 = HEAP32[$183>>2]|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
+  $185 = (($178) + ($181<<3)|0); //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
   $186 = $185; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
   $187 = $186; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
   $188 = HEAP32[$187>>2]|0; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
@@ -4055,2965 +4072,2965 @@ function _blake512_compress($0,$1) {
   $214 = $213; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
   HEAP32[$214>>2] = $210; //@line 86 "c_src/crypto_hash/blake512/ref/hash.c"
  }
- $215 = $2; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $216 = ((($215)) + 64|0); //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $215 = ((($178)) + 64|0); //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $216 = $215; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
  $217 = $216; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $218 = $217; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $219 = HEAP32[$218>>2]|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $220 = (($217) + 4)|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $221 = $220; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $222 = HEAP32[$221>>2]|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $223 = $219 ^ -2052912941; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $224 = $222 ^ 608135816; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $225 = ((($4)) + 64|0); //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $218 = HEAP32[$217>>2]|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $219 = (($216) + 4)|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $220 = $219; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $221 = HEAP32[$220>>2]|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $222 = $218 ^ -2052912941; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $223 = $221 ^ 608135816; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $224 = ((($4)) + 64|0); //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $225 = $224; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
  $226 = $225; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $227 = $226; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$227>>2] = $223; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $228 = (($226) + 4)|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $229 = $228; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$229>>2] = $224; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
- $230 = $2; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $231 = ((($230)) + 64|0); //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $232 = ((($231)) + 8|0); //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$226>>2] = $222; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $227 = (($225) + 4)|0; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $228 = $227; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$228>>2] = $223; //@line 87 "c_src/crypto_hash/blake512/ref/hash.c"
+ $229 = $2; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $230 = ((($229)) + 64|0); //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $231 = ((($230)) + 8|0); //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $232 = $231; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
  $233 = $232; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $234 = $233; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $235 = HEAP32[$234>>2]|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $236 = (($233) + 4)|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $237 = $236; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $238 = HEAP32[$237>>2]|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $239 = $235 ^ 57701188; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $240 = $238 ^ 320440878; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $241 = ((($4)) + 72|0); //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $234 = HEAP32[$233>>2]|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $235 = (($232) + 4)|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $236 = $235; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $237 = HEAP32[$236>>2]|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $238 = $234 ^ 57701188; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $239 = $237 ^ 320440878; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $240 = ((($4)) + 72|0); //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $241 = $240; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
  $242 = $241; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $243 = $242; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$243>>2] = $239; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $244 = (($242) + 4)|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $245 = $244; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$245>>2] = $240; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
- $246 = $2; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $247 = ((($246)) + 64|0); //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $248 = ((($247)) + 16|0); //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$242>>2] = $238; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $243 = (($241) + 4)|0; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $244 = $243; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$244>>2] = $239; //@line 88 "c_src/crypto_hash/blake512/ref/hash.c"
+ $245 = $2; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $246 = ((($245)) + 64|0); //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $247 = ((($246)) + 16|0); //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $248 = $247; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
  $249 = $248; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $250 = $249; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $251 = HEAP32[$250>>2]|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $252 = (($249) + 4)|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $253 = $252; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $254 = HEAP32[$253>>2]|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $255 = $251 ^ 698298832; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $256 = $254 ^ -1542899678; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $257 = ((($4)) + 80|0); //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $250 = HEAP32[$249>>2]|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $251 = (($248) + 4)|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $252 = $251; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $253 = HEAP32[$252>>2]|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $254 = $250 ^ 698298832; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $255 = $253 ^ -1542899678; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $256 = ((($4)) + 80|0); //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $257 = $256; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
  $258 = $257; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $259 = $258; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$259>>2] = $255; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $260 = (($258) + 4)|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $261 = $260; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$261>>2] = $256; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
- $262 = $2; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $263 = ((($262)) + 64|0); //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $264 = ((($263)) + 24|0); //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$258>>2] = $254; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $259 = (($257) + 4)|0; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $260 = $259; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$260>>2] = $255; //@line 89 "c_src/crypto_hash/blake512/ref/hash.c"
+ $261 = $2; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $262 = ((($261)) + 64|0); //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $263 = ((($262)) + 24|0); //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $264 = $263; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
  $265 = $264; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $266 = $265; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $267 = HEAP32[$266>>2]|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $268 = (($265) + 4)|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $269 = $268; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $270 = HEAP32[$269>>2]|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $271 = $267 ^ -330404727; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $272 = $270 ^ 137296536; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $273 = ((($4)) + 88|0); //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $266 = HEAP32[$265>>2]|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $267 = (($264) + 4)|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $268 = $267; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $269 = HEAP32[$268>>2]|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $270 = $266 ^ -330404727; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $271 = $269 ^ 137296536; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $272 = ((($4)) + 88|0); //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $273 = $272; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
  $274 = $273; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $275 = $274; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$275>>2] = $271; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $276 = (($274) + 4)|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $277 = $276; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$277>>2] = $272; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
- $278 = ((($4)) + 96|0); //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$274>>2] = $270; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $275 = (($273) + 4)|0; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $276 = $275; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$276>>2] = $271; //@line 90 "c_src/crypto_hash/blake512/ref/hash.c"
+ $277 = ((($4)) + 96|0); //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
+ $278 = $277; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
  $279 = $278; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
- $280 = $279; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$280>>2] = 953160567; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
- $281 = (($279) + 4)|0; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
- $282 = $281; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$282>>2] = 1160258022; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
- $283 = ((($4)) + 104|0); //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$279>>2] = 953160567; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
+ $280 = (($278) + 4)|0; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
+ $281 = $280; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$281>>2] = 1160258022; //@line 91 "c_src/crypto_hash/blake512/ref/hash.c"
+ $282 = ((($4)) + 104|0); //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
+ $283 = $282; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
  $284 = $283; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
- $285 = $284; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$285>>2] = 887688300; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
- $286 = (($284) + 4)|0; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
- $287 = $286; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$287>>2] = -1101764913; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
- $288 = ((($4)) + 112|0); //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$284>>2] = 887688300; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
+ $285 = (($283) + 4)|0; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
+ $286 = $285; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$286>>2] = -1101764913; //@line 92 "c_src/crypto_hash/blake512/ref/hash.c"
+ $287 = ((($4)) + 112|0); //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
+ $288 = $287; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
  $289 = $288; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
- $290 = $289; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$290>>2] = -914599715; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
- $291 = (($289) + 4)|0; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
- $292 = $291; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$292>>2] = -1062458953; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
- $293 = ((($4)) + 120|0); //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$289>>2] = -914599715; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
+ $290 = (($288) + 4)|0; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
+ $291 = $290; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$291>>2] = -1062458953; //@line 93 "c_src/crypto_hash/blake512/ref/hash.c"
+ $292 = ((($4)) + 120|0); //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
+ $293 = $292; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
  $294 = $293; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
- $295 = $294; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$295>>2] = -1253635817; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
- $296 = (($294) + 4)|0; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
- $297 = $296; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$297>>2] = 1065670069; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
- $298 = $2; //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
- $299 = ((($298)) + 116|0); //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
- $300 = HEAP32[$299>>2]|0; //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
- $301 = ($300|0)==(0); //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
- if ($301) {
-  $302 = $2; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $303 = ((($302)) + 96|0); //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$294>>2] = -1253635817; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
+ $295 = (($293) + 4)|0; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
+ $296 = $295; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$296>>2] = 1065670069; //@line 94 "c_src/crypto_hash/blake512/ref/hash.c"
+ $297 = $2; //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
+ $298 = ((($297)) + 116|0); //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
+ $299 = HEAP32[$298>>2]|0; //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
+ $300 = ($299|0)==(0); //@line 95 "c_src/crypto_hash/blake512/ref/hash.c"
+ if ($300) {
+  $301 = $2; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $302 = ((($301)) + 96|0); //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $303 = $302; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
   $304 = $303; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $305 = $304; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $306 = HEAP32[$305>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $307 = (($304) + 4)|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $308 = $307; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $309 = HEAP32[$308>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $310 = ((($4)) + 96|0); //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $305 = HEAP32[$304>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $306 = (($303) + 4)|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $307 = $306; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $308 = HEAP32[$307>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $309 = ((($4)) + 96|0); //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $310 = $309; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
   $311 = $310; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $312 = $311; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $313 = HEAP32[$312>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $314 = (($311) + 4)|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $315 = $314; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $316 = HEAP32[$315>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $317 = $313 ^ $306; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $318 = $316 ^ $309; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $319 = $310; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $320 = $319; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$320>>2] = $317; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $321 = (($319) + 4)|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $322 = $321; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$322>>2] = $318; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
-  $323 = $2; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $324 = ((($323)) + 96|0); //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $312 = HEAP32[$311>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $313 = (($310) + 4)|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $314 = $313; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $315 = HEAP32[$314>>2]|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $316 = $312 ^ $305; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $317 = $315 ^ $308; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $318 = $309; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $319 = $318; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$319>>2] = $316; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $320 = (($318) + 4)|0; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $321 = $320; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$321>>2] = $317; //@line 96 "c_src/crypto_hash/blake512/ref/hash.c"
+  $322 = $2; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $323 = ((($322)) + 96|0); //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $324 = $323; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
   $325 = $324; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $326 = $325; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $327 = HEAP32[$326>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $328 = (($325) + 4)|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $329 = $328; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $330 = HEAP32[$329>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $331 = ((($4)) + 104|0); //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $326 = HEAP32[$325>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $327 = (($324) + 4)|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $328 = $327; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $329 = HEAP32[$328>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $330 = ((($4)) + 104|0); //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $331 = $330; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
   $332 = $331; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $333 = $332; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $334 = HEAP32[$333>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $335 = (($332) + 4)|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $336 = $335; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $337 = HEAP32[$336>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $338 = $334 ^ $327; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $339 = $337 ^ $330; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $340 = $331; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $341 = $340; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$341>>2] = $338; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $342 = (($340) + 4)|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $343 = $342; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$343>>2] = $339; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
-  $344 = $2; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $345 = ((($344)) + 96|0); //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $346 = ((($345)) + 8|0); //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $333 = HEAP32[$332>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $334 = (($331) + 4)|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $335 = $334; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $336 = HEAP32[$335>>2]|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $337 = $333 ^ $326; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $338 = $336 ^ $329; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $339 = $330; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $340 = $339; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$340>>2] = $337; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $341 = (($339) + 4)|0; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $342 = $341; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$342>>2] = $338; //@line 97 "c_src/crypto_hash/blake512/ref/hash.c"
+  $343 = $2; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $344 = ((($343)) + 96|0); //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $345 = ((($344)) + 8|0); //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $346 = $345; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
   $347 = $346; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $348 = $347; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $349 = HEAP32[$348>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $350 = (($347) + 4)|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $351 = $350; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $352 = HEAP32[$351>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $353 = ((($4)) + 112|0); //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $348 = HEAP32[$347>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $349 = (($346) + 4)|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $350 = $349; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $351 = HEAP32[$350>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $352 = ((($4)) + 112|0); //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $353 = $352; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
   $354 = $353; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $355 = $354; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $356 = HEAP32[$355>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $357 = (($354) + 4)|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $358 = $357; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $359 = HEAP32[$358>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $360 = $356 ^ $349; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $361 = $359 ^ $352; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $362 = $353; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $363 = $362; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$363>>2] = $360; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $364 = (($362) + 4)|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $365 = $364; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$365>>2] = $361; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
-  $366 = $2; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $367 = ((($366)) + 96|0); //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $368 = ((($367)) + 8|0); //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $355 = HEAP32[$354>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $356 = (($353) + 4)|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $357 = $356; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $358 = HEAP32[$357>>2]|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $359 = $355 ^ $348; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $360 = $358 ^ $351; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $361 = $352; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $362 = $361; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$362>>2] = $359; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $363 = (($361) + 4)|0; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $364 = $363; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$364>>2] = $360; //@line 98 "c_src/crypto_hash/blake512/ref/hash.c"
+  $365 = $2; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $366 = ((($365)) + 96|0); //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $367 = ((($366)) + 8|0); //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $368 = $367; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
   $369 = $368; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $370 = $369; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $371 = HEAP32[$370>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $372 = (($369) + 4)|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $373 = $372; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $374 = HEAP32[$373>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $375 = ((($4)) + 120|0); //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $370 = HEAP32[$369>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $371 = (($368) + 4)|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $372 = $371; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $373 = HEAP32[$372>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $374 = ((($4)) + 120|0); //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $375 = $374; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
   $376 = $375; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $377 = $376; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $378 = HEAP32[$377>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $379 = (($376) + 4)|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $380 = $379; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $381 = HEAP32[$380>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $382 = $378 ^ $371; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $383 = $381 ^ $374; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $384 = $375; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $385 = $384; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$385>>2] = $382; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $386 = (($384) + 4)|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  $387 = $386; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$387>>2] = $383; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $377 = HEAP32[$376>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $378 = (($375) + 4)|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $379 = $378; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $380 = HEAP32[$379>>2]|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $381 = $377 ^ $370; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $382 = $380 ^ $373; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $383 = $374; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $384 = $383; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$384>>2] = $381; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $385 = (($383) + 4)|0; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  $386 = $385; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$386>>2] = $382; //@line 99 "c_src/crypto_hash/blake512/ref/hash.c"
  }
- $388 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
- $389 = $388; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$389>>2] = 0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
- $390 = (($388) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
- $391 = $390; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$391>>2] = 0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+ $387 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+ $388 = $387; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$388>>2] = 0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+ $389 = (($387) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+ $390 = $389; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$390>>2] = 0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
  while(1) {
-  $392 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $393 = $392; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $394 = HEAP32[$393>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $395 = (($392) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $396 = $395; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $397 = HEAP32[$396>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $398 = ($397>>>0)<(0); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $399 = ($394>>>0)<(16); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $400 = ($397|0)==(0); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $401 = $400 & $399; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $402 = $398 | $401; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  if (!($402)) {
+  $391 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $392 = $391; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $393 = HEAP32[$392>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $394 = (($391) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $395 = $394; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $396 = HEAP32[$395>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $397 = ($396>>>0)<(0); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $398 = ($393>>>0)<(16); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $399 = ($396|0)==(0); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $400 = $399 & $398; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $401 = $397 | $400; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  if (!($401)) {
    break;
   }
-  $403 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $404 = $403; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $405 = HEAP32[$404>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $406 = (($403) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $407 = $406; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $408 = HEAP32[$407>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $409 = (1317 + ($405<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $410 = HEAP8[$409>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $411 = $410&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $412 = (($5) + ($411<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $402 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $403 = $402; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $404 = HEAP32[$403>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $405 = (($402) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $406 = $405; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $407 = HEAP32[$406>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $408 = (1561 + ($404<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $409 = HEAP8[$408>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $410 = $409&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $411 = (($5) + ($410<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $412 = $411; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $413 = $412; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $414 = $413; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $415 = HEAP32[$414>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $416 = (($413) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $417 = $416; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $418 = HEAP32[$417>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $419 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $420 = $419; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $421 = HEAP32[$420>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $422 = (($419) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $423 = $422; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $424 = HEAP32[$423>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $425 = (1317 + ($421<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $426 = ((($425)) + 1|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $427 = HEAP8[$426>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $428 = $427&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $429 = (8 + ($428<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $414 = HEAP32[$413>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $415 = (($412) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $416 = $415; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $417 = HEAP32[$416>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $418 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $419 = $418; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $420 = HEAP32[$419>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $421 = (($418) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $422 = $421; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $423 = HEAP32[$422>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $424 = (1561 + ($420<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $425 = ((($424)) + 1|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $426 = HEAP8[$425>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $427 = $426&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $428 = (8 + ($427<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $429 = $428; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $430 = $429; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $431 = $430; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $432 = HEAP32[$431>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $433 = (($430) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $434 = $433; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $435 = HEAP32[$434>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $436 = $415 ^ $432; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $437 = $418 ^ $435; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $438 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $431 = HEAP32[$430>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $432 = (($429) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $433 = $432; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $434 = HEAP32[$433>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $435 = $414 ^ $431; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $436 = $417 ^ $434; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $437 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $438 = $437; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $439 = $438; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $440 = $439; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $441 = HEAP32[$440>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $442 = (($439) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $443 = $442; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $444 = HEAP32[$443>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $445 = (_i64Add(($436|0),($437|0),($441|0),($444|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $446 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $447 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $448 = $447; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $449 = HEAP32[$448>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $450 = (($447) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $451 = $450; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $452 = HEAP32[$451>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $453 = (_i64Add(($449|0),($452|0),($445|0),($446|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $454 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $455 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $456 = $455; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$456>>2] = $453; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $457 = (($455) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $458 = $457; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$458>>2] = $454; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $459 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $440 = HEAP32[$439>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $441 = (($438) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $442 = $441; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $443 = HEAP32[$442>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $444 = (_i64Add(($435|0),($436|0),($440|0),($443|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $445 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $446 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $447 = $446; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $448 = HEAP32[$447>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $449 = (($446) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $450 = $449; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $451 = HEAP32[$450>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $452 = (_i64Add(($448|0),($451|0),($444|0),($445|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $453 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $454 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $455 = $454; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$455>>2] = $452; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $456 = (($454) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $457 = $456; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$457>>2] = $453; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $458 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $459 = $458; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $460 = $459; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $461 = $460; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $462 = HEAP32[$461>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $463 = (($460) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $464 = $463; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $465 = HEAP32[$464>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $466 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $467 = $466; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $468 = HEAP32[$467>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $469 = (($466) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $470 = $469; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $471 = HEAP32[$470>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $472 = $462 ^ $468; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $465 ^ $471; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $473 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $461 = HEAP32[$460>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $462 = (($459) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $463 = $462; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $464 = HEAP32[$463>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $465 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $466 = $465; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $467 = HEAP32[$466>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $468 = (($465) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $469 = $468; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $470 = HEAP32[$469>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $471 = $461 ^ $467; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $464 ^ $470; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $472 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $473 = $472; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $474 = $473; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $475 = $474; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $476 = HEAP32[$475>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $477 = (($474) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $478 = $477; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $479 = HEAP32[$478>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $480 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $481 = $480; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $482 = HEAP32[$481>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $483 = (($480) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $484 = $483; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $485 = HEAP32[$484>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $476 ^ $482; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $486 = $479 ^ $485; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $487 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $475 = HEAP32[$474>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $476 = (($473) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $477 = $476; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $478 = HEAP32[$477>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $479 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $480 = $479; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $481 = HEAP32[$480>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $482 = (($479) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $483 = $482; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $484 = HEAP32[$483>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $475 ^ $481; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $485 = $478 ^ $484; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $486 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $487 = $486; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $488 = $487; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $489 = $488; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$489>>2] = $486; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $490 = (($488) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $491 = $490; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$491>>2] = $472; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $492 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$488>>2] = $485; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $489 = (($487) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $490 = $489; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$490>>2] = $471; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $491 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $492 = $491; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $493 = $492; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $494 = $493; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $495 = HEAP32[$494>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $496 = (($493) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $497 = $496; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $498 = HEAP32[$497>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $499 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $494 = HEAP32[$493>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $495 = (($492) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $496 = $495; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $497 = HEAP32[$496>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $498 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $499 = $498; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $500 = $499; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $501 = $500; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $502 = HEAP32[$501>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $503 = (($500) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $504 = $503; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $505 = HEAP32[$504>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $506 = (_i64Add(($502|0),($505|0),($495|0),($498|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $507 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $508 = $499; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $509 = $508; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$509>>2] = $506; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $510 = (($508) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $511 = $510; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$511>>2] = $507; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $512 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $501 = HEAP32[$500>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $502 = (($499) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $503 = $502; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $504 = HEAP32[$503>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $505 = (_i64Add(($501|0),($504|0),($494|0),($497|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $506 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $507 = $498; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $508 = $507; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$508>>2] = $505; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $509 = (($507) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $510 = $509; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$510>>2] = $506; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $511 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $512 = $511; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $513 = $512; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $514 = $513; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $515 = HEAP32[$514>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $516 = (($513) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $517 = $516; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $518 = HEAP32[$517>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $519 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $514 = HEAP32[$513>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $515 = (($512) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $516 = $515; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $517 = HEAP32[$516>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $518 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $519 = $518; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $520 = $519; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $521 = $520; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $522 = HEAP32[$521>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $523 = (($520) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $524 = $523; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $525 = HEAP32[$524>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $526 = $515 ^ $522; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $527 = $518 ^ $525; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $528 = (_bitshift64Shl(($526|0),($527|0),39)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $529 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $530 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $521 = HEAP32[$520>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $522 = (($519) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $523 = $522; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $524 = HEAP32[$523>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $525 = $514 ^ $521; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $526 = $517 ^ $524; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $527 = (_bitshift64Shl(($525|0),($526|0),39)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $528 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $529 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $530 = $529; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $531 = $530; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $532 = $531; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $533 = HEAP32[$532>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $534 = (($531) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $535 = $534; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $536 = HEAP32[$535>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $537 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $532 = HEAP32[$531>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $533 = (($530) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $534 = $533; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $535 = HEAP32[$534>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $536 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $537 = $536; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $538 = $537; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $539 = $538; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $540 = HEAP32[$539>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $541 = (($538) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $542 = $541; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $543 = HEAP32[$542>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $544 = $533 ^ $540; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $545 = $536 ^ $543; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $546 = (_bitshift64Lshr(($544|0),($545|0),25)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $547 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $539 = HEAP32[$538>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $540 = (($537) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $541 = $540; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $542 = HEAP32[$541>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $543 = $532 ^ $539; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $544 = $535 ^ $542; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $545 = (_bitshift64Lshr(($543|0),($544|0),25)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $546 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $547 = $527 | $545; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $548 = $528 | $546; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $549 = $529 | $547; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $550 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $549 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $550 = $549; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $551 = $550; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $552 = $551; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$552>>2] = $548; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $553 = (($551) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $554 = $553; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$554>>2] = $549; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $555 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $556 = $555; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $557 = HEAP32[$556>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $558 = (($555) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $559 = $558; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $560 = HEAP32[$559>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $561 = (1317 + ($557<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $562 = ((($561)) + 1|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $563 = HEAP8[$562>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $564 = $563&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $565 = (($5) + ($564<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$551>>2] = $547; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $552 = (($550) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $553 = $552; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$553>>2] = $548; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $554 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $555 = $554; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $556 = HEAP32[$555>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $557 = (($554) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $558 = $557; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $559 = HEAP32[$558>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $560 = (1561 + ($556<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $561 = ((($560)) + 1|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $562 = HEAP8[$561>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $563 = $562&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $564 = (($5) + ($563<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $565 = $564; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $566 = $565; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $567 = $566; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $568 = HEAP32[$567>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $569 = (($566) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $570 = $569; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $571 = HEAP32[$570>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $572 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $573 = $572; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $574 = HEAP32[$573>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $575 = (($572) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $576 = $575; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $577 = HEAP32[$576>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $578 = (1317 + ($574<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $579 = HEAP8[$578>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $580 = $579&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $581 = (8 + ($580<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $567 = HEAP32[$566>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $568 = (($565) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $569 = $568; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $570 = HEAP32[$569>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $571 = $6; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $572 = $571; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $573 = HEAP32[$572>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $574 = (($571) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $575 = $574; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $576 = HEAP32[$575>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $577 = (1561 + ($573<<4)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $578 = HEAP8[$577>>0]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $579 = $578&255; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $580 = (8 + ($579<<3)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $581 = $580; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $582 = $581; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $583 = $582; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $584 = HEAP32[$583>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $585 = (($582) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $586 = $585; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $587 = HEAP32[$586>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $588 = $568 ^ $584; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $589 = $571 ^ $587; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $590 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $583 = HEAP32[$582>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $584 = (($581) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $585 = $584; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $586 = HEAP32[$585>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $587 = $567 ^ $583; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $588 = $570 ^ $586; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $589 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $590 = $589; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $591 = $590; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $592 = $591; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $593 = HEAP32[$592>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $594 = (($591) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $595 = $594; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $596 = HEAP32[$595>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $597 = (_i64Add(($588|0),($589|0),($593|0),($596|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $598 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $599 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $600 = $599; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $601 = HEAP32[$600>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $602 = (($599) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $603 = $602; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $604 = HEAP32[$603>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $605 = (_i64Add(($601|0),($604|0),($597|0),($598|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $606 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $607 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $608 = $607; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$608>>2] = $605; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $609 = (($607) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $610 = $609; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$610>>2] = $606; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $611 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $592 = HEAP32[$591>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $593 = (($590) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $594 = $593; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $595 = HEAP32[$594>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $596 = (_i64Add(($587|0),($588|0),($592|0),($595|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $597 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $598 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $599 = $598; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $600 = HEAP32[$599>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $601 = (($598) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $602 = $601; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $603 = HEAP32[$602>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $604 = (_i64Add(($600|0),($603|0),($596|0),($597|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $605 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $606 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $607 = $606; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$607>>2] = $604; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $608 = (($606) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $609 = $608; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$609>>2] = $605; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $610 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $611 = $610; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $612 = $611; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $613 = $612; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $614 = HEAP32[$613>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $615 = (($612) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $616 = $615; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $617 = HEAP32[$616>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $618 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $619 = $618; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $620 = HEAP32[$619>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $621 = (($618) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $622 = $621; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $623 = HEAP32[$622>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $624 = $614 ^ $620; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $625 = $617 ^ $623; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $626 = (_bitshift64Shl(($624|0),($625|0),48)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $627 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $628 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $613 = HEAP32[$612>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $614 = (($611) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $615 = $614; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $616 = HEAP32[$615>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $617 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $618 = $617; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $619 = HEAP32[$618>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $620 = (($617) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $621 = $620; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $622 = HEAP32[$621>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $623 = $613 ^ $619; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $624 = $616 ^ $622; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $625 = (_bitshift64Shl(($623|0),($624|0),48)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $626 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $627 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $628 = $627; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $629 = $628; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $630 = $629; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $631 = HEAP32[$630>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $632 = (($629) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $633 = $632; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $634 = HEAP32[$633>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $635 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $636 = $635; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $637 = HEAP32[$636>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $638 = (($635) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $639 = $638; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $640 = HEAP32[$639>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $641 = $631 ^ $637; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $642 = $634 ^ $640; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $643 = (_bitshift64Lshr(($641|0),($642|0),16)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $644 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $630 = HEAP32[$629>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $631 = (($628) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $632 = $631; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $633 = HEAP32[$632>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $634 = $4; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $635 = $634; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $636 = HEAP32[$635>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $637 = (($634) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $638 = $637; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $639 = HEAP32[$638>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $640 = $630 ^ $636; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $641 = $633 ^ $639; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $642 = (_bitshift64Lshr(($640|0),($641|0),16)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $643 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $644 = $625 | $642; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $645 = $626 | $643; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $646 = $627 | $644; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $647 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $646 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $647 = $646; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $648 = $647; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $649 = $648; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$649>>2] = $645; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $650 = (($648) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $651 = $650; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$651>>2] = $646; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $652 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$648>>2] = $644; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $649 = (($647) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $650 = $649; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$650>>2] = $645; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $651 = ((($4)) + 96|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $652 = $651; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $653 = $652; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $654 = $653; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $655 = HEAP32[$654>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $656 = (($653) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $657 = $656; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $658 = HEAP32[$657>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $659 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $654 = HEAP32[$653>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $655 = (($652) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $656 = $655; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $657 = HEAP32[$656>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $658 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $659 = $658; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $660 = $659; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $661 = $660; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $662 = HEAP32[$661>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $663 = (($660) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $664 = $663; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $665 = HEAP32[$664>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $666 = (_i64Add(($662|0),($665|0),($655|0),($658|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $667 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $668 = $659; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $669 = $668; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$669>>2] = $666; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $670 = (($668) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $671 = $670; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$671>>2] = $667; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $672 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $661 = HEAP32[$660>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $662 = (($659) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $663 = $662; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $664 = HEAP32[$663>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $665 = (_i64Add(($661|0),($664|0),($654|0),($657|0))|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $666 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $667 = $658; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $668 = $667; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$668>>2] = $665; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $669 = (($667) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $670 = $669; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$670>>2] = $666; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $671 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $672 = $671; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $673 = $672; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $674 = $673; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $675 = HEAP32[$674>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $676 = (($673) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $677 = $676; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $678 = HEAP32[$677>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $679 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $674 = HEAP32[$673>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $675 = (($672) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $676 = $675; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $677 = HEAP32[$676>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $678 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $679 = $678; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $680 = $679; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $681 = $680; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $682 = HEAP32[$681>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $683 = (($680) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $684 = $683; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $685 = HEAP32[$684>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $686 = $675 ^ $682; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $687 = $678 ^ $685; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $688 = (_bitshift64Shl(($686|0),($687|0),53)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $689 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $690 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $681 = HEAP32[$680>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $682 = (($679) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $683 = $682; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $684 = HEAP32[$683>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $685 = $674 ^ $681; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $686 = $677 ^ $684; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $687 = (_bitshift64Shl(($685|0),($686|0),53)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $688 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $689 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $690 = $689; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $691 = $690; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $692 = $691; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $693 = HEAP32[$692>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $694 = (($691) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $695 = $694; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $696 = HEAP32[$695>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $697 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $692 = HEAP32[$691>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $693 = (($690) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $694 = $693; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $695 = HEAP32[$694>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $696 = ((($4)) + 64|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $697 = $696; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $698 = $697; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $699 = $698; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $700 = HEAP32[$699>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $701 = (($698) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $702 = $701; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $703 = HEAP32[$702>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $704 = $693 ^ $700; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $705 = $696 ^ $703; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $706 = (_bitshift64Lshr(($704|0),($705|0),11)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $707 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $699 = HEAP32[$698>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $700 = (($697) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $701 = $700; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $702 = HEAP32[$701>>2]|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $703 = $692 ^ $699; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $704 = $695 ^ $702; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $705 = (_bitshift64Lshr(($703|0),($704|0),11)|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $706 = tempRet0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $707 = $687 | $705; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $708 = $688 | $706; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $709 = $689 | $707; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $710 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $709 = ((($4)) + 32|0); //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $710 = $709; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
   $711 = $710; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $712 = $711; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$712>>2] = $708; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $713 = (($711) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $714 = $713; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$714>>2] = $709; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
-  $715 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $716 = $715; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $717 = HEAP32[$716>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $718 = (($715) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $719 = $718; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $720 = HEAP32[$719>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $721 = (1317 + ($717<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $722 = ((($721)) + 2|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $723 = HEAP8[$722>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $724 = $723&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $725 = (($5) + ($724<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$711>>2] = $707; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $712 = (($710) + 4)|0; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $713 = $712; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$713>>2] = $708; //@line 103 "c_src/crypto_hash/blake512/ref/hash.c"
+  $714 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $715 = $714; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $716 = HEAP32[$715>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $717 = (($714) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $718 = $717; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $719 = HEAP32[$718>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $720 = (1561 + ($716<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $721 = ((($720)) + 2|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $722 = HEAP8[$721>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $723 = $722&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $724 = (($5) + ($723<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $725 = $724; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $726 = $725; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $727 = $726; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $728 = HEAP32[$727>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $729 = (($726) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $730 = $729; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $731 = HEAP32[$730>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $732 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $733 = $732; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $734 = HEAP32[$733>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $735 = (($732) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $736 = $735; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $737 = HEAP32[$736>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $738 = (1317 + ($734<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $739 = ((($738)) + 3|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $740 = HEAP8[$739>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $741 = $740&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $742 = (8 + ($741<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $727 = HEAP32[$726>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $728 = (($725) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $729 = $728; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $730 = HEAP32[$729>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $731 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $732 = $731; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $733 = HEAP32[$732>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $734 = (($731) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $735 = $734; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $736 = HEAP32[$735>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $737 = (1561 + ($733<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $738 = ((($737)) + 3|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $739 = HEAP8[$738>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $740 = $739&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $741 = (8 + ($740<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $742 = $741; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $743 = $742; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $744 = $743; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $745 = HEAP32[$744>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $746 = (($743) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $747 = $746; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $748 = HEAP32[$747>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $749 = $728 ^ $745; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $750 = $731 ^ $748; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $751 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $744 = HEAP32[$743>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $745 = (($742) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $746 = $745; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $747 = HEAP32[$746>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $748 = $727 ^ $744; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $749 = $730 ^ $747; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $750 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $751 = $750; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $752 = $751; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $753 = $752; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $754 = HEAP32[$753>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $755 = (($752) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $756 = $755; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $757 = HEAP32[$756>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $758 = (_i64Add(($749|0),($750|0),($754|0),($757|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $759 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $760 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $753 = HEAP32[$752>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $754 = (($751) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $755 = $754; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $756 = HEAP32[$755>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $757 = (_i64Add(($748|0),($749|0),($753|0),($756|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $758 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $759 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $760 = $759; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $761 = $760; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $762 = $761; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $763 = HEAP32[$762>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $764 = (($761) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $765 = $764; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $766 = HEAP32[$765>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $767 = (_i64Add(($763|0),($766|0),($758|0),($759|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $768 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $769 = $760; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $770 = $769; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$770>>2] = $767; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $771 = (($769) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $772 = $771; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$772>>2] = $768; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $773 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $762 = HEAP32[$761>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $763 = (($760) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $764 = $763; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $765 = HEAP32[$764>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $766 = (_i64Add(($762|0),($765|0),($757|0),($758|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $767 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $768 = $759; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $769 = $768; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$769>>2] = $766; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $770 = (($768) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $771 = $770; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$771>>2] = $767; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $772 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $773 = $772; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $774 = $773; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $775 = $774; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $776 = HEAP32[$775>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $777 = (($774) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $778 = $777; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $779 = HEAP32[$778>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $780 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $775 = HEAP32[$774>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $776 = (($773) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $777 = $776; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $778 = HEAP32[$777>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $779 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $780 = $779; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $781 = $780; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $782 = $781; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $783 = HEAP32[$782>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $784 = (($781) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $785 = $784; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $786 = HEAP32[$785>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $787 = $776 ^ $783; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $779 ^ $786; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $788 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $782 = HEAP32[$781>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $783 = (($780) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $784 = $783; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $785 = HEAP32[$784>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $786 = $775 ^ $782; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $778 ^ $785; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $787 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $788 = $787; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $789 = $788; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $790 = $789; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $791 = HEAP32[$790>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $792 = (($789) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $793 = $792; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $794 = HEAP32[$793>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $795 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $790 = HEAP32[$789>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $791 = (($788) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $792 = $791; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $793 = HEAP32[$792>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $794 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $795 = $794; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $796 = $795; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $797 = $796; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $798 = HEAP32[$797>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $799 = (($796) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $800 = $799; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $801 = HEAP32[$800>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $791 ^ $798; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $802 = $794 ^ $801; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $803 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $797 = HEAP32[$796>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $798 = (($795) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $799 = $798; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $800 = HEAP32[$799>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $790 ^ $797; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $801 = $793 ^ $800; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $802 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $803 = $802; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $804 = $803; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $805 = $804; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$805>>2] = $802; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $806 = (($804) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $807 = $806; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$807>>2] = $787; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $808 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$804>>2] = $801; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $805 = (($803) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $806 = $805; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$806>>2] = $786; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $807 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $808 = $807; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $809 = $808; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $810 = $809; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $811 = HEAP32[$810>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $812 = (($809) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $813 = $812; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $814 = HEAP32[$813>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $815 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $810 = HEAP32[$809>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $811 = (($808) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $812 = $811; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $813 = HEAP32[$812>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $814 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $815 = $814; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $816 = $815; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $817 = $816; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $818 = HEAP32[$817>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $819 = (($816) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $820 = $819; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $821 = HEAP32[$820>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $822 = (_i64Add(($818|0),($821|0),($811|0),($814|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $823 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $824 = $815; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $825 = $824; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$825>>2] = $822; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $826 = (($824) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $827 = $826; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$827>>2] = $823; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $828 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $817 = HEAP32[$816>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $818 = (($815) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $819 = $818; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $820 = HEAP32[$819>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $821 = (_i64Add(($817|0),($820|0),($810|0),($813|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $822 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $823 = $814; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $824 = $823; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$824>>2] = $821; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $825 = (($823) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $826 = $825; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$826>>2] = $822; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $827 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $828 = $827; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $829 = $828; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $830 = $829; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $831 = HEAP32[$830>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $832 = (($829) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $833 = $832; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $834 = HEAP32[$833>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $835 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $830 = HEAP32[$829>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $831 = (($828) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $832 = $831; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $833 = HEAP32[$832>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $834 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $835 = $834; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $836 = $835; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $837 = $836; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $838 = HEAP32[$837>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $839 = (($836) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $840 = $839; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $841 = HEAP32[$840>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $842 = $831 ^ $838; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $843 = $834 ^ $841; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $844 = (_bitshift64Shl(($842|0),($843|0),39)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $845 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $846 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $837 = HEAP32[$836>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $838 = (($835) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $839 = $838; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $840 = HEAP32[$839>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $841 = $830 ^ $837; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $842 = $833 ^ $840; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $843 = (_bitshift64Shl(($841|0),($842|0),39)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $844 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $845 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $846 = $845; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $847 = $846; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $848 = $847; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $849 = HEAP32[$848>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $850 = (($847) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $851 = $850; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $852 = HEAP32[$851>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $853 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $848 = HEAP32[$847>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $849 = (($846) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $850 = $849; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $851 = HEAP32[$850>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $852 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $853 = $852; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $854 = $853; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $855 = $854; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $856 = HEAP32[$855>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $857 = (($854) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $858 = $857; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $859 = HEAP32[$858>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $860 = $849 ^ $856; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $861 = $852 ^ $859; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $862 = (_bitshift64Lshr(($860|0),($861|0),25)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $863 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $855 = HEAP32[$854>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $856 = (($853) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $857 = $856; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $858 = HEAP32[$857>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $859 = $848 ^ $855; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $860 = $851 ^ $858; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $861 = (_bitshift64Lshr(($859|0),($860|0),25)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $862 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $863 = $843 | $861; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $864 = $844 | $862; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $865 = $845 | $863; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $866 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $865 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $866 = $865; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $867 = $866; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $868 = $867; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$868>>2] = $864; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $869 = (($867) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $870 = $869; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$870>>2] = $865; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $871 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $872 = $871; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $873 = HEAP32[$872>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $874 = (($871) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $875 = $874; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $876 = HEAP32[$875>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $877 = (1317 + ($873<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $878 = ((($877)) + 3|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $879 = HEAP8[$878>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $880 = $879&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $881 = (($5) + ($880<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$867>>2] = $863; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $868 = (($866) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $869 = $868; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$869>>2] = $864; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $870 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $871 = $870; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $872 = HEAP32[$871>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $873 = (($870) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $874 = $873; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $875 = HEAP32[$874>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $876 = (1561 + ($872<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $877 = ((($876)) + 3|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $878 = HEAP8[$877>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $879 = $878&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $880 = (($5) + ($879<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $881 = $880; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $882 = $881; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $883 = $882; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $884 = HEAP32[$883>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $885 = (($882) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $886 = $885; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $887 = HEAP32[$886>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $888 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $889 = $888; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $890 = HEAP32[$889>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $891 = (($888) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $892 = $891; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $893 = HEAP32[$892>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $894 = (1317 + ($890<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $895 = ((($894)) + 2|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $896 = HEAP8[$895>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $897 = $896&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $898 = (8 + ($897<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $883 = HEAP32[$882>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $884 = (($881) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $885 = $884; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $886 = HEAP32[$885>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $887 = $6; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $888 = $887; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $889 = HEAP32[$888>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $890 = (($887) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $891 = $890; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $892 = HEAP32[$891>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $893 = (1561 + ($889<<4)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $894 = ((($893)) + 2|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $895 = HEAP8[$894>>0]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $896 = $895&255; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $897 = (8 + ($896<<3)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $898 = $897; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $899 = $898; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $900 = $899; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $901 = HEAP32[$900>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $902 = (($899) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $903 = $902; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $904 = HEAP32[$903>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $905 = $884 ^ $901; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $906 = $887 ^ $904; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $907 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $900 = HEAP32[$899>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $901 = (($898) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $902 = $901; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $903 = HEAP32[$902>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $904 = $883 ^ $900; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $905 = $886 ^ $903; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $906 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $907 = $906; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $908 = $907; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $909 = $908; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $910 = HEAP32[$909>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $911 = (($908) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $912 = $911; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $913 = HEAP32[$912>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $914 = (_i64Add(($905|0),($906|0),($910|0),($913|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $915 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $916 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $909 = HEAP32[$908>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $910 = (($907) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $911 = $910; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $912 = HEAP32[$911>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $913 = (_i64Add(($904|0),($905|0),($909|0),($912|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $914 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $915 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $916 = $915; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $917 = $916; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $918 = $917; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $919 = HEAP32[$918>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $920 = (($917) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $921 = $920; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $922 = HEAP32[$921>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $923 = (_i64Add(($919|0),($922|0),($914|0),($915|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $924 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $925 = $916; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $926 = $925; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$926>>2] = $923; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $927 = (($925) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $928 = $927; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$928>>2] = $924; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $929 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $918 = HEAP32[$917>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $919 = (($916) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $920 = $919; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $921 = HEAP32[$920>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $922 = (_i64Add(($918|0),($921|0),($913|0),($914|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $923 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $924 = $915; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $925 = $924; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$925>>2] = $922; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $926 = (($924) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $927 = $926; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$927>>2] = $923; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $928 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $929 = $928; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $930 = $929; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $931 = $930; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $932 = HEAP32[$931>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $933 = (($930) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $934 = $933; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $935 = HEAP32[$934>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $936 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $931 = HEAP32[$930>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $932 = (($929) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $933 = $932; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $934 = HEAP32[$933>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $935 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $936 = $935; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $937 = $936; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $938 = $937; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $939 = HEAP32[$938>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $940 = (($937) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $941 = $940; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $942 = HEAP32[$941>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $943 = $932 ^ $939; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $944 = $935 ^ $942; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $945 = (_bitshift64Shl(($943|0),($944|0),48)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $946 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $947 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $938 = HEAP32[$937>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $939 = (($936) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $940 = $939; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $941 = HEAP32[$940>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $942 = $931 ^ $938; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $943 = $934 ^ $941; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $944 = (_bitshift64Shl(($942|0),($943|0),48)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $945 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $946 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $947 = $946; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $948 = $947; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $949 = $948; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $950 = HEAP32[$949>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $951 = (($948) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $952 = $951; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $953 = HEAP32[$952>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $954 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $949 = HEAP32[$948>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $950 = (($947) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $951 = $950; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $952 = HEAP32[$951>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $953 = ((($4)) + 8|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $954 = $953; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $955 = $954; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $956 = $955; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $957 = HEAP32[$956>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $958 = (($955) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $959 = $958; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $960 = HEAP32[$959>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $961 = $950 ^ $957; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $962 = $953 ^ $960; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $963 = (_bitshift64Lshr(($961|0),($962|0),16)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $964 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $956 = HEAP32[$955>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $957 = (($954) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $958 = $957; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $959 = HEAP32[$958>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $960 = $949 ^ $956; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $961 = $952 ^ $959; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $962 = (_bitshift64Lshr(($960|0),($961|0),16)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $963 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $964 = $944 | $962; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $965 = $945 | $963; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $966 = $946 | $964; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $967 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $966 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $967 = $966; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $968 = $967; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $969 = $968; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$969>>2] = $965; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $970 = (($968) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $971 = $970; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$971>>2] = $966; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $972 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$968>>2] = $964; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $969 = (($967) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $970 = $969; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$970>>2] = $965; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $971 = ((($4)) + 104|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $972 = $971; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $973 = $972; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $974 = $973; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $975 = HEAP32[$974>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $976 = (($973) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $977 = $976; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $978 = HEAP32[$977>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $979 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $974 = HEAP32[$973>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $975 = (($972) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $976 = $975; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $977 = HEAP32[$976>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $978 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $979 = $978; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $980 = $979; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $981 = $980; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $982 = HEAP32[$981>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $983 = (($980) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $984 = $983; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $985 = HEAP32[$984>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $986 = (_i64Add(($982|0),($985|0),($975|0),($978|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $987 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $988 = $979; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $989 = $988; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$989>>2] = $986; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $990 = (($988) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $991 = $990; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$991>>2] = $987; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $992 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $981 = HEAP32[$980>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $982 = (($979) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $983 = $982; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $984 = HEAP32[$983>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $985 = (_i64Add(($981|0),($984|0),($974|0),($977|0))|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $986 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $987 = $978; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $988 = $987; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$988>>2] = $985; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $989 = (($987) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $990 = $989; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$990>>2] = $986; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $991 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $992 = $991; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $993 = $992; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $994 = $993; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $995 = HEAP32[$994>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $996 = (($993) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $997 = $996; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $998 = HEAP32[$997>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $999 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $994 = HEAP32[$993>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $995 = (($992) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $996 = $995; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $997 = HEAP32[$996>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $998 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $999 = $998; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $1000 = $999; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1001 = $1000; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1002 = HEAP32[$1001>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1003 = (($1000) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1004 = $1003; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1005 = HEAP32[$1004>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1006 = $995 ^ $1002; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1007 = $998 ^ $1005; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1008 = (_bitshift64Shl(($1006|0),($1007|0),53)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1009 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1010 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1001 = HEAP32[$1000>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1002 = (($999) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1003 = $1002; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1004 = HEAP32[$1003>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1005 = $994 ^ $1001; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1006 = $997 ^ $1004; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1007 = (_bitshift64Shl(($1005|0),($1006|0),53)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1008 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1009 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1010 = $1009; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $1011 = $1010; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1012 = $1011; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1013 = HEAP32[$1012>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1014 = (($1011) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1015 = $1014; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1016 = HEAP32[$1015>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1017 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1012 = HEAP32[$1011>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1013 = (($1010) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1014 = $1013; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1015 = HEAP32[$1014>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1016 = ((($4)) + 72|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1017 = $1016; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $1018 = $1017; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1019 = $1018; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1020 = HEAP32[$1019>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1021 = (($1018) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1022 = $1021; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1023 = HEAP32[$1022>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1024 = $1013 ^ $1020; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1025 = $1016 ^ $1023; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1026 = (_bitshift64Lshr(($1024|0),($1025|0),11)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1027 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1019 = HEAP32[$1018>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1020 = (($1017) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1021 = $1020; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1022 = HEAP32[$1021>>2]|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1023 = $1012 ^ $1019; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1024 = $1015 ^ $1022; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1025 = (_bitshift64Lshr(($1023|0),($1024|0),11)|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1026 = tempRet0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1027 = $1007 | $1025; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $1028 = $1008 | $1026; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1029 = $1009 | $1027; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1030 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1029 = ((($4)) + 40|0); //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1030 = $1029; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
   $1031 = $1030; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1032 = $1031; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1032>>2] = $1028; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1033 = (($1031) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1034 = $1033; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1034>>2] = $1029; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1035 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1036 = $1035; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1037 = HEAP32[$1036>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1038 = (($1035) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1039 = $1038; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1040 = HEAP32[$1039>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1041 = (1317 + ($1037<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1042 = ((($1041)) + 4|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1043 = HEAP8[$1042>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1044 = $1043&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1045 = (($5) + ($1044<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1031>>2] = $1027; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1032 = (($1030) + 4)|0; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1033 = $1032; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1033>>2] = $1028; //@line 104 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1034 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1035 = $1034; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1036 = HEAP32[$1035>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1037 = (($1034) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1038 = $1037; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1039 = HEAP32[$1038>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1040 = (1561 + ($1036<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1041 = ((($1040)) + 4|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1042 = HEAP8[$1041>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1043 = $1042&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1044 = (($5) + ($1043<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1045 = $1044; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1046 = $1045; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1047 = $1046; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1048 = HEAP32[$1047>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1049 = (($1046) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1050 = $1049; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1051 = HEAP32[$1050>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1052 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1053 = $1052; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1054 = HEAP32[$1053>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1055 = (($1052) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1056 = $1055; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1057 = HEAP32[$1056>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1058 = (1317 + ($1054<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1059 = ((($1058)) + 5|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1060 = HEAP8[$1059>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1061 = $1060&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1062 = (8 + ($1061<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1047 = HEAP32[$1046>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1048 = (($1045) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1049 = $1048; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1050 = HEAP32[$1049>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1051 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1052 = $1051; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1053 = HEAP32[$1052>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1054 = (($1051) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1055 = $1054; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1056 = HEAP32[$1055>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1057 = (1561 + ($1053<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1058 = ((($1057)) + 5|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1059 = HEAP8[$1058>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1060 = $1059&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1061 = (8 + ($1060<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1062 = $1061; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1063 = $1062; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1064 = $1063; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1065 = HEAP32[$1064>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1066 = (($1063) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1067 = $1066; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1068 = HEAP32[$1067>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1069 = $1048 ^ $1065; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1070 = $1051 ^ $1068; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1071 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1064 = HEAP32[$1063>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1065 = (($1062) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1066 = $1065; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1067 = HEAP32[$1066>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1068 = $1047 ^ $1064; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1069 = $1050 ^ $1067; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1070 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1071 = $1070; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1072 = $1071; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1073 = $1072; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1074 = HEAP32[$1073>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1075 = (($1072) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1076 = $1075; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1077 = HEAP32[$1076>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1078 = (_i64Add(($1069|0),($1070|0),($1074|0),($1077|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1079 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1080 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1073 = HEAP32[$1072>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1074 = (($1071) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1075 = $1074; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1076 = HEAP32[$1075>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1077 = (_i64Add(($1068|0),($1069|0),($1073|0),($1076|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1078 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1079 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1080 = $1079; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1081 = $1080; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1082 = $1081; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1083 = HEAP32[$1082>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1084 = (($1081) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1085 = $1084; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1086 = HEAP32[$1085>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1087 = (_i64Add(($1083|0),($1086|0),($1078|0),($1079|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1088 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1089 = $1080; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1090 = $1089; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1090>>2] = $1087; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1091 = (($1089) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1092 = $1091; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1092>>2] = $1088; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1093 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1082 = HEAP32[$1081>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1083 = (($1080) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1084 = $1083; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1085 = HEAP32[$1084>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1086 = (_i64Add(($1082|0),($1085|0),($1077|0),($1078|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1087 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1088 = $1079; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1089 = $1088; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1089>>2] = $1086; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1090 = (($1088) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1091 = $1090; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1091>>2] = $1087; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1092 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1093 = $1092; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1094 = $1093; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1095 = $1094; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1096 = HEAP32[$1095>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1097 = (($1094) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1098 = $1097; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1099 = HEAP32[$1098>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1100 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1095 = HEAP32[$1094>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1096 = (($1093) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1097 = $1096; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1098 = HEAP32[$1097>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1099 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1100 = $1099; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1101 = $1100; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1102 = $1101; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1103 = HEAP32[$1102>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1104 = (($1101) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1105 = $1104; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1106 = HEAP32[$1105>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1107 = $1096 ^ $1103; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1099 ^ $1106; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1108 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1102 = HEAP32[$1101>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1103 = (($1100) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1104 = $1103; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1105 = HEAP32[$1104>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1106 = $1095 ^ $1102; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1098 ^ $1105; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1107 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1108 = $1107; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1109 = $1108; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1110 = $1109; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1111 = HEAP32[$1110>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1112 = (($1109) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1113 = $1112; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1114 = HEAP32[$1113>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1115 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1110 = HEAP32[$1109>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1111 = (($1108) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1112 = $1111; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1113 = HEAP32[$1112>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1114 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1115 = $1114; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1116 = $1115; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1117 = $1116; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1118 = HEAP32[$1117>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1119 = (($1116) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1120 = $1119; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1121 = HEAP32[$1120>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1111 ^ $1118; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1122 = $1114 ^ $1121; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1123 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1117 = HEAP32[$1116>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1118 = (($1115) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1119 = $1118; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1120 = HEAP32[$1119>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1110 ^ $1117; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1121 = $1113 ^ $1120; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1122 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1123 = $1122; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1124 = $1123; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1125 = $1124; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1125>>2] = $1122; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1126 = (($1124) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1127 = $1126; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1127>>2] = $1107; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1128 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1124>>2] = $1121; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1125 = (($1123) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1126 = $1125; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1126>>2] = $1106; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1127 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1128 = $1127; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1129 = $1128; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1130 = $1129; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1131 = HEAP32[$1130>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1132 = (($1129) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1133 = $1132; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1134 = HEAP32[$1133>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1135 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1130 = HEAP32[$1129>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1131 = (($1128) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1132 = $1131; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1133 = HEAP32[$1132>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1134 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1135 = $1134; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1136 = $1135; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1137 = $1136; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1138 = HEAP32[$1137>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1139 = (($1136) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1140 = $1139; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1141 = HEAP32[$1140>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1142 = (_i64Add(($1138|0),($1141|0),($1131|0),($1134|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1143 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1144 = $1135; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1145 = $1144; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1145>>2] = $1142; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1146 = (($1144) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1147 = $1146; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1147>>2] = $1143; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1148 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1137 = HEAP32[$1136>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1138 = (($1135) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1139 = $1138; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1140 = HEAP32[$1139>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1141 = (_i64Add(($1137|0),($1140|0),($1130|0),($1133|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1142 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1143 = $1134; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1144 = $1143; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1144>>2] = $1141; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1145 = (($1143) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1146 = $1145; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1146>>2] = $1142; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1147 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1148 = $1147; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1149 = $1148; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1150 = $1149; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1151 = HEAP32[$1150>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1152 = (($1149) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1153 = $1152; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1154 = HEAP32[$1153>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1155 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1150 = HEAP32[$1149>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1151 = (($1148) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1152 = $1151; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1153 = HEAP32[$1152>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1154 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1155 = $1154; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1156 = $1155; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1157 = $1156; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1158 = HEAP32[$1157>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1159 = (($1156) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1160 = $1159; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1161 = HEAP32[$1160>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1162 = $1151 ^ $1158; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1163 = $1154 ^ $1161; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1164 = (_bitshift64Shl(($1162|0),($1163|0),39)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1165 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1166 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1157 = HEAP32[$1156>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1158 = (($1155) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1159 = $1158; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1160 = HEAP32[$1159>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1161 = $1150 ^ $1157; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1162 = $1153 ^ $1160; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1163 = (_bitshift64Shl(($1161|0),($1162|0),39)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1164 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1165 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1166 = $1165; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1167 = $1166; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1168 = $1167; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1169 = HEAP32[$1168>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1170 = (($1167) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1171 = $1170; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1172 = HEAP32[$1171>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1173 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1168 = HEAP32[$1167>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1169 = (($1166) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1170 = $1169; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1171 = HEAP32[$1170>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1172 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1173 = $1172; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1174 = $1173; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1175 = $1174; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1176 = HEAP32[$1175>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1177 = (($1174) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1178 = $1177; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1179 = HEAP32[$1178>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1180 = $1169 ^ $1176; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1181 = $1172 ^ $1179; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1182 = (_bitshift64Lshr(($1180|0),($1181|0),25)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1183 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1175 = HEAP32[$1174>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1176 = (($1173) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1177 = $1176; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1178 = HEAP32[$1177>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1179 = $1168 ^ $1175; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1180 = $1171 ^ $1178; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1181 = (_bitshift64Lshr(($1179|0),($1180|0),25)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1182 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1183 = $1163 | $1181; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1184 = $1164 | $1182; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1185 = $1165 | $1183; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1186 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1185 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1186 = $1185; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1187 = $1186; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1188 = $1187; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1188>>2] = $1184; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1189 = (($1187) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1190 = $1189; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1190>>2] = $1185; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1191 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1192 = $1191; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1193 = HEAP32[$1192>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1194 = (($1191) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1195 = $1194; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1196 = HEAP32[$1195>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1197 = (1317 + ($1193<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1198 = ((($1197)) + 5|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1199 = HEAP8[$1198>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1200 = $1199&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1201 = (($5) + ($1200<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1187>>2] = $1183; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1188 = (($1186) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1189 = $1188; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1189>>2] = $1184; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1190 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1191 = $1190; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1192 = HEAP32[$1191>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1193 = (($1190) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1194 = $1193; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1195 = HEAP32[$1194>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1196 = (1561 + ($1192<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1197 = ((($1196)) + 5|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1198 = HEAP8[$1197>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1199 = $1198&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1200 = (($5) + ($1199<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1201 = $1200; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1202 = $1201; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1203 = $1202; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1204 = HEAP32[$1203>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1205 = (($1202) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1206 = $1205; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1207 = HEAP32[$1206>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1208 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1209 = $1208; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1210 = HEAP32[$1209>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1211 = (($1208) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1212 = $1211; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1213 = HEAP32[$1212>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1214 = (1317 + ($1210<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1215 = ((($1214)) + 4|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1216 = HEAP8[$1215>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1217 = $1216&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1218 = (8 + ($1217<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1203 = HEAP32[$1202>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1204 = (($1201) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1205 = $1204; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1206 = HEAP32[$1205>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1207 = $6; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1208 = $1207; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1209 = HEAP32[$1208>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1210 = (($1207) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1211 = $1210; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1212 = HEAP32[$1211>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1213 = (1561 + ($1209<<4)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1214 = ((($1213)) + 4|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1215 = HEAP8[$1214>>0]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1216 = $1215&255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1217 = (8 + ($1216<<3)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1218 = $1217; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1219 = $1218; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1220 = $1219; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1221 = HEAP32[$1220>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1222 = (($1219) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1223 = $1222; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1224 = HEAP32[$1223>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1225 = $1204 ^ $1221; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1226 = $1207 ^ $1224; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1227 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1220 = HEAP32[$1219>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1221 = (($1218) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1222 = $1221; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1223 = HEAP32[$1222>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1224 = $1203 ^ $1220; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1225 = $1206 ^ $1223; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1226 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1227 = $1226; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1228 = $1227; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1229 = $1228; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1230 = HEAP32[$1229>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1231 = (($1228) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1232 = $1231; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1233 = HEAP32[$1232>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1234 = (_i64Add(($1225|0),($1226|0),($1230|0),($1233|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1235 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1236 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1229 = HEAP32[$1228>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1230 = (($1227) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1231 = $1230; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1232 = HEAP32[$1231>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1233 = (_i64Add(($1224|0),($1225|0),($1229|0),($1232|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1234 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1235 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1236 = $1235; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1237 = $1236; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1238 = $1237; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1239 = HEAP32[$1238>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1240 = (($1237) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1241 = $1240; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1242 = HEAP32[$1241>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1243 = (_i64Add(($1239|0),($1242|0),($1234|0),($1235|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1244 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1245 = $1236; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1246 = $1245; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1246>>2] = $1243; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1247 = (($1245) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1248 = $1247; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1248>>2] = $1244; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1249 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1238 = HEAP32[$1237>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1239 = (($1236) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1240 = $1239; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1241 = HEAP32[$1240>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1242 = (_i64Add(($1238|0),($1241|0),($1233|0),($1234|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1243 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1244 = $1235; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1245 = $1244; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1245>>2] = $1242; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1246 = (($1244) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1247 = $1246; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1247>>2] = $1243; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1248 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1249 = $1248; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1250 = $1249; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1251 = $1250; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1252 = HEAP32[$1251>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1253 = (($1250) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1254 = $1253; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1255 = HEAP32[$1254>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1256 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1251 = HEAP32[$1250>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1252 = (($1249) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1253 = $1252; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1254 = HEAP32[$1253>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1255 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1256 = $1255; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1257 = $1256; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1258 = $1257; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1259 = HEAP32[$1258>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1260 = (($1257) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1261 = $1260; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1262 = HEAP32[$1261>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1263 = $1252 ^ $1259; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1264 = $1255 ^ $1262; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1265 = (_bitshift64Shl(($1263|0),($1264|0),48)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1266 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1267 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1258 = HEAP32[$1257>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1259 = (($1256) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1260 = $1259; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1261 = HEAP32[$1260>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1262 = $1251 ^ $1258; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1263 = $1254 ^ $1261; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1264 = (_bitshift64Shl(($1262|0),($1263|0),48)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1265 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1266 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1267 = $1266; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1268 = $1267; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1269 = $1268; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1270 = HEAP32[$1269>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1271 = (($1268) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1272 = $1271; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1273 = HEAP32[$1272>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1274 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1269 = HEAP32[$1268>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1270 = (($1267) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1271 = $1270; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1272 = HEAP32[$1271>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1273 = ((($4)) + 16|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1274 = $1273; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1275 = $1274; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1276 = $1275; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1277 = HEAP32[$1276>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1278 = (($1275) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1279 = $1278; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1280 = HEAP32[$1279>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1281 = $1270 ^ $1277; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1282 = $1273 ^ $1280; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1283 = (_bitshift64Lshr(($1281|0),($1282|0),16)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1284 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1276 = HEAP32[$1275>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1277 = (($1274) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1278 = $1277; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1279 = HEAP32[$1278>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1280 = $1269 ^ $1276; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1281 = $1272 ^ $1279; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1282 = (_bitshift64Lshr(($1280|0),($1281|0),16)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1283 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1284 = $1264 | $1282; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1285 = $1265 | $1283; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1286 = $1266 | $1284; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1287 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1286 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1287 = $1286; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1288 = $1287; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1289 = $1288; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1289>>2] = $1285; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1290 = (($1288) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1291 = $1290; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1291>>2] = $1286; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1292 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1288>>2] = $1284; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1289 = (($1287) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1290 = $1289; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1290>>2] = $1285; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1291 = ((($4)) + 112|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1292 = $1291; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1293 = $1292; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1294 = $1293; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1295 = HEAP32[$1294>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1296 = (($1293) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1297 = $1296; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1298 = HEAP32[$1297>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1299 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1294 = HEAP32[$1293>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1295 = (($1292) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1296 = $1295; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1297 = HEAP32[$1296>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1298 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1299 = $1298; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1300 = $1299; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1301 = $1300; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1302 = HEAP32[$1301>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1303 = (($1300) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1304 = $1303; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1305 = HEAP32[$1304>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1306 = (_i64Add(($1302|0),($1305|0),($1295|0),($1298|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1307 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1308 = $1299; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1309 = $1308; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1309>>2] = $1306; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1310 = (($1308) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1311 = $1310; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1311>>2] = $1307; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1312 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1301 = HEAP32[$1300>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1302 = (($1299) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1303 = $1302; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1304 = HEAP32[$1303>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1305 = (_i64Add(($1301|0),($1304|0),($1294|0),($1297|0))|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1306 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1307 = $1298; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1308 = $1307; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1308>>2] = $1305; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1309 = (($1307) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1310 = $1309; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1310>>2] = $1306; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1311 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1312 = $1311; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1313 = $1312; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1314 = $1313; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1315 = HEAP32[$1314>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1316 = (($1313) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1317 = $1316; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1318 = HEAP32[$1317>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1319 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1314 = HEAP32[$1313>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1315 = (($1312) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1316 = $1315; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1317 = HEAP32[$1316>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1318 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1319 = $1318; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1320 = $1319; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1321 = $1320; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1322 = HEAP32[$1321>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1323 = (($1320) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1324 = $1323; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1325 = HEAP32[$1324>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1326 = $1315 ^ $1322; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1327 = $1318 ^ $1325; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1328 = (_bitshift64Shl(($1326|0),($1327|0),53)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1329 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1330 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1321 = HEAP32[$1320>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1322 = (($1319) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1323 = $1322; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1324 = HEAP32[$1323>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1325 = $1314 ^ $1321; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1326 = $1317 ^ $1324; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1327 = (_bitshift64Shl(($1325|0),($1326|0),53)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1328 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1329 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1330 = $1329; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1331 = $1330; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1332 = $1331; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1333 = HEAP32[$1332>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1334 = (($1331) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1335 = $1334; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1336 = HEAP32[$1335>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1337 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1332 = HEAP32[$1331>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1333 = (($1330) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1334 = $1333; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1335 = HEAP32[$1334>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1336 = ((($4)) + 80|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1337 = $1336; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1338 = $1337; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1339 = $1338; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1340 = HEAP32[$1339>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1341 = (($1338) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1342 = $1341; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1343 = HEAP32[$1342>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1344 = $1333 ^ $1340; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1345 = $1336 ^ $1343; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1346 = (_bitshift64Lshr(($1344|0),($1345|0),11)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1347 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1339 = HEAP32[$1338>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1340 = (($1337) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1341 = $1340; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1342 = HEAP32[$1341>>2]|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1343 = $1332 ^ $1339; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1344 = $1335 ^ $1342; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1345 = (_bitshift64Lshr(($1343|0),($1344|0),11)|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1346 = tempRet0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1347 = $1327 | $1345; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1348 = $1328 | $1346; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1349 = $1329 | $1347; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1350 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1349 = ((($4)) + 48|0); //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1350 = $1349; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
   $1351 = $1350; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1352 = $1351; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1352>>2] = $1348; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1353 = (($1351) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1354 = $1353; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1354>>2] = $1349; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1355 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1356 = $1355; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1357 = HEAP32[$1356>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1358 = (($1355) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1359 = $1358; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1360 = HEAP32[$1359>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1361 = (1317 + ($1357<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1362 = ((($1361)) + 6|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1363 = HEAP8[$1362>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1364 = $1363&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1365 = (($5) + ($1364<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1351>>2] = $1347; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1352 = (($1350) + 4)|0; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1353 = $1352; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1353>>2] = $1348; //@line 105 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1354 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1355 = $1354; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1356 = HEAP32[$1355>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1357 = (($1354) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1358 = $1357; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1359 = HEAP32[$1358>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1360 = (1561 + ($1356<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1361 = ((($1360)) + 6|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1362 = HEAP8[$1361>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1363 = $1362&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1364 = (($5) + ($1363<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1365 = $1364; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1366 = $1365; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1367 = $1366; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1368 = HEAP32[$1367>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1369 = (($1366) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1370 = $1369; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1371 = HEAP32[$1370>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1372 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1373 = $1372; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1374 = HEAP32[$1373>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1375 = (($1372) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1376 = $1375; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1377 = HEAP32[$1376>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1378 = (1317 + ($1374<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1379 = ((($1378)) + 7|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1380 = HEAP8[$1379>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1381 = $1380&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1382 = (8 + ($1381<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1367 = HEAP32[$1366>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1368 = (($1365) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1369 = $1368; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1370 = HEAP32[$1369>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1371 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1372 = $1371; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1373 = HEAP32[$1372>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1374 = (($1371) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1375 = $1374; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1376 = HEAP32[$1375>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1377 = (1561 + ($1373<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1378 = ((($1377)) + 7|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1379 = HEAP8[$1378>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1380 = $1379&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1381 = (8 + ($1380<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1382 = $1381; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1383 = $1382; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1384 = $1383; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1385 = HEAP32[$1384>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1386 = (($1383) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1387 = $1386; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1388 = HEAP32[$1387>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1389 = $1368 ^ $1385; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1390 = $1371 ^ $1388; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1391 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1384 = HEAP32[$1383>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1385 = (($1382) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1386 = $1385; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1387 = HEAP32[$1386>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1388 = $1367 ^ $1384; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1389 = $1370 ^ $1387; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1390 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1391 = $1390; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1392 = $1391; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1393 = $1392; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1394 = HEAP32[$1393>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1395 = (($1392) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1396 = $1395; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1397 = HEAP32[$1396>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1398 = (_i64Add(($1389|0),($1390|0),($1394|0),($1397|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1399 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1400 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1393 = HEAP32[$1392>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1394 = (($1391) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1395 = $1394; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1396 = HEAP32[$1395>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1397 = (_i64Add(($1388|0),($1389|0),($1393|0),($1396|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1398 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1399 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1400 = $1399; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1401 = $1400; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1402 = $1401; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1403 = HEAP32[$1402>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1404 = (($1401) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1405 = $1404; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1406 = HEAP32[$1405>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1407 = (_i64Add(($1403|0),($1406|0),($1398|0),($1399|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1408 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1409 = $1400; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1410 = $1409; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1410>>2] = $1407; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1411 = (($1409) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1412 = $1411; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1412>>2] = $1408; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1413 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1402 = HEAP32[$1401>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1403 = (($1400) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1404 = $1403; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1405 = HEAP32[$1404>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1406 = (_i64Add(($1402|0),($1405|0),($1397|0),($1398|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1407 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1408 = $1399; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1409 = $1408; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1409>>2] = $1406; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1410 = (($1408) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1411 = $1410; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1411>>2] = $1407; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1412 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1413 = $1412; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1414 = $1413; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1415 = $1414; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1416 = HEAP32[$1415>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1417 = (($1414) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1418 = $1417; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1419 = HEAP32[$1418>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1420 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1415 = HEAP32[$1414>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1416 = (($1413) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1417 = $1416; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1418 = HEAP32[$1417>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1419 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1420 = $1419; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1421 = $1420; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1422 = $1421; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1423 = HEAP32[$1422>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1424 = (($1421) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1425 = $1424; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1426 = HEAP32[$1425>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1427 = $1416 ^ $1423; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1419 ^ $1426; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1428 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1422 = HEAP32[$1421>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1423 = (($1420) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1424 = $1423; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1425 = HEAP32[$1424>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1426 = $1415 ^ $1422; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1418 ^ $1425; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1427 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1428 = $1427; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1429 = $1428; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1430 = $1429; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1431 = HEAP32[$1430>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1432 = (($1429) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1433 = $1432; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1434 = HEAP32[$1433>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1435 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1430 = HEAP32[$1429>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1431 = (($1428) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1432 = $1431; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1433 = HEAP32[$1432>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1434 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1435 = $1434; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1436 = $1435; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1437 = $1436; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1438 = HEAP32[$1437>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1439 = (($1436) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1440 = $1439; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1441 = HEAP32[$1440>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1431 ^ $1438; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1442 = $1434 ^ $1441; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1443 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1437 = HEAP32[$1436>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1438 = (($1435) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1439 = $1438; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1440 = HEAP32[$1439>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1430 ^ $1437; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1441 = $1433 ^ $1440; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1442 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1443 = $1442; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1444 = $1443; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1445 = $1444; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1445>>2] = $1442; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1446 = (($1444) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1447 = $1446; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1447>>2] = $1427; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1448 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1444>>2] = $1441; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1445 = (($1443) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1446 = $1445; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1446>>2] = $1426; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1447 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1448 = $1447; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1449 = $1448; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1450 = $1449; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1451 = HEAP32[$1450>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1452 = (($1449) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1453 = $1452; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1454 = HEAP32[$1453>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1455 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1450 = HEAP32[$1449>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1451 = (($1448) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1452 = $1451; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1453 = HEAP32[$1452>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1454 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1455 = $1454; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1456 = $1455; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1457 = $1456; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1458 = HEAP32[$1457>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1459 = (($1456) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1460 = $1459; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1461 = HEAP32[$1460>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1462 = (_i64Add(($1458|0),($1461|0),($1451|0),($1454|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1463 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1464 = $1455; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1465 = $1464; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1465>>2] = $1462; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1466 = (($1464) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1467 = $1466; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1467>>2] = $1463; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1468 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1457 = HEAP32[$1456>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1458 = (($1455) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1459 = $1458; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1460 = HEAP32[$1459>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1461 = (_i64Add(($1457|0),($1460|0),($1450|0),($1453|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1462 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1463 = $1454; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1464 = $1463; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1464>>2] = $1461; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1465 = (($1463) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1466 = $1465; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1466>>2] = $1462; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1467 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1468 = $1467; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1469 = $1468; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1470 = $1469; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1471 = HEAP32[$1470>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1472 = (($1469) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1473 = $1472; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1474 = HEAP32[$1473>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1475 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1470 = HEAP32[$1469>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1471 = (($1468) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1472 = $1471; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1473 = HEAP32[$1472>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1474 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1475 = $1474; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1476 = $1475; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1477 = $1476; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1478 = HEAP32[$1477>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1479 = (($1476) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1480 = $1479; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1481 = HEAP32[$1480>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1482 = $1471 ^ $1478; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1483 = $1474 ^ $1481; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1484 = (_bitshift64Shl(($1482|0),($1483|0),39)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1485 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1486 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1477 = HEAP32[$1476>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1478 = (($1475) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1479 = $1478; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1480 = HEAP32[$1479>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1481 = $1470 ^ $1477; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1482 = $1473 ^ $1480; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1483 = (_bitshift64Shl(($1481|0),($1482|0),39)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1484 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1485 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1486 = $1485; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1487 = $1486; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1488 = $1487; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1489 = HEAP32[$1488>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1490 = (($1487) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1491 = $1490; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1492 = HEAP32[$1491>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1493 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1488 = HEAP32[$1487>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1489 = (($1486) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1490 = $1489; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1491 = HEAP32[$1490>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1492 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1493 = $1492; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1494 = $1493; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1495 = $1494; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1496 = HEAP32[$1495>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1497 = (($1494) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1498 = $1497; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1499 = HEAP32[$1498>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1500 = $1489 ^ $1496; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1501 = $1492 ^ $1499; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1502 = (_bitshift64Lshr(($1500|0),($1501|0),25)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1503 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1495 = HEAP32[$1494>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1496 = (($1493) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1497 = $1496; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1498 = HEAP32[$1497>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1499 = $1488 ^ $1495; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1500 = $1491 ^ $1498; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1501 = (_bitshift64Lshr(($1499|0),($1500|0),25)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1502 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1503 = $1483 | $1501; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1504 = $1484 | $1502; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1505 = $1485 | $1503; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1506 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1505 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1506 = $1505; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1507 = $1506; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1508 = $1507; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1508>>2] = $1504; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1509 = (($1507) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1510 = $1509; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1510>>2] = $1505; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1511 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1512 = $1511; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1513 = HEAP32[$1512>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1514 = (($1511) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1515 = $1514; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1516 = HEAP32[$1515>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1517 = (1317 + ($1513<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1518 = ((($1517)) + 7|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1519 = HEAP8[$1518>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1520 = $1519&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1521 = (($5) + ($1520<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1507>>2] = $1503; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1508 = (($1506) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1509 = $1508; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1509>>2] = $1504; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1510 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1511 = $1510; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1512 = HEAP32[$1511>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1513 = (($1510) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1514 = $1513; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1515 = HEAP32[$1514>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1516 = (1561 + ($1512<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1517 = ((($1516)) + 7|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1518 = HEAP8[$1517>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1519 = $1518&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1520 = (($5) + ($1519<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1521 = $1520; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1522 = $1521; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1523 = $1522; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1524 = HEAP32[$1523>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1525 = (($1522) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1526 = $1525; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1527 = HEAP32[$1526>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1528 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1529 = $1528; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1530 = HEAP32[$1529>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1531 = (($1528) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1532 = $1531; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1533 = HEAP32[$1532>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1534 = (1317 + ($1530<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1535 = ((($1534)) + 6|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1536 = HEAP8[$1535>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1537 = $1536&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1538 = (8 + ($1537<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1523 = HEAP32[$1522>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1524 = (($1521) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1525 = $1524; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1526 = HEAP32[$1525>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1527 = $6; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1528 = $1527; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1529 = HEAP32[$1528>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1530 = (($1527) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1531 = $1530; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1532 = HEAP32[$1531>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1533 = (1561 + ($1529<<4)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1534 = ((($1533)) + 6|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1535 = HEAP8[$1534>>0]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1536 = $1535&255; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1537 = (8 + ($1536<<3)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1538 = $1537; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1539 = $1538; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1540 = $1539; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1541 = HEAP32[$1540>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1542 = (($1539) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1543 = $1542; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1544 = HEAP32[$1543>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1545 = $1524 ^ $1541; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1546 = $1527 ^ $1544; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1547 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1540 = HEAP32[$1539>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1541 = (($1538) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1542 = $1541; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1543 = HEAP32[$1542>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1544 = $1523 ^ $1540; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1545 = $1526 ^ $1543; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1546 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1547 = $1546; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1548 = $1547; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1549 = $1548; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1550 = HEAP32[$1549>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1551 = (($1548) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1552 = $1551; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1553 = HEAP32[$1552>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1554 = (_i64Add(($1545|0),($1546|0),($1550|0),($1553|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1555 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1556 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1549 = HEAP32[$1548>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1550 = (($1547) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1551 = $1550; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1552 = HEAP32[$1551>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1553 = (_i64Add(($1544|0),($1545|0),($1549|0),($1552|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1554 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1555 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1556 = $1555; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1557 = $1556; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1558 = $1557; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1559 = HEAP32[$1558>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1560 = (($1557) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1561 = $1560; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1562 = HEAP32[$1561>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1563 = (_i64Add(($1559|0),($1562|0),($1554|0),($1555|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1564 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1565 = $1556; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1566 = $1565; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1566>>2] = $1563; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1567 = (($1565) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1568 = $1567; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1568>>2] = $1564; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1569 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1558 = HEAP32[$1557>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1559 = (($1556) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1560 = $1559; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1561 = HEAP32[$1560>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1562 = (_i64Add(($1558|0),($1561|0),($1553|0),($1554|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1563 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1564 = $1555; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1565 = $1564; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1565>>2] = $1562; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1566 = (($1564) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1567 = $1566; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1567>>2] = $1563; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1568 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1569 = $1568; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1570 = $1569; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1571 = $1570; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1572 = HEAP32[$1571>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1573 = (($1570) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1574 = $1573; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1575 = HEAP32[$1574>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1576 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1571 = HEAP32[$1570>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1572 = (($1569) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1573 = $1572; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1574 = HEAP32[$1573>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1575 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1576 = $1575; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1577 = $1576; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1578 = $1577; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1579 = HEAP32[$1578>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1580 = (($1577) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1581 = $1580; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1582 = HEAP32[$1581>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1583 = $1572 ^ $1579; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1584 = $1575 ^ $1582; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1585 = (_bitshift64Shl(($1583|0),($1584|0),48)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1586 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1587 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1578 = HEAP32[$1577>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1579 = (($1576) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1580 = $1579; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1581 = HEAP32[$1580>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1582 = $1571 ^ $1578; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1583 = $1574 ^ $1581; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1584 = (_bitshift64Shl(($1582|0),($1583|0),48)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1585 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1586 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1587 = $1586; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1588 = $1587; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1589 = $1588; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1590 = HEAP32[$1589>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1591 = (($1588) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1592 = $1591; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1593 = HEAP32[$1592>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1594 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1589 = HEAP32[$1588>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1590 = (($1587) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1591 = $1590; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1592 = HEAP32[$1591>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1593 = ((($4)) + 24|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1594 = $1593; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1595 = $1594; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1596 = $1595; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1597 = HEAP32[$1596>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1598 = (($1595) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1599 = $1598; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1600 = HEAP32[$1599>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1601 = $1590 ^ $1597; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1602 = $1593 ^ $1600; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1603 = (_bitshift64Lshr(($1601|0),($1602|0),16)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1604 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1596 = HEAP32[$1595>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1597 = (($1594) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1598 = $1597; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1599 = HEAP32[$1598>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1600 = $1589 ^ $1596; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1601 = $1592 ^ $1599; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1602 = (_bitshift64Lshr(($1600|0),($1601|0),16)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1603 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1604 = $1584 | $1602; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1605 = $1585 | $1603; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1606 = $1586 | $1604; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1607 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1606 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1607 = $1606; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1608 = $1607; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1609 = $1608; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1609>>2] = $1605; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1610 = (($1608) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1611 = $1610; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1611>>2] = $1606; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1612 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1608>>2] = $1604; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1609 = (($1607) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1610 = $1609; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1610>>2] = $1605; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1611 = ((($4)) + 120|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1612 = $1611; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1613 = $1612; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1614 = $1613; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1615 = HEAP32[$1614>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1616 = (($1613) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1617 = $1616; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1618 = HEAP32[$1617>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1619 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1614 = HEAP32[$1613>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1615 = (($1612) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1616 = $1615; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1617 = HEAP32[$1616>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1618 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1619 = $1618; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1620 = $1619; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1621 = $1620; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1622 = HEAP32[$1621>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1623 = (($1620) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1624 = $1623; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1625 = HEAP32[$1624>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1626 = (_i64Add(($1622|0),($1625|0),($1615|0),($1618|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1627 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1628 = $1619; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1629 = $1628; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1629>>2] = $1626; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1630 = (($1628) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1631 = $1630; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1631>>2] = $1627; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1632 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1621 = HEAP32[$1620>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1622 = (($1619) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1623 = $1622; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1624 = HEAP32[$1623>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1625 = (_i64Add(($1621|0),($1624|0),($1614|0),($1617|0))|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1626 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1627 = $1618; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1628 = $1627; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1628>>2] = $1625; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1629 = (($1627) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1630 = $1629; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1630>>2] = $1626; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1631 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1632 = $1631; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1633 = $1632; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1634 = $1633; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1635 = HEAP32[$1634>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1636 = (($1633) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1637 = $1636; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1638 = HEAP32[$1637>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1639 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1634 = HEAP32[$1633>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1635 = (($1632) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1636 = $1635; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1637 = HEAP32[$1636>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1638 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1639 = $1638; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1640 = $1639; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1641 = $1640; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1642 = HEAP32[$1641>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1643 = (($1640) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1644 = $1643; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1645 = HEAP32[$1644>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1646 = $1635 ^ $1642; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1647 = $1638 ^ $1645; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1648 = (_bitshift64Shl(($1646|0),($1647|0),53)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1649 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1650 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1641 = HEAP32[$1640>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1642 = (($1639) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1643 = $1642; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1644 = HEAP32[$1643>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1645 = $1634 ^ $1641; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1646 = $1637 ^ $1644; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1647 = (_bitshift64Shl(($1645|0),($1646|0),53)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1648 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1649 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1650 = $1649; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1651 = $1650; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1652 = $1651; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1653 = HEAP32[$1652>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1654 = (($1651) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1655 = $1654; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1656 = HEAP32[$1655>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1657 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1652 = HEAP32[$1651>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1653 = (($1650) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1654 = $1653; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1655 = HEAP32[$1654>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1656 = ((($4)) + 88|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1657 = $1656; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1658 = $1657; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1659 = $1658; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1660 = HEAP32[$1659>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1661 = (($1658) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1662 = $1661; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1663 = HEAP32[$1662>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1664 = $1653 ^ $1660; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1665 = $1656 ^ $1663; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1666 = (_bitshift64Lshr(($1664|0),($1665|0),11)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1667 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1659 = HEAP32[$1658>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1660 = (($1657) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1661 = $1660; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1662 = HEAP32[$1661>>2]|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1663 = $1652 ^ $1659; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1664 = $1655 ^ $1662; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1665 = (_bitshift64Lshr(($1663|0),($1664|0),11)|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1666 = tempRet0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1667 = $1647 | $1665; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1668 = $1648 | $1666; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1669 = $1649 | $1667; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1670 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1669 = ((($4)) + 56|0); //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1670 = $1669; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
   $1671 = $1670; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1672 = $1671; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1672>>2] = $1668; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1673 = (($1671) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1674 = $1673; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1674>>2] = $1669; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1675 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1676 = $1675; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1677 = HEAP32[$1676>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1678 = (($1675) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1679 = $1678; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1680 = HEAP32[$1679>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1681 = (1317 + ($1677<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1682 = ((($1681)) + 14|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1683 = HEAP8[$1682>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1684 = $1683&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1685 = (($5) + ($1684<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1671>>2] = $1667; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1672 = (($1670) + 4)|0; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1673 = $1672; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1673>>2] = $1668; //@line 106 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1674 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1675 = $1674; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1676 = HEAP32[$1675>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1677 = (($1674) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1678 = $1677; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1679 = HEAP32[$1678>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1680 = (1561 + ($1676<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1681 = ((($1680)) + 14|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1682 = HEAP8[$1681>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1683 = $1682&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1684 = (($5) + ($1683<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1685 = $1684; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1686 = $1685; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1687 = $1686; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1688 = HEAP32[$1687>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1689 = (($1686) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1690 = $1689; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1691 = HEAP32[$1690>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1692 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1693 = $1692; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1694 = HEAP32[$1693>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1695 = (($1692) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1696 = $1695; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1697 = HEAP32[$1696>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1698 = (1317 + ($1694<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1699 = ((($1698)) + 15|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1700 = HEAP8[$1699>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1701 = $1700&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1702 = (8 + ($1701<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1687 = HEAP32[$1686>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1688 = (($1685) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1689 = $1688; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1690 = HEAP32[$1689>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1691 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1692 = $1691; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1693 = HEAP32[$1692>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1694 = (($1691) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1695 = $1694; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1696 = HEAP32[$1695>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1697 = (1561 + ($1693<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1698 = ((($1697)) + 15|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1699 = HEAP8[$1698>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1700 = $1699&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1701 = (8 + ($1700<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1702 = $1701; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1703 = $1702; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1704 = $1703; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1705 = HEAP32[$1704>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1706 = (($1703) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1707 = $1706; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1708 = HEAP32[$1707>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1709 = $1688 ^ $1705; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1710 = $1691 ^ $1708; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1711 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1704 = HEAP32[$1703>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1705 = (($1702) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1706 = $1705; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1707 = HEAP32[$1706>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1708 = $1687 ^ $1704; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1709 = $1690 ^ $1707; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1710 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1711 = $1710; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1712 = $1711; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1713 = $1712; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1714 = HEAP32[$1713>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1715 = (($1712) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1716 = $1715; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1717 = HEAP32[$1716>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1718 = (_i64Add(($1709|0),($1710|0),($1714|0),($1717|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1719 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1720 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1713 = HEAP32[$1712>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1714 = (($1711) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1715 = $1714; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1716 = HEAP32[$1715>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1717 = (_i64Add(($1708|0),($1709|0),($1713|0),($1716|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1718 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1719 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1720 = $1719; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1721 = $1720; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1722 = $1721; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1723 = HEAP32[$1722>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1724 = (($1721) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1725 = $1724; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1726 = HEAP32[$1725>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1727 = (_i64Add(($1723|0),($1726|0),($1718|0),($1719|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1728 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1729 = $1720; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1730 = $1729; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1730>>2] = $1727; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1731 = (($1729) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1732 = $1731; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1732>>2] = $1728; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1733 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1722 = HEAP32[$1721>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1723 = (($1720) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1724 = $1723; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1725 = HEAP32[$1724>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1726 = (_i64Add(($1722|0),($1725|0),($1717|0),($1718|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1727 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1728 = $1719; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1729 = $1728; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1729>>2] = $1726; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1730 = (($1728) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1731 = $1730; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1731>>2] = $1727; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1732 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1733 = $1732; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1734 = $1733; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1735 = $1734; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1736 = HEAP32[$1735>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1737 = (($1734) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1738 = $1737; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1739 = HEAP32[$1738>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1740 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1735 = HEAP32[$1734>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1736 = (($1733) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1737 = $1736; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1738 = HEAP32[$1737>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1739 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1740 = $1739; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1741 = $1740; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1742 = $1741; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1743 = HEAP32[$1742>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1744 = (($1741) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1745 = $1744; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1746 = HEAP32[$1745>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1747 = $1736 ^ $1743; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1739 ^ $1746; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1748 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1742 = HEAP32[$1741>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1743 = (($1740) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1744 = $1743; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1745 = HEAP32[$1744>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1746 = $1735 ^ $1742; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1738 ^ $1745; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1747 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1748 = $1747; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1749 = $1748; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1750 = $1749; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1751 = HEAP32[$1750>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1752 = (($1749) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1753 = $1752; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1754 = HEAP32[$1753>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1755 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1750 = HEAP32[$1749>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1751 = (($1748) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1752 = $1751; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1753 = HEAP32[$1752>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1754 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1755 = $1754; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1756 = $1755; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1757 = $1756; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1758 = HEAP32[$1757>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1759 = (($1756) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1760 = $1759; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1761 = HEAP32[$1760>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1751 ^ $1758; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1762 = $1754 ^ $1761; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1763 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1757 = HEAP32[$1756>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1758 = (($1755) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1759 = $1758; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1760 = HEAP32[$1759>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1750 ^ $1757; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1761 = $1753 ^ $1760; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1762 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1763 = $1762; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1764 = $1763; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1765 = $1764; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1765>>2] = $1762; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1766 = (($1764) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1767 = $1766; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1767>>2] = $1747; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1768 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1764>>2] = $1761; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1765 = (($1763) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1766 = $1765; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1766>>2] = $1746; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1767 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1768 = $1767; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1769 = $1768; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1770 = $1769; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1771 = HEAP32[$1770>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1772 = (($1769) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1773 = $1772; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1774 = HEAP32[$1773>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1775 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1770 = HEAP32[$1769>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1771 = (($1768) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1772 = $1771; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1773 = HEAP32[$1772>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1774 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1775 = $1774; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1776 = $1775; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1777 = $1776; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1778 = HEAP32[$1777>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1779 = (($1776) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1780 = $1779; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1781 = HEAP32[$1780>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1782 = (_i64Add(($1778|0),($1781|0),($1771|0),($1774|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1783 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1784 = $1775; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1785 = $1784; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1785>>2] = $1782; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1786 = (($1784) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1787 = $1786; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1787>>2] = $1783; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1788 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1777 = HEAP32[$1776>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1778 = (($1775) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1779 = $1778; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1780 = HEAP32[$1779>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1781 = (_i64Add(($1777|0),($1780|0),($1770|0),($1773|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1782 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1783 = $1774; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1784 = $1783; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1784>>2] = $1781; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1785 = (($1783) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1786 = $1785; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1786>>2] = $1782; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1787 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1788 = $1787; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1789 = $1788; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1790 = $1789; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1791 = HEAP32[$1790>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1792 = (($1789) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1793 = $1792; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1794 = HEAP32[$1793>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1795 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1790 = HEAP32[$1789>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1791 = (($1788) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1792 = $1791; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1793 = HEAP32[$1792>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1794 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1795 = $1794; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1796 = $1795; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1797 = $1796; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1798 = HEAP32[$1797>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1799 = (($1796) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1800 = $1799; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1801 = HEAP32[$1800>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1802 = $1791 ^ $1798; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1803 = $1794 ^ $1801; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1804 = (_bitshift64Shl(($1802|0),($1803|0),39)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1805 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1806 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1797 = HEAP32[$1796>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1798 = (($1795) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1799 = $1798; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1800 = HEAP32[$1799>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1801 = $1790 ^ $1797; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1802 = $1793 ^ $1800; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1803 = (_bitshift64Shl(($1801|0),($1802|0),39)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1804 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1805 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1806 = $1805; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1807 = $1806; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1808 = $1807; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1809 = HEAP32[$1808>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1810 = (($1807) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1811 = $1810; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1812 = HEAP32[$1811>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1813 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1808 = HEAP32[$1807>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1809 = (($1806) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1810 = $1809; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1811 = HEAP32[$1810>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1812 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1813 = $1812; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1814 = $1813; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1815 = $1814; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1816 = HEAP32[$1815>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1817 = (($1814) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1818 = $1817; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1819 = HEAP32[$1818>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1820 = $1809 ^ $1816; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1821 = $1812 ^ $1819; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1822 = (_bitshift64Lshr(($1820|0),($1821|0),25)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1823 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1815 = HEAP32[$1814>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1816 = (($1813) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1817 = $1816; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1818 = HEAP32[$1817>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1819 = $1808 ^ $1815; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1820 = $1811 ^ $1818; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1821 = (_bitshift64Lshr(($1819|0),($1820|0),25)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1822 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1823 = $1803 | $1821; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1824 = $1804 | $1822; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1825 = $1805 | $1823; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1826 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1825 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1826 = $1825; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1827 = $1826; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1828 = $1827; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1828>>2] = $1824; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1829 = (($1827) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1830 = $1829; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1830>>2] = $1825; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1831 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1832 = $1831; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1833 = HEAP32[$1832>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1834 = (($1831) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1835 = $1834; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1836 = HEAP32[$1835>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1837 = (1317 + ($1833<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1838 = ((($1837)) + 15|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1839 = HEAP8[$1838>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1840 = $1839&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1841 = (($5) + ($1840<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1827>>2] = $1823; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1828 = (($1826) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1829 = $1828; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1829>>2] = $1824; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1830 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1831 = $1830; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1832 = HEAP32[$1831>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1833 = (($1830) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1834 = $1833; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1835 = HEAP32[$1834>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1836 = (1561 + ($1832<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1837 = ((($1836)) + 15|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1838 = HEAP8[$1837>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1839 = $1838&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1840 = (($5) + ($1839<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1841 = $1840; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1842 = $1841; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1843 = $1842; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1844 = HEAP32[$1843>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1845 = (($1842) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1846 = $1845; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1847 = HEAP32[$1846>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1848 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1849 = $1848; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1850 = HEAP32[$1849>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1851 = (($1848) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1852 = $1851; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1853 = HEAP32[$1852>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1854 = (1317 + ($1850<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1855 = ((($1854)) + 14|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1856 = HEAP8[$1855>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1857 = $1856&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1858 = (8 + ($1857<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1843 = HEAP32[$1842>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1844 = (($1841) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1845 = $1844; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1846 = HEAP32[$1845>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1847 = $6; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1848 = $1847; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1849 = HEAP32[$1848>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1850 = (($1847) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1851 = $1850; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1852 = HEAP32[$1851>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1853 = (1561 + ($1849<<4)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1854 = ((($1853)) + 14|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1855 = HEAP8[$1854>>0]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1856 = $1855&255; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1857 = (8 + ($1856<<3)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1858 = $1857; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1859 = $1858; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1860 = $1859; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1861 = HEAP32[$1860>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1862 = (($1859) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1863 = $1862; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1864 = HEAP32[$1863>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1865 = $1844 ^ $1861; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1866 = $1847 ^ $1864; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1867 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1860 = HEAP32[$1859>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1861 = (($1858) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1862 = $1861; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1863 = HEAP32[$1862>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1864 = $1843 ^ $1860; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1865 = $1846 ^ $1863; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1866 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1867 = $1866; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1868 = $1867; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1869 = $1868; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1870 = HEAP32[$1869>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1871 = (($1868) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1872 = $1871; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1873 = HEAP32[$1872>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1874 = (_i64Add(($1865|0),($1866|0),($1870|0),($1873|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1875 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1876 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1869 = HEAP32[$1868>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1870 = (($1867) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1871 = $1870; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1872 = HEAP32[$1871>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1873 = (_i64Add(($1864|0),($1865|0),($1869|0),($1872|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1874 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1875 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1876 = $1875; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1877 = $1876; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1878 = $1877; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1879 = HEAP32[$1878>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1880 = (($1877) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1881 = $1880; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1882 = HEAP32[$1881>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1883 = (_i64Add(($1879|0),($1882|0),($1874|0),($1875|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1884 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1885 = $1876; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1886 = $1885; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1886>>2] = $1883; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1887 = (($1885) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1888 = $1887; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1888>>2] = $1884; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1889 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1878 = HEAP32[$1877>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1879 = (($1876) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1880 = $1879; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1881 = HEAP32[$1880>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1882 = (_i64Add(($1878|0),($1881|0),($1873|0),($1874|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1883 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1884 = $1875; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1885 = $1884; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1885>>2] = $1882; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1886 = (($1884) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1887 = $1886; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1887>>2] = $1883; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1888 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1889 = $1888; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1890 = $1889; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1891 = $1890; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1892 = HEAP32[$1891>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1893 = (($1890) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1894 = $1893; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1895 = HEAP32[$1894>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1896 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1891 = HEAP32[$1890>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1892 = (($1889) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1893 = $1892; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1894 = HEAP32[$1893>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1895 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1896 = $1895; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1897 = $1896; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1898 = $1897; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1899 = HEAP32[$1898>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1900 = (($1897) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1901 = $1900; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1902 = HEAP32[$1901>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1903 = $1892 ^ $1899; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1904 = $1895 ^ $1902; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1905 = (_bitshift64Shl(($1903|0),($1904|0),48)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1906 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1907 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1898 = HEAP32[$1897>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1899 = (($1896) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1900 = $1899; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1901 = HEAP32[$1900>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1902 = $1891 ^ $1898; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1903 = $1894 ^ $1901; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1904 = (_bitshift64Shl(($1902|0),($1903|0),48)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1905 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1906 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1907 = $1906; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1908 = $1907; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1909 = $1908; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1910 = HEAP32[$1909>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1911 = (($1908) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1912 = $1911; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1913 = HEAP32[$1912>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1914 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1909 = HEAP32[$1908>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1910 = (($1907) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1911 = $1910; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1912 = HEAP32[$1911>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1913 = ((($4)) + 24|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1914 = $1913; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1915 = $1914; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1916 = $1915; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1917 = HEAP32[$1916>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1918 = (($1915) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1919 = $1918; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1920 = HEAP32[$1919>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1921 = $1910 ^ $1917; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1922 = $1913 ^ $1920; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1923 = (_bitshift64Lshr(($1921|0),($1922|0),16)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1924 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1916 = HEAP32[$1915>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1917 = (($1914) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1918 = $1917; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1919 = HEAP32[$1918>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1920 = $1909 ^ $1916; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1921 = $1912 ^ $1919; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1922 = (_bitshift64Lshr(($1920|0),($1921|0),16)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1923 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1924 = $1904 | $1922; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1925 = $1905 | $1923; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1926 = $1906 | $1924; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1927 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1926 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1927 = $1926; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1928 = $1927; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1929 = $1928; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1929>>2] = $1925; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1930 = (($1928) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1931 = $1930; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1931>>2] = $1926; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1932 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1928>>2] = $1924; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1929 = (($1927) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1930 = $1929; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1930>>2] = $1925; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1931 = ((($4)) + 112|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1932 = $1931; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1933 = $1932; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1934 = $1933; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1935 = HEAP32[$1934>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1936 = (($1933) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1937 = $1936; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1938 = HEAP32[$1937>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1939 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1934 = HEAP32[$1933>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1935 = (($1932) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1936 = $1935; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1937 = HEAP32[$1936>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1938 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1939 = $1938; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1940 = $1939; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1941 = $1940; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1942 = HEAP32[$1941>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1943 = (($1940) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1944 = $1943; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1945 = HEAP32[$1944>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1946 = (_i64Add(($1942|0),($1945|0),($1935|0),($1938|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1947 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1948 = $1939; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1949 = $1948; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1949>>2] = $1946; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1950 = (($1948) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1951 = $1950; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1951>>2] = $1947; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1952 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1941 = HEAP32[$1940>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1942 = (($1939) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1943 = $1942; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1944 = HEAP32[$1943>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1945 = (_i64Add(($1941|0),($1944|0),($1934|0),($1937|0))|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1946 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1947 = $1938; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1948 = $1947; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1948>>2] = $1945; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1949 = (($1947) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1950 = $1949; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1950>>2] = $1946; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1951 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1952 = $1951; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1953 = $1952; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1954 = $1953; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1955 = HEAP32[$1954>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1956 = (($1953) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1957 = $1956; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1958 = HEAP32[$1957>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1959 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1954 = HEAP32[$1953>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1955 = (($1952) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1956 = $1955; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1957 = HEAP32[$1956>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1958 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1959 = $1958; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1960 = $1959; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1961 = $1960; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1962 = HEAP32[$1961>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1963 = (($1960) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1964 = $1963; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1965 = HEAP32[$1964>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1966 = $1955 ^ $1962; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1967 = $1958 ^ $1965; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1968 = (_bitshift64Shl(($1966|0),($1967|0),53)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1969 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1970 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1961 = HEAP32[$1960>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1962 = (($1959) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1963 = $1962; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1964 = HEAP32[$1963>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1965 = $1954 ^ $1961; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1966 = $1957 ^ $1964; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1967 = (_bitshift64Shl(($1965|0),($1966|0),53)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1968 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1969 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1970 = $1969; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1971 = $1970; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1972 = $1971; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1973 = HEAP32[$1972>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1974 = (($1971) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1975 = $1974; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1976 = HEAP32[$1975>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1977 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1972 = HEAP32[$1971>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1973 = (($1970) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1974 = $1973; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1975 = HEAP32[$1974>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1976 = ((($4)) + 72|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1977 = $1976; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1978 = $1977; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1979 = $1978; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1980 = HEAP32[$1979>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1981 = (($1978) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1982 = $1981; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1983 = HEAP32[$1982>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1984 = $1973 ^ $1980; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1985 = $1976 ^ $1983; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1986 = (_bitshift64Lshr(($1984|0),($1985|0),11)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1987 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1979 = HEAP32[$1978>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1980 = (($1977) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1981 = $1980; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1982 = HEAP32[$1981>>2]|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1983 = $1972 ^ $1979; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1984 = $1975 ^ $1982; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1985 = (_bitshift64Lshr(($1983|0),($1984|0),11)|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1986 = tempRet0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1987 = $1967 | $1985; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1988 = $1968 | $1986; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1989 = $1969 | $1987; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1990 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1989 = ((($4)) + 32|0); //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1990 = $1989; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
   $1991 = $1990; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1992 = $1991; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1992>>2] = $1988; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1993 = (($1991) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1994 = $1993; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$1994>>2] = $1989; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1995 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1996 = $1995; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1997 = HEAP32[$1996>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1998 = (($1995) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $1999 = $1998; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2000 = HEAP32[$1999>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2001 = (1317 + ($1997<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2002 = ((($2001)) + 12|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2003 = HEAP8[$2002>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2004 = $2003&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2005 = (($5) + ($2004<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1991>>2] = $1987; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1992 = (($1990) + 4)|0; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1993 = $1992; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$1993>>2] = $1988; //@line 107 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1994 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1995 = $1994; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1996 = HEAP32[$1995>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1997 = (($1994) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1998 = $1997; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $1999 = HEAP32[$1998>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2000 = (1561 + ($1996<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2001 = ((($2000)) + 12|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2002 = HEAP8[$2001>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2003 = $2002&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2004 = (($5) + ($2003<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2005 = $2004; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2006 = $2005; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2007 = $2006; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2008 = HEAP32[$2007>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2009 = (($2006) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2010 = $2009; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2011 = HEAP32[$2010>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2012 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2013 = $2012; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2014 = HEAP32[$2013>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2015 = (($2012) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2016 = $2015; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2017 = HEAP32[$2016>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2018 = (1317 + ($2014<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2019 = ((($2018)) + 13|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2020 = HEAP8[$2019>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2021 = $2020&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2022 = (8 + ($2021<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2007 = HEAP32[$2006>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2008 = (($2005) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2009 = $2008; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2010 = HEAP32[$2009>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2011 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2012 = $2011; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2013 = HEAP32[$2012>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2014 = (($2011) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2015 = $2014; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2016 = HEAP32[$2015>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2017 = (1561 + ($2013<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2018 = ((($2017)) + 13|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2019 = HEAP8[$2018>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2020 = $2019&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2021 = (8 + ($2020<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2022 = $2021; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2023 = $2022; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2024 = $2023; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2025 = HEAP32[$2024>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2026 = (($2023) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2027 = $2026; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2028 = HEAP32[$2027>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2029 = $2008 ^ $2025; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2030 = $2011 ^ $2028; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2031 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2024 = HEAP32[$2023>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2025 = (($2022) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2026 = $2025; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2027 = HEAP32[$2026>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2028 = $2007 ^ $2024; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2029 = $2010 ^ $2027; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2030 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2031 = $2030; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2032 = $2031; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2033 = $2032; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2034 = HEAP32[$2033>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2035 = (($2032) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2036 = $2035; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2037 = HEAP32[$2036>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2038 = (_i64Add(($2029|0),($2030|0),($2034|0),($2037|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2039 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2040 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2033 = HEAP32[$2032>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2034 = (($2031) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2035 = $2034; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2036 = HEAP32[$2035>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2037 = (_i64Add(($2028|0),($2029|0),($2033|0),($2036|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2038 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2039 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2040 = $2039; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2041 = $2040; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2042 = $2041; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2043 = HEAP32[$2042>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2044 = (($2041) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2045 = $2044; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2046 = HEAP32[$2045>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2047 = (_i64Add(($2043|0),($2046|0),($2038|0),($2039|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2048 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2049 = $2040; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2050 = $2049; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2050>>2] = $2047; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2051 = (($2049) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2052 = $2051; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2052>>2] = $2048; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2053 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2042 = HEAP32[$2041>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2043 = (($2040) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2044 = $2043; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2045 = HEAP32[$2044>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2046 = (_i64Add(($2042|0),($2045|0),($2037|0),($2038|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2047 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2048 = $2039; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2049 = $2048; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2049>>2] = $2046; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2050 = (($2048) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2051 = $2050; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2051>>2] = $2047; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2052 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2053 = $2052; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2054 = $2053; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2055 = $2054; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2056 = HEAP32[$2055>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2057 = (($2054) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2058 = $2057; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2059 = HEAP32[$2058>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2060 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2055 = HEAP32[$2054>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2056 = (($2053) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2057 = $2056; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2058 = HEAP32[$2057>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2059 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2060 = $2059; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2061 = $2060; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2062 = $2061; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2063 = HEAP32[$2062>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2064 = (($2061) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2065 = $2064; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2066 = HEAP32[$2065>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2067 = $2056 ^ $2063; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2059 ^ $2066; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2068 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2062 = HEAP32[$2061>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2063 = (($2060) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2064 = $2063; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2065 = HEAP32[$2064>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2066 = $2055 ^ $2062; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2058 ^ $2065; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2067 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2068 = $2067; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2069 = $2068; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2070 = $2069; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2071 = HEAP32[$2070>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2072 = (($2069) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2073 = $2072; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2074 = HEAP32[$2073>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2075 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2070 = HEAP32[$2069>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2071 = (($2068) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2072 = $2071; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2073 = HEAP32[$2072>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2074 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2075 = $2074; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2076 = $2075; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2077 = $2076; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2078 = HEAP32[$2077>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2079 = (($2076) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2080 = $2079; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2081 = HEAP32[$2080>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2071 ^ $2078; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2082 = $2074 ^ $2081; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2083 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2077 = HEAP32[$2076>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2078 = (($2075) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2079 = $2078; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2080 = HEAP32[$2079>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2070 ^ $2077; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2081 = $2073 ^ $2080; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2082 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2083 = $2082; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2084 = $2083; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2085 = $2084; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2085>>2] = $2082; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2086 = (($2084) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2087 = $2086; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2087>>2] = $2067; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2088 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2084>>2] = $2081; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2085 = (($2083) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2086 = $2085; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2086>>2] = $2066; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2087 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2088 = $2087; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2089 = $2088; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2090 = $2089; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2091 = HEAP32[$2090>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2092 = (($2089) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2093 = $2092; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2094 = HEAP32[$2093>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2095 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2090 = HEAP32[$2089>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2091 = (($2088) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2092 = $2091; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2093 = HEAP32[$2092>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2094 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2095 = $2094; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2096 = $2095; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2097 = $2096; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2098 = HEAP32[$2097>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2099 = (($2096) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2100 = $2099; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2101 = HEAP32[$2100>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2102 = (_i64Add(($2098|0),($2101|0),($2091|0),($2094|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2103 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2104 = $2095; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2105 = $2104; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2105>>2] = $2102; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2106 = (($2104) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2107 = $2106; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2107>>2] = $2103; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2108 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2097 = HEAP32[$2096>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2098 = (($2095) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2099 = $2098; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2100 = HEAP32[$2099>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2101 = (_i64Add(($2097|0),($2100|0),($2090|0),($2093|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2102 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2103 = $2094; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2104 = $2103; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2104>>2] = $2101; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2105 = (($2103) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2106 = $2105; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2106>>2] = $2102; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2107 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2108 = $2107; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2109 = $2108; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2110 = $2109; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2111 = HEAP32[$2110>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2112 = (($2109) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2113 = $2112; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2114 = HEAP32[$2113>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2115 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2110 = HEAP32[$2109>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2111 = (($2108) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2112 = $2111; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2113 = HEAP32[$2112>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2114 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2115 = $2114; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2116 = $2115; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2117 = $2116; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2118 = HEAP32[$2117>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2119 = (($2116) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2120 = $2119; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2121 = HEAP32[$2120>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2122 = $2111 ^ $2118; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2123 = $2114 ^ $2121; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2124 = (_bitshift64Shl(($2122|0),($2123|0),39)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2125 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2126 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2117 = HEAP32[$2116>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2118 = (($2115) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2119 = $2118; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2120 = HEAP32[$2119>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2121 = $2110 ^ $2117; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2122 = $2113 ^ $2120; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2123 = (_bitshift64Shl(($2121|0),($2122|0),39)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2124 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2125 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2126 = $2125; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2127 = $2126; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2128 = $2127; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2129 = HEAP32[$2128>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2130 = (($2127) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2131 = $2130; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2132 = HEAP32[$2131>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2133 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2128 = HEAP32[$2127>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2129 = (($2126) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2130 = $2129; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2131 = HEAP32[$2130>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2132 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2133 = $2132; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2134 = $2133; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2135 = $2134; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2136 = HEAP32[$2135>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2137 = (($2134) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2138 = $2137; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2139 = HEAP32[$2138>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2140 = $2129 ^ $2136; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2141 = $2132 ^ $2139; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2142 = (_bitshift64Lshr(($2140|0),($2141|0),25)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2143 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2135 = HEAP32[$2134>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2136 = (($2133) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2137 = $2136; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2138 = HEAP32[$2137>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2139 = $2128 ^ $2135; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2140 = $2131 ^ $2138; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2141 = (_bitshift64Lshr(($2139|0),($2140|0),25)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2142 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2143 = $2123 | $2141; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2144 = $2124 | $2142; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2145 = $2125 | $2143; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2146 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2145 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2146 = $2145; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2147 = $2146; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2148 = $2147; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2148>>2] = $2144; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2149 = (($2147) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2150 = $2149; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2150>>2] = $2145; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2151 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2152 = $2151; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2153 = HEAP32[$2152>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2154 = (($2151) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2155 = $2154; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2156 = HEAP32[$2155>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2157 = (1317 + ($2153<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2158 = ((($2157)) + 13|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2159 = HEAP8[$2158>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2160 = $2159&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2161 = (($5) + ($2160<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2147>>2] = $2143; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2148 = (($2146) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2149 = $2148; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2149>>2] = $2144; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2150 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2151 = $2150; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2152 = HEAP32[$2151>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2153 = (($2150) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2154 = $2153; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2155 = HEAP32[$2154>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2156 = (1561 + ($2152<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2157 = ((($2156)) + 13|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2158 = HEAP8[$2157>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2159 = $2158&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2160 = (($5) + ($2159<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2161 = $2160; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2162 = $2161; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2163 = $2162; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2164 = HEAP32[$2163>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2165 = (($2162) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2166 = $2165; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2167 = HEAP32[$2166>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2168 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2169 = $2168; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2170 = HEAP32[$2169>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2171 = (($2168) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2172 = $2171; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2173 = HEAP32[$2172>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2174 = (1317 + ($2170<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2175 = ((($2174)) + 12|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2176 = HEAP8[$2175>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2177 = $2176&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2178 = (8 + ($2177<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2163 = HEAP32[$2162>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2164 = (($2161) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2165 = $2164; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2166 = HEAP32[$2165>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2167 = $6; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2168 = $2167; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2169 = HEAP32[$2168>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2170 = (($2167) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2171 = $2170; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2172 = HEAP32[$2171>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2173 = (1561 + ($2169<<4)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2174 = ((($2173)) + 12|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2175 = HEAP8[$2174>>0]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2176 = $2175&255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2177 = (8 + ($2176<<3)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2178 = $2177; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2179 = $2178; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2180 = $2179; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2181 = HEAP32[$2180>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2182 = (($2179) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2183 = $2182; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2184 = HEAP32[$2183>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2185 = $2164 ^ $2181; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2186 = $2167 ^ $2184; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2187 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2180 = HEAP32[$2179>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2181 = (($2178) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2182 = $2181; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2183 = HEAP32[$2182>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2184 = $2163 ^ $2180; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2185 = $2166 ^ $2183; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2186 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2187 = $2186; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2188 = $2187; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2189 = $2188; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2190 = HEAP32[$2189>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2191 = (($2188) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2192 = $2191; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2193 = HEAP32[$2192>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2194 = (_i64Add(($2185|0),($2186|0),($2190|0),($2193|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2195 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2196 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2189 = HEAP32[$2188>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2190 = (($2187) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2191 = $2190; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2192 = HEAP32[$2191>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2193 = (_i64Add(($2184|0),($2185|0),($2189|0),($2192|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2194 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2195 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2196 = $2195; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2197 = $2196; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2198 = $2197; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2199 = HEAP32[$2198>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2200 = (($2197) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2201 = $2200; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2202 = HEAP32[$2201>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2203 = (_i64Add(($2199|0),($2202|0),($2194|0),($2195|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2204 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2205 = $2196; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2206 = $2205; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2206>>2] = $2203; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2207 = (($2205) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2208 = $2207; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2208>>2] = $2204; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2209 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2198 = HEAP32[$2197>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2199 = (($2196) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2200 = $2199; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2201 = HEAP32[$2200>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2202 = (_i64Add(($2198|0),($2201|0),($2193|0),($2194|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2203 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2204 = $2195; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2205 = $2204; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2205>>2] = $2202; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2206 = (($2204) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2207 = $2206; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2207>>2] = $2203; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2208 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2209 = $2208; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2210 = $2209; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2211 = $2210; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2212 = HEAP32[$2211>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2213 = (($2210) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2214 = $2213; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2215 = HEAP32[$2214>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2216 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2211 = HEAP32[$2210>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2212 = (($2209) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2213 = $2212; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2214 = HEAP32[$2213>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2215 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2216 = $2215; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2217 = $2216; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2218 = $2217; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2219 = HEAP32[$2218>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2220 = (($2217) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2221 = $2220; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2222 = HEAP32[$2221>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2223 = $2212 ^ $2219; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2224 = $2215 ^ $2222; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2225 = (_bitshift64Shl(($2223|0),($2224|0),48)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2226 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2227 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2218 = HEAP32[$2217>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2219 = (($2216) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2220 = $2219; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2221 = HEAP32[$2220>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2222 = $2211 ^ $2218; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2223 = $2214 ^ $2221; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2224 = (_bitshift64Shl(($2222|0),($2223|0),48)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2225 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2226 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2227 = $2226; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2228 = $2227; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2229 = $2228; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2230 = HEAP32[$2229>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2231 = (($2228) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2232 = $2231; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2233 = HEAP32[$2232>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2234 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2229 = HEAP32[$2228>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2230 = (($2227) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2231 = $2230; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2232 = HEAP32[$2231>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2233 = ((($4)) + 16|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2234 = $2233; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2235 = $2234; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2236 = $2235; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2237 = HEAP32[$2236>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2238 = (($2235) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2239 = $2238; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2240 = HEAP32[$2239>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2241 = $2230 ^ $2237; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2242 = $2233 ^ $2240; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2243 = (_bitshift64Lshr(($2241|0),($2242|0),16)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2244 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2236 = HEAP32[$2235>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2237 = (($2234) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2238 = $2237; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2239 = HEAP32[$2238>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2240 = $2229 ^ $2236; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2241 = $2232 ^ $2239; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2242 = (_bitshift64Lshr(($2240|0),($2241|0),16)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2243 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2244 = $2224 | $2242; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2245 = $2225 | $2243; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2246 = $2226 | $2244; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2247 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2246 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2247 = $2246; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2248 = $2247; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2249 = $2248; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2249>>2] = $2245; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2250 = (($2248) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2251 = $2250; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2251>>2] = $2246; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2252 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2248>>2] = $2244; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2249 = (($2247) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2250 = $2249; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2250>>2] = $2245; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2251 = ((($4)) + 104|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2252 = $2251; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2253 = $2252; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2254 = $2253; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2255 = HEAP32[$2254>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2256 = (($2253) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2257 = $2256; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2258 = HEAP32[$2257>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2259 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2254 = HEAP32[$2253>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2255 = (($2252) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2256 = $2255; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2257 = HEAP32[$2256>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2258 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2259 = $2258; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2260 = $2259; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2261 = $2260; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2262 = HEAP32[$2261>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2263 = (($2260) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2264 = $2263; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2265 = HEAP32[$2264>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2266 = (_i64Add(($2262|0),($2265|0),($2255|0),($2258|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2267 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2268 = $2259; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2269 = $2268; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2269>>2] = $2266; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2270 = (($2268) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2271 = $2270; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2271>>2] = $2267; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2272 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2261 = HEAP32[$2260>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2262 = (($2259) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2263 = $2262; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2264 = HEAP32[$2263>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2265 = (_i64Add(($2261|0),($2264|0),($2254|0),($2257|0))|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2266 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2267 = $2258; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2268 = $2267; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2268>>2] = $2265; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2269 = (($2267) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2270 = $2269; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2270>>2] = $2266; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2271 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2272 = $2271; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2273 = $2272; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2274 = $2273; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2275 = HEAP32[$2274>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2276 = (($2273) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2277 = $2276; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2278 = HEAP32[$2277>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2279 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2274 = HEAP32[$2273>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2275 = (($2272) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2276 = $2275; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2277 = HEAP32[$2276>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2278 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2279 = $2278; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2280 = $2279; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2281 = $2280; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2282 = HEAP32[$2281>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2283 = (($2280) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2284 = $2283; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2285 = HEAP32[$2284>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2286 = $2275 ^ $2282; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2287 = $2278 ^ $2285; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2288 = (_bitshift64Shl(($2286|0),($2287|0),53)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2289 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2290 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2281 = HEAP32[$2280>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2282 = (($2279) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2283 = $2282; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2284 = HEAP32[$2283>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2285 = $2274 ^ $2281; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2286 = $2277 ^ $2284; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2287 = (_bitshift64Shl(($2285|0),($2286|0),53)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2288 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2289 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2290 = $2289; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2291 = $2290; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2292 = $2291; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2293 = HEAP32[$2292>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2294 = (($2291) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2295 = $2294; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2296 = HEAP32[$2295>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2297 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2292 = HEAP32[$2291>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2293 = (($2290) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2294 = $2293; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2295 = HEAP32[$2294>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2296 = ((($4)) + 64|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2297 = $2296; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2298 = $2297; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2299 = $2298; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2300 = HEAP32[$2299>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2301 = (($2298) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2302 = $2301; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2303 = HEAP32[$2302>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2304 = $2293 ^ $2300; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2305 = $2296 ^ $2303; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2306 = (_bitshift64Lshr(($2304|0),($2305|0),11)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2307 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2299 = HEAP32[$2298>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2300 = (($2297) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2301 = $2300; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2302 = HEAP32[$2301>>2]|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2303 = $2292 ^ $2299; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2304 = $2295 ^ $2302; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2305 = (_bitshift64Lshr(($2303|0),($2304|0),11)|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2306 = tempRet0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2307 = $2287 | $2305; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2308 = $2288 | $2306; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2309 = $2289 | $2307; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2310 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2309 = ((($4)) + 56|0); //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2310 = $2309; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
   $2311 = $2310; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2312 = $2311; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2312>>2] = $2308; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2313 = (($2311) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2314 = $2313; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2314>>2] = $2309; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2315 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2316 = $2315; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2317 = HEAP32[$2316>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2318 = (($2315) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2319 = $2318; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2320 = HEAP32[$2319>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2321 = (1317 + ($2317<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2322 = ((($2321)) + 8|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2323 = HEAP8[$2322>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2324 = $2323&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2325 = (($5) + ($2324<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2311>>2] = $2307; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2312 = (($2310) + 4)|0; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2313 = $2312; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2313>>2] = $2308; //@line 108 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2314 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2315 = $2314; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2316 = HEAP32[$2315>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2317 = (($2314) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2318 = $2317; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2319 = HEAP32[$2318>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2320 = (1561 + ($2316<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2321 = ((($2320)) + 8|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2322 = HEAP8[$2321>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2323 = $2322&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2324 = (($5) + ($2323<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2325 = $2324; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2326 = $2325; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2327 = $2326; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2328 = HEAP32[$2327>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2329 = (($2326) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2330 = $2329; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2331 = HEAP32[$2330>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2332 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2333 = $2332; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2334 = HEAP32[$2333>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2335 = (($2332) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2336 = $2335; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2337 = HEAP32[$2336>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2338 = (1317 + ($2334<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2339 = ((($2338)) + 9|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2340 = HEAP8[$2339>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2341 = $2340&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2342 = (8 + ($2341<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2327 = HEAP32[$2326>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2328 = (($2325) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2329 = $2328; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2330 = HEAP32[$2329>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2331 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2332 = $2331; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2333 = HEAP32[$2332>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2334 = (($2331) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2335 = $2334; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2336 = HEAP32[$2335>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2337 = (1561 + ($2333<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2338 = ((($2337)) + 9|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2339 = HEAP8[$2338>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2340 = $2339&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2341 = (8 + ($2340<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2342 = $2341; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2343 = $2342; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2344 = $2343; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2345 = HEAP32[$2344>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2346 = (($2343) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2347 = $2346; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2348 = HEAP32[$2347>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2349 = $2328 ^ $2345; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2350 = $2331 ^ $2348; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2351 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2344 = HEAP32[$2343>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2345 = (($2342) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2346 = $2345; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2347 = HEAP32[$2346>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2348 = $2327 ^ $2344; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2349 = $2330 ^ $2347; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2350 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2351 = $2350; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2352 = $2351; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2353 = $2352; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2354 = HEAP32[$2353>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2355 = (($2352) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2356 = $2355; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2357 = HEAP32[$2356>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2358 = (_i64Add(($2349|0),($2350|0),($2354|0),($2357|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2359 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2360 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2361 = $2360; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2362 = HEAP32[$2361>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2363 = (($2360) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2364 = $2363; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2365 = HEAP32[$2364>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2366 = (_i64Add(($2362|0),($2365|0),($2358|0),($2359|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2367 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2368 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2369 = $2368; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2369>>2] = $2366; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2370 = (($2368) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2371 = $2370; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2371>>2] = $2367; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2372 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2353 = HEAP32[$2352>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2354 = (($2351) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2355 = $2354; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2356 = HEAP32[$2355>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2357 = (_i64Add(($2348|0),($2349|0),($2353|0),($2356|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2358 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2359 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2360 = $2359; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2361 = HEAP32[$2360>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2362 = (($2359) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2363 = $2362; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2364 = HEAP32[$2363>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2365 = (_i64Add(($2361|0),($2364|0),($2357|0),($2358|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2366 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2367 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2368 = $2367; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2368>>2] = $2365; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2369 = (($2367) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2370 = $2369; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2370>>2] = $2366; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2371 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2372 = $2371; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2373 = $2372; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2374 = $2373; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2375 = HEAP32[$2374>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2376 = (($2373) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2377 = $2376; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2378 = HEAP32[$2377>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2379 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2380 = $2379; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2381 = HEAP32[$2380>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2382 = (($2379) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2383 = $2382; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2384 = HEAP32[$2383>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2385 = $2375 ^ $2381; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2378 ^ $2384; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2386 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2374 = HEAP32[$2373>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2375 = (($2372) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2376 = $2375; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2377 = HEAP32[$2376>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2378 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2379 = $2378; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2380 = HEAP32[$2379>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2381 = (($2378) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2382 = $2381; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2383 = HEAP32[$2382>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2384 = $2374 ^ $2380; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2377 ^ $2383; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2385 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2386 = $2385; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2387 = $2386; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2388 = $2387; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2389 = HEAP32[$2388>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2390 = (($2387) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2391 = $2390; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2392 = HEAP32[$2391>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2393 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2394 = $2393; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2395 = HEAP32[$2394>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2396 = (($2393) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2397 = $2396; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2398 = HEAP32[$2397>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2389 ^ $2395; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2399 = $2392 ^ $2398; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2400 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2388 = HEAP32[$2387>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2389 = (($2386) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2390 = $2389; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2391 = HEAP32[$2390>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2392 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2393 = $2392; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2394 = HEAP32[$2393>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2395 = (($2392) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2396 = $2395; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2397 = HEAP32[$2396>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2388 ^ $2394; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2398 = $2391 ^ $2397; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2399 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2400 = $2399; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2401 = $2400; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2402 = $2401; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2402>>2] = $2399; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2403 = (($2401) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2404 = $2403; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2404>>2] = $2385; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2405 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2401>>2] = $2398; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2402 = (($2400) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2403 = $2402; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2403>>2] = $2384; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2404 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2405 = $2404; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2406 = $2405; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2407 = $2406; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2408 = HEAP32[$2407>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2409 = (($2406) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2410 = $2409; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2411 = HEAP32[$2410>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2412 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2407 = HEAP32[$2406>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2408 = (($2405) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2409 = $2408; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2410 = HEAP32[$2409>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2411 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2412 = $2411; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2413 = $2412; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2414 = $2413; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2415 = HEAP32[$2414>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2416 = (($2413) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2417 = $2416; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2418 = HEAP32[$2417>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2419 = (_i64Add(($2415|0),($2418|0),($2408|0),($2411|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2420 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2421 = $2412; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2422 = $2421; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2422>>2] = $2419; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2423 = (($2421) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2424 = $2423; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2424>>2] = $2420; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2425 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2414 = HEAP32[$2413>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2415 = (($2412) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2416 = $2415; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2417 = HEAP32[$2416>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2418 = (_i64Add(($2414|0),($2417|0),($2407|0),($2410|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2419 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2420 = $2411; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2421 = $2420; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2421>>2] = $2418; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2422 = (($2420) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2423 = $2422; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2423>>2] = $2419; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2424 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2425 = $2424; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2426 = $2425; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2427 = $2426; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2428 = HEAP32[$2427>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2429 = (($2426) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2430 = $2429; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2431 = HEAP32[$2430>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2432 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2427 = HEAP32[$2426>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2428 = (($2425) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2429 = $2428; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2430 = HEAP32[$2429>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2431 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2432 = $2431; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2433 = $2432; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2434 = $2433; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2435 = HEAP32[$2434>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2436 = (($2433) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2437 = $2436; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2438 = HEAP32[$2437>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2439 = $2428 ^ $2435; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2440 = $2431 ^ $2438; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2441 = (_bitshift64Shl(($2439|0),($2440|0),39)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2442 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2443 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2434 = HEAP32[$2433>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2435 = (($2432) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2436 = $2435; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2437 = HEAP32[$2436>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2438 = $2427 ^ $2434; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2439 = $2430 ^ $2437; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2440 = (_bitshift64Shl(($2438|0),($2439|0),39)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2441 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2442 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2443 = $2442; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2444 = $2443; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2445 = $2444; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2446 = HEAP32[$2445>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2447 = (($2444) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2448 = $2447; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2449 = HEAP32[$2448>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2450 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2445 = HEAP32[$2444>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2446 = (($2443) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2447 = $2446; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2448 = HEAP32[$2447>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2449 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2450 = $2449; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2451 = $2450; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2452 = $2451; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2453 = HEAP32[$2452>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2454 = (($2451) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2455 = $2454; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2456 = HEAP32[$2455>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2457 = $2446 ^ $2453; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2458 = $2449 ^ $2456; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2459 = (_bitshift64Lshr(($2457|0),($2458|0),25)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2460 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2452 = HEAP32[$2451>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2453 = (($2450) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2454 = $2453; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2455 = HEAP32[$2454>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2456 = $2445 ^ $2452; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2457 = $2448 ^ $2455; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2458 = (_bitshift64Lshr(($2456|0),($2457|0),25)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2459 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2460 = $2440 | $2458; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2461 = $2441 | $2459; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2462 = $2442 | $2460; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2463 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2462 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2463 = $2462; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2464 = $2463; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2465 = $2464; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2465>>2] = $2461; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2466 = (($2464) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2467 = $2466; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2467>>2] = $2462; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2468 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2469 = $2468; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2470 = HEAP32[$2469>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2471 = (($2468) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2472 = $2471; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2473 = HEAP32[$2472>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2474 = (1317 + ($2470<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2475 = ((($2474)) + 9|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2476 = HEAP8[$2475>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2477 = $2476&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2478 = (($5) + ($2477<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2464>>2] = $2460; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2465 = (($2463) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2466 = $2465; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2466>>2] = $2461; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2467 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2468 = $2467; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2469 = HEAP32[$2468>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2470 = (($2467) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2471 = $2470; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2472 = HEAP32[$2471>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2473 = (1561 + ($2469<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2474 = ((($2473)) + 9|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2475 = HEAP8[$2474>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2476 = $2475&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2477 = (($5) + ($2476<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2478 = $2477; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2479 = $2478; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2480 = $2479; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2481 = HEAP32[$2480>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2482 = (($2479) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2483 = $2482; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2484 = HEAP32[$2483>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2485 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2486 = $2485; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2487 = HEAP32[$2486>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2488 = (($2485) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2489 = $2488; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2490 = HEAP32[$2489>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2491 = (1317 + ($2487<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2492 = ((($2491)) + 8|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2493 = HEAP8[$2492>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2494 = $2493&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2495 = (8 + ($2494<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2480 = HEAP32[$2479>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2481 = (($2478) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2482 = $2481; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2483 = HEAP32[$2482>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2484 = $6; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2485 = $2484; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2486 = HEAP32[$2485>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2487 = (($2484) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2488 = $2487; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2489 = HEAP32[$2488>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2490 = (1561 + ($2486<<4)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2491 = ((($2490)) + 8|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2492 = HEAP8[$2491>>0]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2493 = $2492&255; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2494 = (8 + ($2493<<3)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2495 = $2494; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2496 = $2495; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2497 = $2496; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2498 = HEAP32[$2497>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2499 = (($2496) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2500 = $2499; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2501 = HEAP32[$2500>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2502 = $2481 ^ $2498; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2503 = $2484 ^ $2501; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2504 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2497 = HEAP32[$2496>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2498 = (($2495) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2499 = $2498; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2500 = HEAP32[$2499>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2501 = $2480 ^ $2497; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2502 = $2483 ^ $2500; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2503 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2504 = $2503; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2505 = $2504; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2506 = $2505; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2507 = HEAP32[$2506>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2508 = (($2505) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2509 = $2508; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2510 = HEAP32[$2509>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2511 = (_i64Add(($2502|0),($2503|0),($2507|0),($2510|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2512 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2513 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2514 = $2513; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2515 = HEAP32[$2514>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2516 = (($2513) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2517 = $2516; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2518 = HEAP32[$2517>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2519 = (_i64Add(($2515|0),($2518|0),($2511|0),($2512|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2520 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2521 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2522 = $2521; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2522>>2] = $2519; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2523 = (($2521) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2524 = $2523; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2524>>2] = $2520; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2525 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2506 = HEAP32[$2505>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2507 = (($2504) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2508 = $2507; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2509 = HEAP32[$2508>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2510 = (_i64Add(($2501|0),($2502|0),($2506|0),($2509|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2511 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2512 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2513 = $2512; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2514 = HEAP32[$2513>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2515 = (($2512) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2516 = $2515; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2517 = HEAP32[$2516>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2518 = (_i64Add(($2514|0),($2517|0),($2510|0),($2511|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2519 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2520 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2521 = $2520; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2521>>2] = $2518; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2522 = (($2520) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2523 = $2522; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2523>>2] = $2519; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2524 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2525 = $2524; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2526 = $2525; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2527 = $2526; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2528 = HEAP32[$2527>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2529 = (($2526) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2530 = $2529; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2531 = HEAP32[$2530>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2532 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2533 = $2532; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2534 = HEAP32[$2533>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2535 = (($2532) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2536 = $2535; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2537 = HEAP32[$2536>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2538 = $2528 ^ $2534; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2539 = $2531 ^ $2537; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2540 = (_bitshift64Shl(($2538|0),($2539|0),48)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2541 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2542 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2527 = HEAP32[$2526>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2528 = (($2525) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2529 = $2528; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2530 = HEAP32[$2529>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2531 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2532 = $2531; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2533 = HEAP32[$2532>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2534 = (($2531) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2535 = $2534; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2536 = HEAP32[$2535>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2537 = $2527 ^ $2533; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2538 = $2530 ^ $2536; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2539 = (_bitshift64Shl(($2537|0),($2538|0),48)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2540 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2541 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2542 = $2541; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2543 = $2542; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2544 = $2543; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2545 = HEAP32[$2544>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2546 = (($2543) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2547 = $2546; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2548 = HEAP32[$2547>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2549 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2550 = $2549; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2551 = HEAP32[$2550>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2552 = (($2549) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2553 = $2552; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2554 = HEAP32[$2553>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2555 = $2545 ^ $2551; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2556 = $2548 ^ $2554; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2557 = (_bitshift64Lshr(($2555|0),($2556|0),16)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2558 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2544 = HEAP32[$2543>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2545 = (($2542) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2546 = $2545; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2547 = HEAP32[$2546>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2548 = $4; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2549 = $2548; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2550 = HEAP32[$2549>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2551 = (($2548) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2552 = $2551; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2553 = HEAP32[$2552>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2554 = $2544 ^ $2550; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2555 = $2547 ^ $2553; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2556 = (_bitshift64Lshr(($2554|0),($2555|0),16)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2557 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2558 = $2539 | $2556; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2559 = $2540 | $2557; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2560 = $2541 | $2558; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2561 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2560 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2561 = $2560; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2562 = $2561; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2563 = $2562; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2563>>2] = $2559; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2564 = (($2562) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2565 = $2564; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2565>>2] = $2560; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2566 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2562>>2] = $2558; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2563 = (($2561) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2564 = $2563; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2564>>2] = $2559; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2565 = ((($4)) + 120|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2566 = $2565; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2567 = $2566; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2568 = $2567; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2569 = HEAP32[$2568>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2570 = (($2567) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2571 = $2570; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2572 = HEAP32[$2571>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2573 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2568 = HEAP32[$2567>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2569 = (($2566) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2570 = $2569; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2571 = HEAP32[$2570>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2572 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2573 = $2572; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2574 = $2573; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2575 = $2574; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2576 = HEAP32[$2575>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2577 = (($2574) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2578 = $2577; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2579 = HEAP32[$2578>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2580 = (_i64Add(($2576|0),($2579|0),($2569|0),($2572|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2581 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2582 = $2573; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2583 = $2582; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2583>>2] = $2580; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2584 = (($2582) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2585 = $2584; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2585>>2] = $2581; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2586 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2575 = HEAP32[$2574>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2576 = (($2573) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2577 = $2576; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2578 = HEAP32[$2577>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2579 = (_i64Add(($2575|0),($2578|0),($2568|0),($2571|0))|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2580 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2581 = $2572; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2582 = $2581; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2582>>2] = $2579; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2583 = (($2581) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2584 = $2583; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2584>>2] = $2580; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2585 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2586 = $2585; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2587 = $2586; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2588 = $2587; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2589 = HEAP32[$2588>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2590 = (($2587) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2591 = $2590; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2592 = HEAP32[$2591>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2593 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2588 = HEAP32[$2587>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2589 = (($2586) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2590 = $2589; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2591 = HEAP32[$2590>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2592 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2593 = $2592; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2594 = $2593; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2595 = $2594; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2596 = HEAP32[$2595>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2597 = (($2594) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2598 = $2597; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2599 = HEAP32[$2598>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2600 = $2589 ^ $2596; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2601 = $2592 ^ $2599; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2602 = (_bitshift64Shl(($2600|0),($2601|0),53)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2603 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2604 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2595 = HEAP32[$2594>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2596 = (($2593) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2597 = $2596; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2598 = HEAP32[$2597>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2599 = $2588 ^ $2595; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2600 = $2591 ^ $2598; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2601 = (_bitshift64Shl(($2599|0),($2600|0),53)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2602 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2603 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2604 = $2603; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2605 = $2604; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2606 = $2605; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2607 = HEAP32[$2606>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2608 = (($2605) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2609 = $2608; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2610 = HEAP32[$2609>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2611 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2606 = HEAP32[$2605>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2607 = (($2604) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2608 = $2607; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2609 = HEAP32[$2608>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2610 = ((($4)) + 80|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2611 = $2610; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2612 = $2611; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2613 = $2612; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2614 = HEAP32[$2613>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2615 = (($2612) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2616 = $2615; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2617 = HEAP32[$2616>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2618 = $2607 ^ $2614; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2619 = $2610 ^ $2617; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2620 = (_bitshift64Lshr(($2618|0),($2619|0),11)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2621 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2613 = HEAP32[$2612>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2614 = (($2611) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2615 = $2614; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2616 = HEAP32[$2615>>2]|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2617 = $2606 ^ $2613; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2618 = $2609 ^ $2616; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2619 = (_bitshift64Lshr(($2617|0),($2618|0),11)|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2620 = tempRet0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2621 = $2601 | $2619; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2622 = $2602 | $2620; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2623 = $2603 | $2621; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2624 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2623 = ((($4)) + 40|0); //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2624 = $2623; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
   $2625 = $2624; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2626 = $2625; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2626>>2] = $2622; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2627 = (($2625) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2628 = $2627; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2628>>2] = $2623; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2629 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2630 = $2629; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2631 = HEAP32[$2630>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2632 = (($2629) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2633 = $2632; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2634 = HEAP32[$2633>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2635 = (1317 + ($2631<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2636 = ((($2635)) + 10|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2637 = HEAP8[$2636>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2638 = $2637&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2639 = (($5) + ($2638<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2625>>2] = $2621; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2626 = (($2624) + 4)|0; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2627 = $2626; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2627>>2] = $2622; //@line 109 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2628 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2629 = $2628; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2630 = HEAP32[$2629>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2631 = (($2628) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2632 = $2631; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2633 = HEAP32[$2632>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2634 = (1561 + ($2630<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2635 = ((($2634)) + 10|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2636 = HEAP8[$2635>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2637 = $2636&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2638 = (($5) + ($2637<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2639 = $2638; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2640 = $2639; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2641 = $2640; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2642 = HEAP32[$2641>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2643 = (($2640) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2644 = $2643; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2645 = HEAP32[$2644>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2646 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2647 = $2646; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2648 = HEAP32[$2647>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2649 = (($2646) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2650 = $2649; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2651 = HEAP32[$2650>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2652 = (1317 + ($2648<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2653 = ((($2652)) + 11|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2654 = HEAP8[$2653>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2655 = $2654&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2656 = (8 + ($2655<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2641 = HEAP32[$2640>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2642 = (($2639) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2643 = $2642; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2644 = HEAP32[$2643>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2645 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2646 = $2645; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2647 = HEAP32[$2646>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2648 = (($2645) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2649 = $2648; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2650 = HEAP32[$2649>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2651 = (1561 + ($2647<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2652 = ((($2651)) + 11|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2653 = HEAP8[$2652>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2654 = $2653&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2655 = (8 + ($2654<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2656 = $2655; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2657 = $2656; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2658 = $2657; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2659 = HEAP32[$2658>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2660 = (($2657) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2661 = $2660; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2662 = HEAP32[$2661>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2663 = $2642 ^ $2659; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2664 = $2645 ^ $2662; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2665 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2658 = HEAP32[$2657>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2659 = (($2656) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2660 = $2659; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2661 = HEAP32[$2660>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2662 = $2641 ^ $2658; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2663 = $2644 ^ $2661; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2664 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2665 = $2664; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2666 = $2665; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2667 = $2666; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2668 = HEAP32[$2667>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2669 = (($2666) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2670 = $2669; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2671 = HEAP32[$2670>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2672 = (_i64Add(($2663|0),($2664|0),($2668|0),($2671|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2673 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2674 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2667 = HEAP32[$2666>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2668 = (($2665) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2669 = $2668; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2670 = HEAP32[$2669>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2671 = (_i64Add(($2662|0),($2663|0),($2667|0),($2670|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2672 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2673 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2674 = $2673; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2675 = $2674; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2676 = $2675; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2677 = HEAP32[$2676>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2678 = (($2675) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2679 = $2678; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2680 = HEAP32[$2679>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2681 = (_i64Add(($2677|0),($2680|0),($2672|0),($2673|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2682 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2683 = $2674; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2684 = $2683; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2684>>2] = $2681; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2685 = (($2683) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2686 = $2685; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2686>>2] = $2682; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2687 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2676 = HEAP32[$2675>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2677 = (($2674) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2678 = $2677; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2679 = HEAP32[$2678>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2680 = (_i64Add(($2676|0),($2679|0),($2671|0),($2672|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2681 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2682 = $2673; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2683 = $2682; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2683>>2] = $2680; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2684 = (($2682) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2685 = $2684; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2685>>2] = $2681; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2686 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2687 = $2686; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2688 = $2687; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2689 = $2688; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2690 = HEAP32[$2689>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2691 = (($2688) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2692 = $2691; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2693 = HEAP32[$2692>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2694 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2689 = HEAP32[$2688>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2690 = (($2687) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2691 = $2690; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2692 = HEAP32[$2691>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2693 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2694 = $2693; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2695 = $2694; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2696 = $2695; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2697 = HEAP32[$2696>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2698 = (($2695) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2699 = $2698; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2700 = HEAP32[$2699>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2701 = $2690 ^ $2697; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2693 ^ $2700; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2702 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2696 = HEAP32[$2695>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2697 = (($2694) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2698 = $2697; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2699 = HEAP32[$2698>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2700 = $2689 ^ $2696; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2692 ^ $2699; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2701 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2702 = $2701; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2703 = $2702; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2704 = $2703; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2705 = HEAP32[$2704>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2706 = (($2703) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2707 = $2706; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2708 = HEAP32[$2707>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2709 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2704 = HEAP32[$2703>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2705 = (($2702) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2706 = $2705; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2707 = HEAP32[$2706>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2708 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2709 = $2708; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2710 = $2709; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2711 = $2710; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2712 = HEAP32[$2711>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2713 = (($2710) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2714 = $2713; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2715 = HEAP32[$2714>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2705 ^ $2712; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2716 = $2708 ^ $2715; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2717 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2711 = HEAP32[$2710>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2712 = (($2709) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2713 = $2712; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2714 = HEAP32[$2713>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2704 ^ $2711; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2715 = $2707 ^ $2714; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2716 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2717 = $2716; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2718 = $2717; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2719 = $2718; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2719>>2] = $2716; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2720 = (($2718) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2721 = $2720; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2721>>2] = $2701; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2722 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2718>>2] = $2715; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2719 = (($2717) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2720 = $2719; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2720>>2] = $2700; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2721 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2722 = $2721; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2723 = $2722; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2724 = $2723; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2725 = HEAP32[$2724>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2726 = (($2723) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2727 = $2726; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2728 = HEAP32[$2727>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2729 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2724 = HEAP32[$2723>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2725 = (($2722) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2726 = $2725; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2727 = HEAP32[$2726>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2728 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2729 = $2728; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2730 = $2729; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2731 = $2730; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2732 = HEAP32[$2731>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2733 = (($2730) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2734 = $2733; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2735 = HEAP32[$2734>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2736 = (_i64Add(($2732|0),($2735|0),($2725|0),($2728|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2737 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2738 = $2729; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2739 = $2738; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2739>>2] = $2736; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2740 = (($2738) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2741 = $2740; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2741>>2] = $2737; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2742 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2731 = HEAP32[$2730>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2732 = (($2729) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2733 = $2732; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2734 = HEAP32[$2733>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2735 = (_i64Add(($2731|0),($2734|0),($2724|0),($2727|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2736 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2737 = $2728; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2738 = $2737; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2738>>2] = $2735; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2739 = (($2737) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2740 = $2739; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2740>>2] = $2736; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2741 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2742 = $2741; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2743 = $2742; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2744 = $2743; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2745 = HEAP32[$2744>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2746 = (($2743) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2747 = $2746; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2748 = HEAP32[$2747>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2749 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2744 = HEAP32[$2743>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2745 = (($2742) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2746 = $2745; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2747 = HEAP32[$2746>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2748 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2749 = $2748; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2750 = $2749; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2751 = $2750; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2752 = HEAP32[$2751>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2753 = (($2750) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2754 = $2753; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2755 = HEAP32[$2754>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2756 = $2745 ^ $2752; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2757 = $2748 ^ $2755; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2758 = (_bitshift64Shl(($2756|0),($2757|0),39)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2759 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2760 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2751 = HEAP32[$2750>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2752 = (($2749) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2753 = $2752; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2754 = HEAP32[$2753>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2755 = $2744 ^ $2751; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2756 = $2747 ^ $2754; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2757 = (_bitshift64Shl(($2755|0),($2756|0),39)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2758 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2759 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2760 = $2759; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2761 = $2760; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2762 = $2761; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2763 = HEAP32[$2762>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2764 = (($2761) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2765 = $2764; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2766 = HEAP32[$2765>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2767 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2762 = HEAP32[$2761>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2763 = (($2760) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2764 = $2763; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2765 = HEAP32[$2764>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2766 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2767 = $2766; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2768 = $2767; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2769 = $2768; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2770 = HEAP32[$2769>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2771 = (($2768) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2772 = $2771; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2773 = HEAP32[$2772>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2774 = $2763 ^ $2770; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2775 = $2766 ^ $2773; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2776 = (_bitshift64Lshr(($2774|0),($2775|0),25)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2777 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2769 = HEAP32[$2768>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2770 = (($2767) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2771 = $2770; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2772 = HEAP32[$2771>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2773 = $2762 ^ $2769; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2774 = $2765 ^ $2772; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2775 = (_bitshift64Lshr(($2773|0),($2774|0),25)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2776 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2777 = $2757 | $2775; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2778 = $2758 | $2776; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2779 = $2759 | $2777; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2780 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2779 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2780 = $2779; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2781 = $2780; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2782 = $2781; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2782>>2] = $2778; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2783 = (($2781) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2784 = $2783; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2784>>2] = $2779; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2785 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2786 = $2785; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2787 = HEAP32[$2786>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2788 = (($2785) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2789 = $2788; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2790 = HEAP32[$2789>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2791 = (1317 + ($2787<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2792 = ((($2791)) + 11|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2793 = HEAP8[$2792>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2794 = $2793&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2795 = (($5) + ($2794<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2781>>2] = $2777; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2782 = (($2780) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2783 = $2782; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2783>>2] = $2778; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2784 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2785 = $2784; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2786 = HEAP32[$2785>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2787 = (($2784) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2788 = $2787; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2789 = HEAP32[$2788>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2790 = (1561 + ($2786<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2791 = ((($2790)) + 11|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2792 = HEAP8[$2791>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2793 = $2792&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2794 = (($5) + ($2793<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2795 = $2794; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2796 = $2795; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2797 = $2796; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2798 = HEAP32[$2797>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2799 = (($2796) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2800 = $2799; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2801 = HEAP32[$2800>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2802 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2803 = $2802; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2804 = HEAP32[$2803>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2805 = (($2802) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2806 = $2805; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2807 = HEAP32[$2806>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2808 = (1317 + ($2804<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2809 = ((($2808)) + 10|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2810 = HEAP8[$2809>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2811 = $2810&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2812 = (8 + ($2811<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2797 = HEAP32[$2796>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2798 = (($2795) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2799 = $2798; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2800 = HEAP32[$2799>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2801 = $6; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2802 = $2801; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2803 = HEAP32[$2802>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2804 = (($2801) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2805 = $2804; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2806 = HEAP32[$2805>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2807 = (1561 + ($2803<<4)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2808 = ((($2807)) + 10|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2809 = HEAP8[$2808>>0]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2810 = $2809&255; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2811 = (8 + ($2810<<3)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2812 = $2811; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2813 = $2812; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2814 = $2813; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2815 = HEAP32[$2814>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2816 = (($2813) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2817 = $2816; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2818 = HEAP32[$2817>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2819 = $2798 ^ $2815; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2820 = $2801 ^ $2818; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2821 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2814 = HEAP32[$2813>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2815 = (($2812) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2816 = $2815; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2817 = HEAP32[$2816>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2818 = $2797 ^ $2814; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2819 = $2800 ^ $2817; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2820 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2821 = $2820; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2822 = $2821; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2823 = $2822; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2824 = HEAP32[$2823>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2825 = (($2822) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2826 = $2825; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2827 = HEAP32[$2826>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2828 = (_i64Add(($2819|0),($2820|0),($2824|0),($2827|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2829 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2830 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2823 = HEAP32[$2822>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2824 = (($2821) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2825 = $2824; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2826 = HEAP32[$2825>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2827 = (_i64Add(($2818|0),($2819|0),($2823|0),($2826|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2828 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2829 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2830 = $2829; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2831 = $2830; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2832 = $2831; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2833 = HEAP32[$2832>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2834 = (($2831) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2835 = $2834; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2836 = HEAP32[$2835>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2837 = (_i64Add(($2833|0),($2836|0),($2828|0),($2829|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2838 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2839 = $2830; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2840 = $2839; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2840>>2] = $2837; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2841 = (($2839) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2842 = $2841; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2842>>2] = $2838; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2843 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2832 = HEAP32[$2831>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2833 = (($2830) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2834 = $2833; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2835 = HEAP32[$2834>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2836 = (_i64Add(($2832|0),($2835|0),($2827|0),($2828|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2837 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2838 = $2829; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2839 = $2838; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2839>>2] = $2836; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2840 = (($2838) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2841 = $2840; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2841>>2] = $2837; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2842 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2843 = $2842; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2844 = $2843; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2845 = $2844; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2846 = HEAP32[$2845>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2847 = (($2844) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2848 = $2847; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2849 = HEAP32[$2848>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2850 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2845 = HEAP32[$2844>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2846 = (($2843) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2847 = $2846; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2848 = HEAP32[$2847>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2849 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2850 = $2849; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2851 = $2850; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2852 = $2851; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2853 = HEAP32[$2852>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2854 = (($2851) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2855 = $2854; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2856 = HEAP32[$2855>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2857 = $2846 ^ $2853; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2858 = $2849 ^ $2856; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2859 = (_bitshift64Shl(($2857|0),($2858|0),48)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2860 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2861 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2852 = HEAP32[$2851>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2853 = (($2850) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2854 = $2853; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2855 = HEAP32[$2854>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2856 = $2845 ^ $2852; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2857 = $2848 ^ $2855; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2858 = (_bitshift64Shl(($2856|0),($2857|0),48)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2859 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2860 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2861 = $2860; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2862 = $2861; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2863 = $2862; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2864 = HEAP32[$2863>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2865 = (($2862) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2866 = $2865; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2867 = HEAP32[$2866>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2868 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2863 = HEAP32[$2862>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2864 = (($2861) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2865 = $2864; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2866 = HEAP32[$2865>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2867 = ((($4)) + 8|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2868 = $2867; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2869 = $2868; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2870 = $2869; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2871 = HEAP32[$2870>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2872 = (($2869) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2873 = $2872; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2874 = HEAP32[$2873>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2875 = $2864 ^ $2871; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2876 = $2867 ^ $2874; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2877 = (_bitshift64Lshr(($2875|0),($2876|0),16)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2878 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2870 = HEAP32[$2869>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2871 = (($2868) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2872 = $2871; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2873 = HEAP32[$2872>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2874 = $2863 ^ $2870; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2875 = $2866 ^ $2873; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2876 = (_bitshift64Lshr(($2874|0),($2875|0),16)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2877 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2878 = $2858 | $2876; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2879 = $2859 | $2877; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2880 = $2860 | $2878; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2881 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2880 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2881 = $2880; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2882 = $2881; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2883 = $2882; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2883>>2] = $2879; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2884 = (($2882) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2885 = $2884; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2885>>2] = $2880; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2886 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2882>>2] = $2878; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2883 = (($2881) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2884 = $2883; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2884>>2] = $2879; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2885 = ((($4)) + 96|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2886 = $2885; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2887 = $2886; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2888 = $2887; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2889 = HEAP32[$2888>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2890 = (($2887) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2891 = $2890; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2892 = HEAP32[$2891>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2893 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2888 = HEAP32[$2887>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2889 = (($2886) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2890 = $2889; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2891 = HEAP32[$2890>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2892 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2893 = $2892; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2894 = $2893; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2895 = $2894; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2896 = HEAP32[$2895>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2897 = (($2894) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2898 = $2897; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2899 = HEAP32[$2898>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2900 = (_i64Add(($2896|0),($2899|0),($2889|0),($2892|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2901 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2902 = $2893; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2903 = $2902; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2903>>2] = $2900; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2904 = (($2902) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2905 = $2904; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2905>>2] = $2901; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2906 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2895 = HEAP32[$2894>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2896 = (($2893) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2897 = $2896; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2898 = HEAP32[$2897>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2899 = (_i64Add(($2895|0),($2898|0),($2888|0),($2891|0))|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2900 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2901 = $2892; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2902 = $2901; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2902>>2] = $2899; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2903 = (($2901) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2904 = $2903; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2904>>2] = $2900; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2905 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2906 = $2905; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2907 = $2906; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2908 = $2907; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2909 = HEAP32[$2908>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2910 = (($2907) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2911 = $2910; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2912 = HEAP32[$2911>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2913 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2908 = HEAP32[$2907>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2909 = (($2906) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2910 = $2909; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2911 = HEAP32[$2910>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2912 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2913 = $2912; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2914 = $2913; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2915 = $2914; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2916 = HEAP32[$2915>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2917 = (($2914) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2918 = $2917; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2919 = HEAP32[$2918>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2920 = $2909 ^ $2916; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2921 = $2912 ^ $2919; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2922 = (_bitshift64Shl(($2920|0),($2921|0),53)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2923 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2924 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2915 = HEAP32[$2914>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2916 = (($2913) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2917 = $2916; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2918 = HEAP32[$2917>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2919 = $2908 ^ $2915; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2920 = $2911 ^ $2918; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2921 = (_bitshift64Shl(($2919|0),($2920|0),53)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2922 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2923 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2924 = $2923; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2925 = $2924; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2926 = $2925; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2927 = HEAP32[$2926>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2928 = (($2925) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2929 = $2928; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2930 = HEAP32[$2929>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2931 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2926 = HEAP32[$2925>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2927 = (($2924) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2928 = $2927; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2929 = HEAP32[$2928>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2930 = ((($4)) + 88|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2931 = $2930; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2932 = $2931; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2933 = $2932; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2934 = HEAP32[$2933>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2935 = (($2932) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2936 = $2935; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2937 = HEAP32[$2936>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2938 = $2927 ^ $2934; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2939 = $2930 ^ $2937; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2940 = (_bitshift64Lshr(($2938|0),($2939|0),11)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2941 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2933 = HEAP32[$2932>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2934 = (($2931) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2935 = $2934; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2936 = HEAP32[$2935>>2]|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2937 = $2926 ^ $2933; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2938 = $2929 ^ $2936; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2939 = (_bitshift64Lshr(($2937|0),($2938|0),11)|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2940 = tempRet0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2941 = $2921 | $2939; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2942 = $2922 | $2940; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2943 = $2923 | $2941; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2944 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2943 = ((($4)) + 48|0); //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2944 = $2943; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
   $2945 = $2944; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2946 = $2945; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2946>>2] = $2942; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2947 = (($2945) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2948 = $2947; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2948>>2] = $2943; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2949 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2950 = $2949; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2951 = HEAP32[$2950>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2952 = (($2949) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2953 = $2952; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2954 = HEAP32[$2953>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2955 = (_i64Add(($2951|0),($2954|0),1,0)|0); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2956 = tempRet0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2957 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2958 = $2957; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2958>>2] = $2955; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2959 = (($2957) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2960 = $2959; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$2960>>2] = $2956; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2945>>2] = $2941; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2946 = (($2944) + 4)|0; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2947 = $2946; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2947>>2] = $2942; //@line 110 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2948 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2949 = $2948; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2950 = HEAP32[$2949>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2951 = (($2948) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2952 = $2951; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2953 = HEAP32[$2952>>2]|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2954 = (_i64Add(($2950|0),($2953|0),1,0)|0); //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2955 = tempRet0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2956 = $6; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2957 = $2956; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2957>>2] = $2954; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2958 = (($2956) + 4)|0; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2959 = $2958; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$2959>>2] = $2955; //@line 102 "c_src/crypto_hash/blake512/ref/hash.c"
  }
- $2961 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
- $2962 = $2961; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$2962>>2] = 0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
- $2963 = (($2961) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
- $2964 = $2963; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$2964>>2] = 0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+ $2960 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+ $2961 = $2960; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$2961>>2] = 0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+ $2962 = (($2960) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+ $2963 = $2962; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$2963>>2] = 0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
  while(1) {
-  $2965 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2966 = $2965; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2967 = HEAP32[$2966>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2968 = (($2965) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2969 = $2968; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2970 = HEAP32[$2969>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2971 = ($2970>>>0)<(0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2972 = ($2967>>>0)<(16); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2973 = ($2970|0)==(0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2974 = $2973 & $2972; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2975 = $2971 | $2974; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  if (!($2975)) {
+  $2964 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2965 = $2964; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2966 = HEAP32[$2965>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2967 = (($2964) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2968 = $2967; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2969 = HEAP32[$2968>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2970 = ($2969>>>0)<(0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2971 = ($2966>>>0)<(16); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2972 = ($2969|0)==(0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2973 = $2972 & $2971; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2974 = $2970 | $2973; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  if (!($2974)) {
    break;
   }
-  $2976 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2977 = $2976; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2978 = HEAP32[$2977>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2979 = (($2976) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2980 = $2979; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2981 = HEAP32[$2980>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2982 = (($4) + ($2978<<3)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2975 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2976 = $2975; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2977 = HEAP32[$2976>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2978 = (($2975) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2979 = $2978; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2980 = HEAP32[$2979>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2981 = (($4) + ($2977<<3)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2982 = $2981; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2983 = $2982; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2984 = $2983; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2985 = HEAP32[$2984>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2986 = (($2983) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2987 = $2986; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2988 = HEAP32[$2987>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2984 = HEAP32[$2983>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2985 = (($2982) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2986 = $2985; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2987 = HEAP32[$2986>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2988 = $2; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2989 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2990 = $2989; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2991 = HEAP32[$2990>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
@@ -7022,111 +7039,110 @@ function _blake512_compress($0,$1) {
   $2994 = HEAP32[$2993>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2995 = (___uremdi3(($2991|0),($2994|0),8,0)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2996 = tempRet0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2997 = $2; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $2998 = (($2997) + ($2995<<3)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2997 = (($2988) + ($2995<<3)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $2998 = $2997; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
   $2999 = $2998; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3000 = $2999; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3001 = HEAP32[$3000>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3002 = (($2999) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3003 = $3002; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3004 = HEAP32[$3003>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3005 = $3001 ^ $2985; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3006 = $3004 ^ $2988; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3007 = $2998; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3008 = $3007; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3008>>2] = $3005; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3009 = (($3007) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3010 = $3009; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3010>>2] = $3006; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3011 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3012 = $3011; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3013 = HEAP32[$3012>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3014 = (($3011) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3015 = $3014; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3016 = HEAP32[$3015>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3017 = (_i64Add(($3013|0),($3016|0),1,0)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3018 = tempRet0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3019 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3020 = $3019; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3020>>2] = $3017; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3021 = (($3019) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3022 = $3021; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3022>>2] = $3018; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3000 = HEAP32[$2999>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3001 = (($2998) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3002 = $3001; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3003 = HEAP32[$3002>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3004 = $3000 ^ $2984; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3005 = $3003 ^ $2987; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3006 = $2997; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3007 = $3006; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3007>>2] = $3004; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3008 = (($3006) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3009 = $3008; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3009>>2] = $3005; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3010 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3011 = $3010; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3012 = HEAP32[$3011>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3013 = (($3010) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3014 = $3013; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3015 = HEAP32[$3014>>2]|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3016 = (_i64Add(($3012|0),($3015|0),1,0)|0); //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3017 = tempRet0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3018 = $6; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3019 = $3018; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3019>>2] = $3016; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3020 = (($3018) + 4)|0; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3021 = $3020; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3021>>2] = $3017; //@line 113 "c_src/crypto_hash/blake512/ref/hash.c"
  }
- $3023 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
- $3024 = $3023; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$3024>>2] = 0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
- $3025 = (($3023) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
- $3026 = $3025; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
- HEAP32[$3026>>2] = 0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+ $3022 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+ $3023 = $3022; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$3023>>2] = 0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+ $3024 = (($3022) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+ $3025 = $3024; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+ HEAP32[$3025>>2] = 0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
  while(1) {
-  $3027 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3028 = $3027; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3029 = HEAP32[$3028>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3030 = (($3027) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3031 = $3030; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3032 = HEAP32[$3031>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3033 = ($3032>>>0)<(0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3034 = ($3029>>>0)<(8); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3035 = ($3032|0)==(0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3036 = $3035 & $3034; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3037 = $3033 | $3036; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  if (!($3037)) {
+  $3026 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3027 = $3026; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3028 = HEAP32[$3027>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3029 = (($3026) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3030 = $3029; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3031 = HEAP32[$3030>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3032 = ($3031>>>0)<(0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3033 = ($3028>>>0)<(8); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3034 = ($3031|0)==(0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3035 = $3034 & $3033; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3036 = $3032 | $3035; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  if (!($3036)) {
    break;
   }
-  $3038 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3039 = $3038; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3040 = HEAP32[$3039>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3041 = (($3038) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3042 = $3041; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3043 = HEAP32[$3042>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3044 = (___uremdi3(($3040|0),($3043|0),4,0)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3045 = tempRet0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3046 = $2; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3047 = ((($3046)) + 64|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3048 = (($3047) + ($3044<<3)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3037 = $2; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3038 = ((($3037)) + 64|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3039 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3040 = $3039; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3041 = HEAP32[$3040>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3042 = (($3039) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3043 = $3042; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3044 = HEAP32[$3043>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3045 = (___uremdi3(($3041|0),($3044|0),4,0)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3046 = tempRet0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3047 = (($3038) + ($3045<<3)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3048 = $3047; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3049 = $3048; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3050 = $3049; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3051 = HEAP32[$3050>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3052 = (($3049) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3053 = $3052; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3054 = HEAP32[$3053>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3050 = HEAP32[$3049>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3051 = (($3048) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3052 = $3051; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3053 = HEAP32[$3052>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3054 = $2; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3055 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3056 = $3055; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3057 = HEAP32[$3056>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3058 = (($3055) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3059 = $3058; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3060 = HEAP32[$3059>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3061 = $2; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3062 = (($3061) + ($3057<<3)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3061 = (($3054) + ($3057<<3)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3062 = $3061; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
   $3063 = $3062; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3064 = $3063; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3065 = HEAP32[$3064>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3066 = (($3063) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3067 = $3066; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3068 = HEAP32[$3067>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3069 = $3065 ^ $3051; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3070 = $3068 ^ $3054; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3071 = $3062; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3072 = $3071; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3072>>2] = $3069; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3073 = (($3071) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3074 = $3073; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3074>>2] = $3070; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3075 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3076 = $3075; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3077 = HEAP32[$3076>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3078 = (($3075) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3079 = $3078; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3080 = HEAP32[$3079>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3081 = (_i64Add(($3077|0),($3080|0),1,0)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3082 = tempRet0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3083 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3084 = $3083; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3084>>2] = $3081; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3085 = (($3083) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  $3086 = $3085; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$3086>>2] = $3082; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3064 = HEAP32[$3063>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3065 = (($3062) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3066 = $3065; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3067 = HEAP32[$3066>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3068 = $3064 ^ $3050; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3069 = $3067 ^ $3053; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3070 = $3061; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3071 = $3070; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3071>>2] = $3068; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3072 = (($3070) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3073 = $3072; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3073>>2] = $3069; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3074 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3075 = $3074; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3076 = HEAP32[$3075>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3077 = (($3074) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3078 = $3077; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3079 = HEAP32[$3078>>2]|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3080 = (_i64Add(($3076|0),($3079|0),1,0)|0); //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3081 = tempRet0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3082 = $6; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3083 = $3082; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3083>>2] = $3080; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3084 = (($3082) + 4)|0; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  $3085 = $3084; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
+  HEAP32[$3085>>2] = $3081; //@line 114 "c_src/crypto_hash/blake512/ref/hash.c"
  }
  STACKTOP = sp;return; //@line 115 "c_src/crypto_hash/blake512/ref/hash.c"
 }
@@ -7268,14 +7284,14 @@ function _blake512_update($0,$1,$2,$3) {
  $1 = $1|0;
  $2 = $2|0;
  $3 = $3|0;
- var $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0;
- var $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0;
- var $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0;
- var $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
- var $29 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0;
- var $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0;
- var $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0, $83 = 0;
- var $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
+ var $$sink = 0, $$sink2 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
+ var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
+ var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
+ var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0;
+ var $28 = 0, $29 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0;
+ var $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0;
+ var $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0, $80 = 0, $81 = 0, $82 = 0;
+ var $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0, $99 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 32|0;
  $6 = sp;
@@ -7431,43 +7447,44 @@ function _blake512_update($0,$1,$2,$3) {
  $129 = ($126|0)==(0); //@line 156 "c_src/crypto_hash/blake512/ref/hash.c"
  $130 = $129 & $128; //@line 156 "c_src/crypto_hash/blake512/ref/hash.c"
  $131 = $127 | $130; //@line 156 "c_src/crypto_hash/blake512/ref/hash.c"
- $132 = $4; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
- if ($131) {
-  $133 = ((($132)) + 120|0); //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $134 = $7; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $135 = (($133) + ($134)|0); //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $136 = $5; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $137 = $6; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $138 = $137; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $139 = HEAP32[$138>>2]|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $140 = (($137) + 4)|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $141 = $140; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $142 = HEAP32[$141>>2]|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $143 = (_bitshift64Lshr(($139|0),($142|0),3)|0); //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $144 = tempRet0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $145 = $143 & 127; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  _memcpy(($135|0),($136|0),($145|0))|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
-  $146 = $7; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $147 = $146 << 3; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $148 = ($147|0)<(0); //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $149 = $148 << 31 >> 31; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $150 = $6; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $151 = $150; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $152 = HEAP32[$151>>2]|0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $153 = (($150) + 4)|0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $154 = $153; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $155 = HEAP32[$154>>2]|0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $156 = (_i64Add(($147|0),($149|0),($152|0),($155|0))|0); //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $157 = tempRet0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $158 = $4; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  $159 = ((($158)) + 112|0); //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$159>>2] = $156; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
-  STACKTOP = sp;return; //@line 161 "c_src/crypto_hash/blake512/ref/hash.c"
- } else {
-  $160 = ((($132)) + 112|0); //@line 160 "c_src/crypto_hash/blake512/ref/hash.c"
-  HEAP32[$160>>2] = 0; //@line 160 "c_src/crypto_hash/blake512/ref/hash.c"
+ $132 = $4;
+ if (!($131)) {
+  $$sink = 0;$$sink2 = $132;
+  $159 = ((($$sink2)) + 112|0);
+  HEAP32[$159>>2] = $$sink;
   STACKTOP = sp;return; //@line 161 "c_src/crypto_hash/blake512/ref/hash.c"
  }
+ $133 = ((($132)) + 120|0); //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $134 = $7; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $135 = (($133) + ($134)|0); //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $136 = $5; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $137 = $6; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $138 = $137; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $139 = HEAP32[$138>>2]|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $140 = (($137) + 4)|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $141 = $140; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $142 = HEAP32[$141>>2]|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $143 = (_bitshift64Lshr(($139|0),($142|0),3)|0); //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $144 = tempRet0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $145 = $143 & 127; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ _memcpy(($135|0),($136|0),($145|0))|0; //@line 157 "c_src/crypto_hash/blake512/ref/hash.c"
+ $146 = $7; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $147 = $146 << 3; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $148 = ($147|0)<(0); //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $149 = $148 << 31 >> 31; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $150 = $6; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $151 = $150; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $152 = HEAP32[$151>>2]|0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $153 = (($150) + 4)|0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $154 = $153; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $155 = HEAP32[$154>>2]|0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $156 = (_i64Add(($147|0),($149|0),($152|0),($155|0))|0); //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $157 = tempRet0; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $158 = $4; //@line 158 "c_src/crypto_hash/blake512/ref/hash.c"
+ $$sink = $156;$$sink2 = $158;
+ $159 = ((($$sink2)) + 112|0);
+ HEAP32[$159>>2] = $$sink;
+ STACKTOP = sp;return; //@line 161 "c_src/crypto_hash/blake512/ref/hash.c"
 }
 function _blake512_final($0,$1) {
  $0 = $0|0;
@@ -7782,7 +7799,7 @@ function _blake512_final($0,$1) {
  $222 = ((($221)) + 112|0); //@line 172 "c_src/crypto_hash/blake512/ref/hash.c"
  $223 = HEAP32[$222>>2]|0; //@line 172 "c_src/crypto_hash/blake512/ref/hash.c"
  $224 = ($223|0)==(888); //@line 172 "c_src/crypto_hash/blake512/ref/hash.c"
- $225 = $2; //@line 173 "c_src/crypto_hash/blake512/ref/hash.c"
+ $225 = $2;
  if ($224) {
   $226 = ((($225)) + 96|0); //@line 173 "c_src/crypto_hash/blake512/ref/hash.c"
   $227 = $226; //@line 173 "c_src/crypto_hash/blake512/ref/hash.c"
@@ -7805,9 +7822,9 @@ function _blake512_final($0,$1) {
   $240 = ((($225)) + 112|0); //@line 177 "c_src/crypto_hash/blake512/ref/hash.c"
   $241 = HEAP32[$240>>2]|0; //@line 177 "c_src/crypto_hash/blake512/ref/hash.c"
   $242 = ($241|0)<(888); //@line 177 "c_src/crypto_hash/blake512/ref/hash.c"
-  $243 = $2; //@line 178 "c_src/crypto_hash/blake512/ref/hash.c"
-  $244 = ((($243)) + 112|0); //@line 178 "c_src/crypto_hash/blake512/ref/hash.c"
-  $245 = HEAP32[$244>>2]|0; //@line 178 "c_src/crypto_hash/blake512/ref/hash.c"
+  $243 = $2;
+  $244 = ((($243)) + 112|0);
+  $245 = HEAP32[$244>>2]|0;
   if ($242) {
    $246 = ($245|0)==(0); //@line 178 "c_src/crypto_hash/blake512/ref/hash.c"
    if ($246) {
@@ -7844,7 +7861,7 @@ function _blake512_final($0,$1) {
    $273 = (888 - ($272))|0; //@line 180 "c_src/crypto_hash/blake512/ref/hash.c"
    $274 = ($273|0)<(0); //@line 180 "c_src/crypto_hash/blake512/ref/hash.c"
    $275 = $274 << 31 >> 31; //@line 180 "c_src/crypto_hash/blake512/ref/hash.c"
-   _blake512_update($269,1637,$273,$275); //@line 180 "c_src/crypto_hash/blake512/ref/hash.c"
+   _blake512_update($269,1881,$273,$275); //@line 180 "c_src/crypto_hash/blake512/ref/hash.c"
   } else {
    $276 = (1024 - ($245))|0; //@line 183 "c_src/crypto_hash/blake512/ref/hash.c"
    $277 = ($276|0)<(0); //@line 183 "c_src/crypto_hash/blake512/ref/hash.c"
@@ -7872,7 +7889,7 @@ function _blake512_final($0,$1) {
    $297 = (1024 - ($296))|0; //@line 184 "c_src/crypto_hash/blake512/ref/hash.c"
    $298 = ($297|0)<(0); //@line 184 "c_src/crypto_hash/blake512/ref/hash.c"
    $299 = $298 << 31 >> 31; //@line 184 "c_src/crypto_hash/blake512/ref/hash.c"
-   _blake512_update($293,1637,$297,$299); //@line 184 "c_src/crypto_hash/blake512/ref/hash.c"
+   _blake512_update($293,1881,$297,$299); //@line 184 "c_src/crypto_hash/blake512/ref/hash.c"
    $300 = $2; //@line 185 "c_src/crypto_hash/blake512/ref/hash.c"
    $301 = ((($300)) + 96|0); //@line 185 "c_src/crypto_hash/blake512/ref/hash.c"
    $302 = $301; //@line 185 "c_src/crypto_hash/blake512/ref/hash.c"
@@ -7890,7 +7907,7 @@ function _blake512_final($0,$1) {
    $313 = $312; //@line 185 "c_src/crypto_hash/blake512/ref/hash.c"
    HEAP32[$313>>2] = $309; //@line 185 "c_src/crypto_hash/blake512/ref/hash.c"
    $314 = $2; //@line 186 "c_src/crypto_hash/blake512/ref/hash.c"
-   _blake512_update($314,(1638),888,0); //@line 186 "c_src/crypto_hash/blake512/ref/hash.c"
+   _blake512_update($314,(1882),888,0); //@line 186 "c_src/crypto_hash/blake512/ref/hash.c"
    $315 = $2; //@line 187 "c_src/crypto_hash/blake512/ref/hash.c"
    $316 = ((($315)) + 116|0); //@line 187 "c_src/crypto_hash/blake512/ref/hash.c"
    HEAP32[$316>>2] = 1; //@line 187 "c_src/crypto_hash/blake512/ref/hash.c"
@@ -8855,8 +8872,8 @@ function _crypto_stream_chacha12_ref($0,$1,$2,$3,$4) {
  $4 = $4|0;
  var $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0;
  var $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0, $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0;
- var $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $65 = 0, $7 = 0, $8 = 0;
- var $9 = 0, label = 0, sp = 0;
+ var $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0, $64 = 0, $7 = 0, $8 = 0, $9 = 0;
+ var label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 96|0;
  $6 = sp + 8|0;
@@ -8899,17 +8916,17 @@ function _crypto_stream_chacha12_ref($0,$1,$2,$3,$4) {
   $35 = ($26|0)==($32|0); //@line 21 "c_src/crypto_stream/chacha12/e/ref/stream.c"
   $36 = $35 & $34; //@line 21 "c_src/crypto_stream/chacha12/e/ref/stream.c"
   $37 = $33 | $36; //@line 21 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $38 = $5;
   if (!($37)) {
    break;
   }
-  $38 = $10; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $39 = $38; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $40 = HEAP32[$39>>2]|0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $41 = (($38) + 4)|0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $42 = $41; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $43 = HEAP32[$42>>2]|0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $44 = $5; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
-  $45 = (($44) + ($40)|0); //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $39 = $10; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $40 = $39; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $41 = HEAP32[$40>>2]|0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $42 = (($39) + 4)|0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $43 = $42; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $44 = HEAP32[$43>>2]|0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+  $45 = (($38) + ($41)|0); //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
   HEAP8[$45>>0] = 0; //@line 22 "c_src/crypto_stream/chacha12/e/ref/stream.c"
   $46 = $10; //@line 21 "c_src/crypto_stream/chacha12/e/ref/stream.c"
   $47 = $46; //@line 21 "c_src/crypto_stream/chacha12/e/ref/stream.c"
@@ -8927,14 +8944,13 @@ function _crypto_stream_chacha12_ref($0,$1,$2,$3,$4) {
   HEAP32[$57>>2] = $53; //@line 21 "c_src/crypto_stream/chacha12/e/ref/stream.c"
  }
  $58 = $5; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $59 = $5; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $60 = $6; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $61 = $60; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $62 = HEAP32[$61>>2]|0; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $63 = (($60) + 4)|0; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $64 = $63; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- $65 = HEAP32[$64>>2]|0; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
- _ECRYPT_encrypt_bytes($9,$58,$59,$62); //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ $59 = $6; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ $60 = $59; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ $61 = HEAP32[$60>>2]|0; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ $62 = (($59) + 4)|0; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ $63 = $62; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ $64 = HEAP32[$63>>2]|0; //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
+ _ECRYPT_encrypt_bytes($9,$38,$58,$61); //@line 24 "c_src/crypto_stream/chacha12/e/ref/stream.c"
  STACKTOP = sp;return 0; //@line 25 "c_src/crypto_stream/chacha12/e/ref/stream.c"
 }
 function _ECRYPT_keysetup($0,$1,$2,$3) {
@@ -9079,9 +9095,9 @@ function _ECRYPT_keysetup($0,$1,$2,$3) {
   $115 = $5; //@line 57 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $116 = ((($115)) + 16|0); //@line 57 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $5 = $116; //@line 57 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $8 = 1782; //@line 58 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $8 = 2010; //@line 58 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
  } else {
-  $8 = 1766; //@line 60 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $8 = 2026; //@line 60 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
  }
  $117 = $5; //@line 62 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
  $118 = HEAP8[$117>>0]|0; //@line 62 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -9416,7 +9432,7 @@ function _ECRYPT_encrypt_bytes($0,$1,$2,$3) {
   }
   $29 = $7; //@line 93 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $30 = ($29>>>0)<=(64); //@line 93 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $9 = 0; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $9 = 0;
   if ($30) {
    break;
   }
@@ -9426,9 +9442,9 @@ function _ECRYPT_encrypt_bytes($0,$1,$2,$3) {
    if (!($51)) {
     break;
    }
-   $52 = $9; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-   $53 = $5; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-   $54 = (($53) + ($52)|0); //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+   $52 = $5; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+   $53 = $9; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+   $54 = (($52) + ($53)|0); //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $55 = HEAP8[$54>>0]|0; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $56 = $55&255; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $57 = $9; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -9437,9 +9453,9 @@ function _ECRYPT_encrypt_bytes($0,$1,$2,$3) {
    $60 = $59&255; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $61 = $56 ^ $60; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $62 = $61&255; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-   $63 = $9; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-   $64 = $6; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-   $65 = (($64) + ($63)|0); //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+   $63 = $6; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+   $64 = $9; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+   $65 = (($63) + ($64)|0); //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    HEAP8[$65>>0] = $62; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $66 = $9; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
    $67 = (($66) + 1)|0; //@line 97 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -9462,9 +9478,9 @@ function _ECRYPT_encrypt_bytes($0,$1,$2,$3) {
   if (!($33)) {
    break;
   }
-  $34 = $9; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $35 = $5; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $36 = (($35) + ($34)|0); //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $34 = $5; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $35 = $9; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $36 = (($34) + ($35)|0); //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $37 = HEAP8[$36>>0]|0; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $38 = $37&255; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $39 = $9; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -9473,9 +9489,9 @@ function _ECRYPT_encrypt_bytes($0,$1,$2,$3) {
   $42 = $41&255; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $43 = $38 ^ $42; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $44 = $43&255; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $45 = $9; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $46 = $6; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $47 = (($46) + ($45)|0); //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $45 = $6; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $46 = $9; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $47 = (($45) + ($46)|0); //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   HEAP8[$47>>0] = $44; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $48 = $9; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $49 = (($48) + 1)|0; //@line 94 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -9534,9 +9550,9 @@ function _salsa20_wordtobyte($0,$1) {
   if (!($7)) {
    break;
   }
-  $8 = $5; //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $9 = $3; //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $10 = (($9) + ($8<<2)|0); //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $8 = $3; //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $9 = $5; //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $10 = (($8) + ($9<<2)|0); //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $11 = HEAP32[$10>>2]|0; //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $12 = $5; //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $13 = (($4) + ($12<<2)|0); //@line 25 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -10254,9 +10270,9 @@ function _salsa20_wordtobyte($0,$1) {
   $646 = $5; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $647 = (($4) + ($646<<2)|0); //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $648 = HEAP32[$647>>2]|0; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $649 = $5; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $650 = $3; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
-  $651 = (($650) + ($649<<2)|0); //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $649 = $3; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $650 = $5; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
+  $651 = (($649) + ($650<<2)|0); //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $652 = HEAP32[$651>>2]|0; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $653 = (($648) + ($652))|0; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
   $654 = $5; //@line 36 "c_src/crypto_stream/chacha12/e/ref/e/chacha.c"
@@ -10407,16 +10423,16 @@ function _hash_2n_n($0,$1) {
   if (!($7)) {
    break;
   }
-  $8 = $5; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $9 = $3; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $10 = (($9) + ($8)|0); //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $8 = $3; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $9 = $5; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $10 = (($8) + ($9)|0); //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $11 = HEAP8[$10>>0]|0; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $12 = $5; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $13 = (($4) + ($12)|0); //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
   HEAP8[$13>>0] = $11; //@line 37 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $14 = $5; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $15 = HEAP32[50]|0; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $16 = (($15) + ($14)|0); //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $14 = HEAP32[50]|0; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $15 = $5; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $16 = (($14) + ($15)|0); //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $17 = HEAP8[$16>>0]|0; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $18 = $5; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $19 = (($18) + 32)|0; //@line 38 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10438,10 +10454,10 @@ function _hash_2n_n($0,$1) {
   $26 = (($4) + ($25)|0); //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $27 = HEAP8[$26>>0]|0; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $28 = $27&255; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $29 = $5; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $30 = (($29) + 32)|0; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $31 = $3; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $32 = (($31) + ($30)|0); //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $29 = $3; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $30 = $5; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $31 = (($30) + 32)|0; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $32 = (($29) + ($31)|0); //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $33 = HEAP8[$32>>0]|0; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $34 = $33&255; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $35 = $28 ^ $34; //@line 42 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10464,9 +10480,9 @@ function _hash_2n_n($0,$1) {
   $43 = $5; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $44 = (($4) + ($43)|0); //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $45 = HEAP8[$44>>0]|0; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $46 = $5; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $47 = $2; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $48 = (($47) + ($46)|0); //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $46 = $2; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $47 = $5; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $48 = (($46) + ($47)|0); //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
   HEAP8[$48>>0] = $45; //@line 45 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $49 = $5; //@line 44 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $50 = (($49) + 1)|0; //@line 44 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10493,14 +10509,14 @@ function _hash_2n_n_mask($0,$1,$2) {
   if (!($9)) {
    break;
   }
-  $10 = $7; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $11 = $4; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $12 = (($11) + ($10)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $10 = $4; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $11 = $7; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $12 = (($10) + ($11)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $13 = HEAP8[$12>>0]|0; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $14 = $13&255; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $15 = $7; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $16 = $5; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $17 = (($16) + ($15)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $15 = $5; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $16 = $7; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $17 = (($15) + ($16)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $18 = HEAP8[$17>>0]|0; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $19 = $18&255; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $20 = $14 ^ $19; //@line 55 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10533,16 +10549,16 @@ function _hash_n_n($0,$1) {
   if (!($7)) {
    break;
   }
-  $8 = $5; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $9 = $3; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $10 = (($9) + ($8)|0); //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $8 = $3; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $9 = $5; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $10 = (($8) + ($9)|0); //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $11 = HEAP8[$10>>0]|0; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $12 = $5; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $13 = (($4) + ($12)|0); //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
   HEAP8[$13>>0] = $11; //@line 70 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $14 = $5; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $15 = HEAP32[50]|0; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $16 = (($15) + ($14)|0); //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $14 = HEAP32[50]|0; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $15 = $5; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $16 = (($14) + ($15)|0); //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $17 = HEAP8[$16>>0]|0; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $18 = $5; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $19 = (($18) + 32)|0; //@line 71 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10563,9 +10579,9 @@ function _hash_n_n($0,$1) {
   $25 = $5; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $26 = (($4) + ($25)|0); //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $27 = HEAP8[$26>>0]|0; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $28 = $5; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $29 = $2; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $30 = (($29) + ($28)|0); //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $28 = $2; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $29 = $5; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $30 = (($28) + ($29)|0); //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
   HEAP8[$30>>0] = $27; //@line 75 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $31 = $5; //@line 74 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $32 = (($31) + 1)|0; //@line 74 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10592,14 +10608,14 @@ function _hash_n_n_mask($0,$1,$2) {
   if (!($9)) {
    break;
   }
-  $10 = $7; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $11 = $4; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $12 = (($11) + ($10)|0); //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $10 = $4; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $11 = $7; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $12 = (($10) + ($11)|0); //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $13 = HEAP8[$12>>0]|0; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $14 = $13&255; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $15 = $7; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $16 = $5; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
-  $17 = (($16) + ($15)|0); //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $15 = $5; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $16 = $7; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
+  $17 = (($15) + ($16)|0); //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $18 = HEAP8[$17>>0]|0; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $19 = $18&255; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
   $20 = $14 ^ $19; //@line 85 "c_src/crypto_sign/sphincs256/ref/hash.c"
@@ -10773,11 +10789,11 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
   $111 = $20; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $112 = (($23) + ($111)|0); //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $113 = HEAP8[$112>>0]|0; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $114 = $22; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $115 = (($114) + 1)|0; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $22 = $115; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $116 = $9; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $117 = (($116) + ($114)|0); //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $114 = $9; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $115 = $22; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $116 = (($115) + 1)|0; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $22 = $116; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $117 = (($114) + ($115)|0); //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
   HEAP8[$117>>0] = $113; //@line 52 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $118 = $20; //@line 51 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $119 = (($118) + 1)|0; //@line 51 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10790,17 +10806,17 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
   if (!($121)) {
    break;
   }
-  $122 = $19; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $123 = $122<<1; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $124 = $16; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $125 = (($124) + ($123)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $122 = $16; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $123 = $19; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $124 = $123<<1; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $125 = (($122) + ($124)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $126 = HEAP8[$125>>0]|0; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $127 = $126&255; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $128 = $19; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $129 = $128<<1; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $130 = (($129) + 1)|0; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $131 = $16; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $132 = (($131) + ($130)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $128 = $16; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $129 = $19; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $130 = $129<<1; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $131 = (($130) + 1)|0; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $132 = (($128) + ($131)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $133 = HEAP8[$132>>0]|0; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $134 = $133&255; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $135 = $134 << 8; //@line 57 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10810,7 +10826,7 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
   while(1) {
    $137 = $21; //@line 59 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $138 = ($137|0)<(32); //@line 59 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $139 = $18; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $139 = $18;
    if (!($138)) {
     break;
    }
@@ -10819,11 +10835,11 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
    $142 = (($140) + ($141))|0; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $143 = (($17) + ($142)|0); //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $144 = HEAP8[$143>>0]|0; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $145 = $22; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $146 = (($145) + 1)|0; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $22 = $146; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $147 = $9; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $148 = (($147) + ($145)|0); //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $145 = $9; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $146 = $22; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $147 = (($146) + 1)|0; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $22 = $147; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $148 = (($145) + ($146)|0); //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
    HEAP8[$148>>0] = $144; //@line 60 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $149 = $21; //@line 59 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $150 = (($149) + 1)|0; //@line 59 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10841,7 +10857,7 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
    $154 = $18; //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $155 = $154 & 1; //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $156 = ($155|0)!=(0); //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $157 = $18; //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $157 = $18;
    $158 = (($157) + 1)|0; //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $159 = (($157) - 1)|0; //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $160 = $156 ? $158 : $159; //@line 65 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10850,7 +10866,7 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
    while(1) {
     $161 = $21; //@line 66 "c_src/crypto_sign/sphincs256/ref/horst.c"
     $162 = ($161|0)<(32); //@line 66 "c_src/crypto_sign/sphincs256/ref/horst.c"
-    $163 = $18; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
+    $163 = $18;
     if (!($162)) {
      break;
     }
@@ -10859,11 +10875,11 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
     $166 = (($164) + ($165))|0; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
     $167 = (($23) + ($166)|0); //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
     $168 = HEAP8[$167>>0]|0; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
-    $169 = $22; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
-    $170 = (($169) + 1)|0; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
-    $22 = $170; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
-    $171 = $9; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
-    $172 = (($171) + ($169)|0); //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
+    $169 = $9; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
+    $170 = $22; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
+    $171 = (($170) + 1)|0; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
+    $22 = $171; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
+    $172 = (($169) + ($170)|0); //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
     HEAP8[$172>>0] = $168; //@line 67 "c_src/crypto_sign/sphincs256/ref/horst.c"
     $173 = $21; //@line 66 "c_src/crypto_sign/sphincs256/ref/horst.c"
     $174 = (($173) + 1)|0; //@line 66 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10890,9 +10906,9 @@ function _horst_sign($0,$1,$2,$3,$4,$5,$6,$7,$8) {
   $183 = $19; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $184 = (($23) + ($183)|0); //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $185 = HEAP8[$184>>0]|0; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $186 = $19; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $187 = $10; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $188 = (($187) + ($186)|0); //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $186 = $10; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $187 = $19; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $188 = (($186) + ($187)|0); //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
   HEAP8[$188>>0] = $185; //@line 73 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $189 = $19; //@line 72 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $190 = (($189) + 1)|0; //@line 72 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10966,17 +10982,17 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
   if (!($28)) {
    break;
   }
-  $29 = $17; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $30 = $29<<1; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $31 = $13; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $32 = (($31) + ($30)|0); //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $29 = $13; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $30 = $17; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $31 = $30<<1; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $32 = (($29) + ($31)|0); //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $33 = HEAP8[$32>>0]|0; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $34 = $33&255; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $35 = $17; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $36 = $35<<1; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $37 = (($36) + 1)|0; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $38 = $13; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
-  $39 = (($38) + ($37)|0); //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $35 = $13; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $36 = $17; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $37 = $36<<1; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $38 = (($37) + 1)|0; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
+  $39 = (($35) + ($38)|0); //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $40 = HEAP8[$39>>0]|0; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $41 = $40&255; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
   $42 = $41 << 8; //@line 95 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -10997,10 +11013,10 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
      if (!($63)) {
       break L4;
      }
-     $64 = $19; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
-     $65 = (32 + ($64))|0; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
-     $66 = $9; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
-     $67 = (($66) + ($65)|0); //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $64 = $9; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $65 = $19; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $66 = (32 + ($65))|0; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $67 = (($64) + ($66)|0); //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
      $68 = HEAP8[$67>>0]|0; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
      $69 = $19; //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
      $70 = (($14) + ($69)|0); //@line 111 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -11019,10 +11035,10 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
      if (!($49)) {
       break L4;
      }
-     $50 = $19; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
-     $51 = (32 + ($50))|0; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
-     $52 = $9; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
-     $53 = (($52) + ($51)|0); //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $50 = $9; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $51 = $19; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $52 = (32 + ($51))|0; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
+     $53 = (($50) + ($52)|0); //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
      $54 = HEAP8[$53>>0]|0; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
      $55 = $19; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
      $56 = (32 + ($55))|0; //@line 105 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -11041,9 +11057,9 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
   while(1) {
    $75 = $18; //@line 115 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $76 = ($75|0)<(10); //@line 115 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $77 = $16; //@line 117 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $78 = $77 >>> 1; //@line 117 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $16 = $78; //@line 117 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $77 = $16;
+   $78 = $77 >>> 1;
+   $16 = $78;
    if (!($76)) {
     break;
    }
@@ -11067,9 +11083,9 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
       if (!($107)) {
        break L17;
       }
-      $108 = $19; //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
-      $109 = $9; //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
-      $110 = (($109) + ($108)|0); //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
+      $108 = $9; //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
+      $109 = $19; //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
+      $110 = (($108) + ($109)|0); //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
       $111 = HEAP8[$110>>0]|0; //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
       $112 = $19; //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
       $113 = (($14) + ($112)|0); //@line 129 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -11093,9 +11109,9 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
       if (!($89)) {
        break L17;
       }
-      $90 = $19; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
-      $91 = $9; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
-      $92 = (($91) + ($90)|0); //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
+      $90 = $9; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
+      $91 = $19; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
+      $92 = (($90) + ($91)|0); //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
       $93 = HEAP8[$92>>0]|0; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
       $94 = $19; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
       $95 = (32 + ($94))|0; //@line 123 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -11124,12 +11140,12 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
    if (!($123)) {
     break;
    }
-   $124 = $16; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $125 = $124<<5; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $126 = $19; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $127 = (($125) + ($126))|0; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $128 = $15; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $129 = (($128) + ($127)|0); //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $124 = $15; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $125 = $16; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $126 = $125<<5; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $127 = $19; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $128 = (($126) + ($127))|0; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $129 = (($124) + ($128)|0); //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $130 = HEAP8[$129>>0]|0; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $131 = $130&255; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $132 = $19; //@line 138 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -11157,9 +11173,9 @@ function _horst_verify($0,$1,$2,$3,$4,$5,$6) {
    if (!($211)) {
     break;
    }
-   $212 = $19; //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $213 = $8; //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
-   $214 = (($213) + ($212)|0); //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $212 = $8; //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $213 = $19; //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
+   $214 = (($212) + ($213)|0); //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
    HEAP8[$214>>0] = 0; //@line 165 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $215 = $19; //@line 164 "c_src/crypto_sign/sphincs256/ref/horst.c"
    $216 = (($215) + 1)|0; //@line 164 "c_src/crypto_sign/sphincs256/ref/horst.c"
@@ -11335,11 +11351,11 @@ function _chacha_permute($0,$1) {
   if (!($7)) {
    break;
   }
-  $8 = $5; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $9 = $8<<2; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $10 = (($9) + 3)|0; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $11 = $3; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $12 = (($11) + ($10)|0); //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $8 = $3; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $9 = $5; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $10 = $9<<2; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $11 = (($10) + 3)|0; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $12 = (($8) + ($11)|0); //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $13 = HEAP8[$12>>0]|0; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $14 = $13&255; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $15 = $5; //@line 30 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -11350,11 +11366,11 @@ function _chacha_permute($0,$1) {
   $19 = HEAP32[$18>>2]|0; //@line 31 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $20 = $19 << 8; //@line 31 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP32[$18>>2] = $20; //@line 31 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $21 = $5; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $22 = $21<<2; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $23 = (($22) + 2)|0; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $24 = $3; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $25 = (($24) + ($23)|0); //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $21 = $3; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $22 = $5; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $23 = $22<<2; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $24 = (($23) + 2)|0; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $25 = (($21) + ($24)|0); //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $26 = HEAP8[$25>>0]|0; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $27 = $26&255; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $28 = $5; //@line 32 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -11367,11 +11383,11 @@ function _chacha_permute($0,$1) {
   $34 = HEAP32[$33>>2]|0; //@line 33 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $35 = $34 << 8; //@line 33 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP32[$33>>2] = $35; //@line 33 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $36 = $5; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $37 = $36<<2; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $38 = (($37) + 1)|0; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $39 = $3; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $40 = (($39) + ($38)|0); //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $36 = $3; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $37 = $5; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $38 = $37<<2; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $39 = (($38) + 1)|0; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $40 = (($36) + ($39)|0); //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $41 = HEAP8[$40>>0]|0; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $42 = $41&255; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $43 = $5; //@line 34 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -11384,11 +11400,11 @@ function _chacha_permute($0,$1) {
   $49 = HEAP32[$48>>2]|0; //@line 35 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $50 = $49 << 8; //@line 35 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP32[$48>>2] = $50; //@line 35 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $51 = $5; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $52 = $51<<2; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $53 = (($52) + 0)|0; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $54 = $3; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $55 = (($54) + ($53)|0); //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $51 = $3; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $52 = $5; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $53 = $52<<2; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $54 = (($53) + 0)|0; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $55 = (($51) + ($54)|0); //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $56 = HEAP8[$55>>0]|0; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $57 = $56&255; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $58 = $5; //@line 36 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -12111,10 +12127,10 @@ function _chacha_permute($0,$1) {
   $696 = HEAP32[$695>>2]|0; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $697 = $696 & 255; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $698 = $697&255; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $699 = $5; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $700 = $699<<2; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $701 = $2; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $702 = (($701) + ($700)|0); //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $699 = $2; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $700 = $5; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $701 = $700<<2; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $702 = (($699) + ($701)|0); //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP8[$702>>0] = $698; //@line 54 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $703 = $5; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $704 = (($4) + ($703<<2)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -12122,11 +12138,11 @@ function _chacha_permute($0,$1) {
   $706 = $705 >>> 8; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $707 = $706 & 255; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $708 = $707&255; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $709 = $5; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $710 = $709<<2; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $711 = (($710) + 1)|0; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $712 = $2; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $713 = (($712) + ($711)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $709 = $2; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $710 = $5; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $711 = $710<<2; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $712 = (($711) + 1)|0; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $713 = (($709) + ($712)|0); //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP8[$713>>0] = $708; //@line 55 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $714 = $5; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $715 = (($4) + ($714<<2)|0); //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -12134,11 +12150,11 @@ function _chacha_permute($0,$1) {
   $717 = $716 >>> 16; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $718 = $717 & 255; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $719 = $718&255; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $720 = $5; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $721 = $720<<2; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $722 = (($721) + 2)|0; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $723 = $2; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $724 = (($723) + ($722)|0); //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $720 = $2; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $721 = $5; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $722 = $721<<2; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $723 = (($722) + 2)|0; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $724 = (($720) + ($723)|0); //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP8[$724>>0] = $719; //@line 56 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $725 = $5; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $726 = (($4) + ($725<<2)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -12146,11 +12162,11 @@ function _chacha_permute($0,$1) {
   $728 = $727 >>> 24; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $729 = $728 & 255; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $730 = $729&255; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $731 = $5; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $732 = $731<<2; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $733 = (($732) + 3)|0; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $734 = $2; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
-  $735 = (($734) + ($733)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $731 = $2; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $732 = $5; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $733 = $732<<2; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $734 = (($733) + 3)|0; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
+  $735 = (($731) + ($734)|0); //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
   HEAP8[$735>>0] = $730; //@line 57 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $736 = $5; //@line 52 "c_src/crypto_sign/sphincs256/ref/permute.c"
   $737 = (($736) + 1)|0; //@line 52 "c_src/crypto_sign/sphincs256/ref/permute.c"
@@ -12183,7 +12199,7 @@ function _prg($0,$1,$2,$3) {
  $16 = $15; //@line 13 "c_src/crypto_sign/sphincs256/ref/prg.c"
  $17 = HEAP32[$16>>2]|0; //@line 13 "c_src/crypto_sign/sphincs256/ref/prg.c"
  $18 = $6; //@line 13 "c_src/crypto_sign/sphincs256/ref/prg.c"
- (_crypto_stream_chacha12_ref($11,$14,$17,2376,$18)|0); //@line 13 "c_src/crypto_sign/sphincs256/ref/prg.c"
+ (_crypto_stream_chacha12_ref($11,$14,$17,2640,$18)|0); //@line 13 "c_src/crypto_sign/sphincs256/ref/prg.c"
  STACKTOP = sp;return; //@line 14 "c_src/crypto_sign/sphincs256/ref/prg.c"
 }
 function _crypto_sign_sphincs_keypair($0,$1) {
@@ -12341,9 +12357,9 @@ function _treehash($0,$1,$2,$3,$4) {
   $84 = $12; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $85 = (($21) + ($84)|0); //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $86 = HEAP8[$85>>0]|0; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $87 = $12; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $88 = $5; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $89 = (($88) + ($87)|0); //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $87 = $5; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $88 = $12; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $89 = (($87) + ($88)|0); //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
   HEAP8[$89>>0] = $86; //@line 125 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $90 = $12; //@line 124 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $91 = (($90) + 1)|0; //@line 124 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -12400,9 +12416,9 @@ function _get_seed($0,$1,$2) {
   if (!($10)) {
    break;
   }
-  $11 = $8; //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $12 = $4; //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $13 = (($12) + ($11)|0); //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $11 = $4; //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $12 = $8; //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $13 = (($11) + ($12)|0); //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $14 = HEAP8[$13>>0]|0; //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $15 = $8; //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $16 = (($6) + ($15)|0); //@line 45 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -12648,14 +12664,14 @@ function _crypto_sign_sphincs($0,$1,$2,$3,$4) {
   if (!($38)) {
    break;
   }
-  $39 = $11; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $40 = $39; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $41 = HEAP32[$40>>2]|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $42 = (($39) + 4)|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $43 = $42; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $44 = HEAP32[$43>>2]|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $45 = $9; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $46 = (($45) + ($41)|0); //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $39 = $9; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $40 = $11; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $41 = $40; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $42 = HEAP32[$41>>2]|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $43 = (($40) + 4)|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $44 = $43; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $45 = HEAP32[$44>>2]|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $46 = (($39) + ($42)|0); //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $47 = HEAP8[$46>>0]|0; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $48 = $11; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $49 = $48; //@line 253 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -12706,29 +12722,29 @@ function _crypto_sign_sphincs($0,$1,$2,$3,$4) {
   if (!($85)) {
    break;
   }
-  $86 = $11; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $87 = $86; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $88 = HEAP32[$87>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $89 = (($86) + 4)|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $90 = $89; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $91 = HEAP32[$90>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $92 = (_i64Subtract(($88|0),($91|0),1,0)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $93 = tempRet0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $94 = $7; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $95 = (($94) + ($92)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $86 = $7; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $87 = $11; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $88 = $87; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $89 = HEAP32[$88>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $90 = (($87) + 4)|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $91 = $90; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $92 = HEAP32[$91>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $93 = (_i64Subtract(($89|0),($92|0),1,0)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $94 = tempRet0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $95 = (($86) + ($93)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $96 = HEAP8[$95>>0]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $97 = $11; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $98 = $97; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $99 = HEAP32[$98>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $100 = (($97) + 4)|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $101 = $100; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $102 = HEAP32[$101>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $103 = (_i64Add(32,0,($99|0),($102|0))|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $104 = tempRet0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $105 = (_i64Subtract(($103|0),($104|0),1,0)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $106 = tempRet0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $107 = $22; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $108 = (($107) + ($105)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $97 = $22; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $98 = $11; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $99 = $98; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $100 = HEAP32[$99>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $101 = (($98) + 4)|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $102 = $101; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $103 = HEAP32[$102>>2]|0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $104 = (_i64Add(32,0,($100|0),($103|0))|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $105 = tempRet0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $106 = (_i64Subtract(($104|0),($105|0),1,0)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $107 = tempRet0; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $108 = (($97) + ($106)|0); //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
   HEAP8[$108>>0] = $96; //@line 262 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $109 = $11; //@line 261 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $110 = $109; //@line 261 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -12863,14 +12879,14 @@ function _crypto_sign_sphincs($0,$1,$2,$3,$4) {
   $208 = HEAP32[$207>>2]|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $209 = (($13) + ($205)|0); //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $210 = HEAP8[$209>>0]|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $211 = $11; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $212 = $211; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $213 = HEAP32[$212>>2]|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $214 = (($211) + 4)|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $215 = $214; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $216 = HEAP32[$215>>2]|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $217 = $5; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $218 = (($217) + ($213)|0); //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $211 = $5; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $212 = $11; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $213 = $212; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $214 = HEAP32[$213>>2]|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $215 = (($212) + 4)|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $216 = $215; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $217 = HEAP32[$216>>2]|0; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $218 = (($211) + ($214)|0); //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
   HEAP8[$218>>0] = $210; //@line 312 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $219 = $11; //@line 311 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $220 = $219; //@line 311 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -12946,14 +12962,14 @@ function _crypto_sign_sphincs($0,$1,$2,$3,$4) {
   $277 = tempRet0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $278 = $276 & 255; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $279 = $278&255; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $280 = $11; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $281 = $280; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $282 = HEAP32[$281>>2]|0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $283 = (($280) + 4)|0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $284 = $283; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $285 = HEAP32[$284>>2]|0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $286 = $5; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $287 = (($286) + ($282)|0); //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $280 = $5; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $281 = $11; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $282 = $281; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $283 = HEAP32[$282>>2]|0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $284 = (($281) + 4)|0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $285 = $284; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $286 = HEAP32[$285>>2]|0; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $287 = (($280) + ($283)|0); //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
   HEAP8[$287>>0] = $279; //@line 319 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $288 = $11; //@line 318 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $289 = $288; //@line 318 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13412,14 +13428,14 @@ function _crypto_sign_sphincs_open($0,$1,$2,$3,$4) {
   if (!($43)) {
    break;
   }
-  $44 = $11; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $45 = $44; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $46 = HEAP32[$45>>2]|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $47 = (($44) + 4)|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $48 = $47; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $49 = HEAP32[$48>>2]|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $50 = $10; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $51 = (($50) + ($46)|0); //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $44 = $10; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $45 = $11; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $46 = $45; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $47 = HEAP32[$46>>2]|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $48 = (($45) + 4)|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $49 = $48; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $50 = HEAP32[$49>>2]|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $51 = (($44) + ($47)|0); //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $52 = HEAP8[$51>>0]|0; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $53 = $11; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $54 = $53; //@line 373 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13465,14 +13481,14 @@ function _crypto_sign_sphincs_open($0,$1,$2,$3,$4) {
   if (!($86)) {
    break;
   }
-  $87 = $11; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $88 = $87; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $89 = HEAP32[$88>>2]|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $90 = (($87) + 4)|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $91 = $90; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $92 = HEAP32[$91>>2]|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $93 = $8; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $94 = (($93) + ($89)|0); //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $87 = $8; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $88 = $11; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $89 = $88; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $90 = HEAP32[$89>>2]|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $91 = (($88) + 4)|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $92 = $91; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $93 = HEAP32[$92>>2]|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $94 = (($87) + ($90)|0); //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $95 = HEAP8[$94>>0]|0; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $96 = $11; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $97 = $96; //@line 380 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13551,14 +13567,14 @@ function _crypto_sign_sphincs_open($0,$1,$2,$3,$4) {
   if (!($152)) {
    break;
   }
-  $153 = $11; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $154 = $153; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $155 = HEAP32[$154>>2]|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $156 = (($153) + 4)|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $157 = $156; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $158 = HEAP32[$157>>2]|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $159 = $17; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
-  $160 = (($159) + ($155)|0); //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $153 = $17; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $154 = $11; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $155 = $154; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $156 = HEAP32[$155>>2]|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $157 = (($154) + 4)|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $158 = $157; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $159 = HEAP32[$158>>2]|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
+  $160 = (($153) + ($156)|0); //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $161 = HEAP8[$160>>0]|0; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $162 = $161&255; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
   $163 = $11; //@line 405 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13794,27 +13810,27 @@ function _crypto_sign_sphincs_open($0,$1,$2,$3,$4) {
    if (!($344)) {
     break;
    }
-   $345 = $11; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $346 = $345; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $347 = HEAP32[$346>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $348 = (($345) + 4)|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $349 = $348; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $350 = HEAP32[$349>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $351 = (_i64Add(($347|0),($350|0),32,0)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $352 = tempRet0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $353 = (_i64Add(($351|0),($352|0),1056,0)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $354 = tempRet0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $355 = $6; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $356 = (($355) + ($353)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $345 = $6; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $346 = $11; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $347 = $346; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $348 = HEAP32[$347>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $349 = (($346) + 4)|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $350 = $349; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $351 = HEAP32[$350>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $352 = (_i64Add(($348|0),($351|0),32,0)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $353 = tempRet0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $354 = (_i64Add(($352|0),($353|0),1056,0)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $355 = tempRet0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $356 = (($345) + ($354)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
    $357 = HEAP8[$356>>0]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $358 = $11; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $359 = $358; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $360 = HEAP32[$359>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $361 = (($358) + 4)|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $362 = $361; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $363 = HEAP32[$362>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $364 = $6; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $365 = (($364) + ($360)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $358 = $6; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $359 = $11; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $360 = $359; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $361 = HEAP32[$360>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $362 = (($359) + 4)|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $363 = $362; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $364 = HEAP32[$363>>2]|0; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $365 = (($358) + ($361)|0); //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
    HEAP8[$365>>0] = $357; //@line 438 "c_src/crypto_sign/sphincs256/ref/sign.c"
    $366 = $11; //@line 437 "c_src/crypto_sign/sphincs256/ref/sign.c"
    $367 = $366; //@line 437 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13872,14 +13888,14 @@ function _crypto_sign_sphincs_open($0,$1,$2,$3,$4) {
    if (!($405)) {
     break;
    }
-   $406 = $11; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $407 = $406; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $408 = HEAP32[$407>>2]|0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $409 = (($406) + 4)|0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $410 = $409; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $411 = HEAP32[$410>>2]|0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $412 = $6; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
-   $413 = (($412) + ($408)|0); //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $406 = $6; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $407 = $11; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $408 = $407; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $409 = HEAP32[$408>>2]|0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $410 = (($407) + 4)|0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $411 = $410; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $412 = HEAP32[$411>>2]|0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
+   $413 = (($406) + ($409)|0); //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
    HEAP8[$413>>0] = 0; //@line 446 "c_src/crypto_sign/sphincs256/ref/sign.c"
    $414 = $11; //@line 445 "c_src/crypto_sign/sphincs256/ref/sign.c"
    $415 = $414; //@line 445 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13934,7 +13950,7 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
  $15 = $8; //@line 134 "c_src/crypto_sign/sphincs256/ref/sign.c"
  $16 = $15 & 1; //@line 134 "c_src/crypto_sign/sphincs256/ref/sign.c"
  $17 = ($16|0)!=(0); //@line 134 "c_src/crypto_sign/sphincs256/ref/sign.c"
- $13 = 0; //@line 136 "c_src/crypto_sign/sphincs256/ref/sign.c"
+ $13 = 0;
  L1: do {
   if ($17) {
    while(1) {
@@ -13943,9 +13959,9 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
     if (!($19)) {
      break;
     }
-    $20 = $13; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $21 = $7; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $22 = (($21) + ($20)|0); //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $20 = $7; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $21 = $13; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $22 = (($20) + ($21)|0); //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $23 = HEAP8[$22>>0]|0; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $24 = $13; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $25 = (32 + ($24))|0; //@line 137 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13962,9 +13978,9 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
     if (!($30)) {
      break L1;
     }
-    $31 = $13; //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $32 = $9; //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $33 = (($32) + ($31)|0); //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $31 = $9; //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $32 = $13; //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $33 = (($31) + ($32)|0); //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $34 = HEAP8[$33>>0]|0; //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $35 = $13; //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $36 = (($14) + ($35)|0); //@line 139 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13980,9 +13996,9 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
     if (!($40)) {
      break;
     }
-    $41 = $13; //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $42 = $7; //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $43 = (($42) + ($41)|0); //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $41 = $7; //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $42 = $13; //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $43 = (($41) + ($42)|0); //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $44 = HEAP8[$43>>0]|0; //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $45 = $13; //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $46 = (($14) + ($45)|0); //@line 144 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -13998,9 +14014,9 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
     if (!($50)) {
      break L1;
     }
-    $51 = $13; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $52 = $9; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
-    $53 = (($52) + ($51)|0); //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $51 = $9; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $52 = $13; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
+    $53 = (($51) + ($52)|0); //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $54 = HEAP8[$53>>0]|0; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $55 = $13; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
     $56 = (32 + ($55))|0; //@line 146 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -14047,9 +14063,9 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
      if (!($79)) {
       break L20;
      }
-     $80 = $13; //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
-     $81 = $9; //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
-     $82 = (($81) + ($80)|0); //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
+     $80 = $9; //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
+     $81 = $13; //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
+     $82 = (($80) + ($81)|0); //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
      $83 = HEAP8[$82>>0]|0; //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
      $84 = $13; //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
      $85 = (($14) + ($84)|0); //@line 157 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -14073,9 +14089,9 @@ function _validate_authpath($0,$1,$2,$3,$4,$5) {
      if (!($95)) {
       break L20;
      }
-     $96 = $13; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
-     $97 = $9; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
-     $98 = (($97) + ($96)|0); //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
+     $96 = $9; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
+     $97 = $13; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
+     $98 = (($96) + ($97)|0); //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
      $99 = HEAP8[$98>>0]|0; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
      $100 = $13; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
      $101 = (($100) + 32)|0; //@line 163 "c_src/crypto_sign/sphincs256/ref/sign.c"
@@ -14175,13 +14191,13 @@ function _gen_chain($0,$1,$2,$3) {
   if (!($11)) {
    break;
   }
-  $12 = $9; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $13 = $5; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $14 = (($13) + ($12)|0); //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $12 = $5; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $13 = $9; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $14 = (($12) + ($13)|0); //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $15 = HEAP8[$14>>0]|0; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $16 = $9; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $17 = $4; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $18 = (($17) + ($16)|0); //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $16 = $4; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $17 = $9; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $18 = (($16) + ($17)|0); //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
   HEAP8[$18>>0] = $15; //@line 16 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $19 = $9; //@line 15 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $20 = (($19) + 1)|0; //@line 15 "c_src/crypto_sign/sphincs256/ref/wots.c"
@@ -14235,20 +14251,20 @@ function _wots_sign($0,$1,$2,$3) {
   if (!($12)) {
    break;
   }
-  $13 = $9; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $14 = (($13|0) / 2)&-1; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $15 = $5; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $16 = (($15) + ($14)|0); //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $13 = $5; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $14 = $9; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $15 = (($14|0) / 2)&-1; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $16 = (($13) + ($15)|0); //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $17 = HEAP8[$16>>0]|0; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $18 = $17&255; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $19 = $18 & 15; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $20 = $9; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $21 = (($8) + ($20<<2)|0); //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
   HEAP32[$21>>2] = $19; //@line 39 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $22 = $9; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $23 = (($22|0) / 2)&-1; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $24 = $5; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $25 = (($24) + ($23)|0); //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $22 = $5; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $23 = $9; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $24 = (($23|0) / 2)&-1; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $25 = (($22) + ($24)|0); //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $26 = HEAP8[$25>>0]|0; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $27 = $26&255; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $28 = $27 >> 4; //@line 40 "c_src/crypto_sign/sphincs256/ref/wots.c"
@@ -14346,20 +14362,20 @@ function _wots_verify($0,$1,$2,$3) {
   if (!($12)) {
    break;
   }
-  $13 = $9; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $14 = (($13|0) / 2)&-1; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $15 = $6; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $16 = (($15) + ($14)|0); //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $13 = $6; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $14 = $9; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $15 = (($14|0) / 2)&-1; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $16 = (($13) + ($15)|0); //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $17 = HEAP8[$16>>0]|0; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $18 = $17&255; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $19 = $18 & 15; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $20 = $9; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $21 = (($8) + ($20<<2)|0); //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
   HEAP32[$21>>2] = $19; //@line 90 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $22 = $9; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $23 = (($22|0) / 2)&-1; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $24 = $6; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
-  $25 = (($24) + ($23)|0); //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $22 = $6; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $23 = $9; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $24 = (($23|0) / 2)&-1; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
+  $25 = (($22) + ($24)|0); //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $26 = HEAP8[$25>>0]|0; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $27 = $26&255; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
   $28 = $27 >> 4; //@line 91 "c_src/crypto_sign/sphincs256/ref/wots.c"
@@ -14498,81 +14514,90 @@ function _sphincsjs_signature_bytes() {
  sp = STACKTOP;
  return 41000; //@line 13 "sphincs.c"
 }
-function ___errno_location() {
- var $$0 = 0, $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, label = 0, sp = 0;
+function _emscripten_get_global_libc() {
+ var label = 0, sp = 0;
  sp = STACKTOP;
- $0 = HEAP32[458]|0;
- $1 = ($0|0)==(0|0);
- if ($1) {
-  $$0 = 1876;
- } else {
-  $2 = (_pthread_self()|0);
-  $3 = ((($2)) + 64|0);
-  $4 = HEAP32[$3>>2]|0;
-  $$0 = $4;
- }
- return ($$0|0);
+ return (2080|0);
+}
+function ___errno_location() {
+ var $0 = 0, $1 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = (___pthread_self()|0);
+ $1 = ((($0)) + 64|0);
+ return ($1|0);
+}
+function ___pthread_self() {
+ var $0 = 0, label = 0, sp = 0;
+ sp = STACKTOP;
+ $0 = (_pthread_self()|0);
+ return ($0|0);
+}
+function _pthread_self() {
+ var label = 0, sp = 0;
+ sp = STACKTOP;
+ return (204|0);
 }
 function _malloc($0) {
  $0 = $0|0;
- var $$$0190$i = 0, $$$0191$i = 0, $$$4349$i = 0, $$$i = 0, $$0 = 0, $$0$i$i = 0, $$0$i$i$i = 0, $$0$i17$i = 0, $$0$i18$i = 0, $$01$i$i = 0, $$0187$i = 0, $$0189$i = 0, $$0190$i = 0, $$0191$i = 0, $$0197 = 0, $$0199 = 0, $$0206$i$i = 0, $$0207$i$i = 0, $$0211$i$i = 0, $$0212$i$i = 0;
- var $$024370$i = 0, $$0286$i$i = 0, $$0287$i$i = 0, $$0288$i$i = 0, $$0294$i$i = 0, $$0295$i$i = 0, $$0340$i = 0, $$0342$i = 0, $$0343$i = 0, $$0345$i = 0, $$0351$i = 0, $$0356$i = 0, $$0357$$i = 0, $$0357$i = 0, $$0359$i = 0, $$0360$i = 0, $$0366$i = 0, $$1194$i = 0, $$1196$i = 0, $$124469$i = 0;
- var $$1290$i$i = 0, $$1292$i$i = 0, $$1341$i = 0, $$1346$i = 0, $$1361$i = 0, $$1368$i = 0, $$1372$i = 0, $$2247$ph$i = 0, $$2253$ph$i = 0, $$2353$i = 0, $$3$i = 0, $$3$i$i = 0, $$3$i201 = 0, $$3348$i = 0, $$3370$i = 0, $$4$lcssa$i = 0, $$413$i = 0, $$4349$lcssa$i = 0, $$434912$i = 0, $$4355$$4$i = 0;
- var $$4355$ph$i = 0, $$435511$i = 0, $$5256$i = 0, $$723947$i = 0, $$748$i = 0, $$not$i = 0, $$pre = 0, $$pre$i = 0, $$pre$i$i = 0, $$pre$i19$i = 0, $$pre$i205 = 0, $$pre$i208 = 0, $$pre$phi$i$iZ2D = 0, $$pre$phi$i20$iZ2D = 0, $$pre$phi$i206Z2D = 0, $$pre$phi$iZ2D = 0, $$pre$phi10$i$iZ2D = 0, $$pre$phiZ2D = 0, $$pre9$i$i = 0, $1 = 0;
- var $10 = 0, $100 = 0, $1000 = 0, $1001 = 0, $1002 = 0, $1003 = 0, $1004 = 0, $1005 = 0, $1006 = 0, $1007 = 0, $1008 = 0, $1009 = 0, $101 = 0, $1010 = 0, $1011 = 0, $1012 = 0, $1013 = 0, $1014 = 0, $1015 = 0, $1016 = 0;
- var $1017 = 0, $1018 = 0, $1019 = 0, $102 = 0, $1020 = 0, $1021 = 0, $1022 = 0, $1023 = 0, $1024 = 0, $1025 = 0, $1026 = 0, $1027 = 0, $1028 = 0, $1029 = 0, $103 = 0, $1030 = 0, $1031 = 0, $1032 = 0, $1033 = 0, $1034 = 0;
- var $1035 = 0, $1036 = 0, $1037 = 0, $1038 = 0, $1039 = 0, $104 = 0, $1040 = 0, $1041 = 0, $1042 = 0, $1043 = 0, $1044 = 0, $1045 = 0, $1046 = 0, $1047 = 0, $1048 = 0, $1049 = 0, $105 = 0, $1050 = 0, $1051 = 0, $1052 = 0;
- var $1053 = 0, $1054 = 0, $1055 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0;
- var $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0;
- var $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0;
- var $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0;
- var $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0;
- var $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0;
- var $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0;
- var $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0;
- var $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0;
- var $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0;
- var $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0;
- var $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0;
- var $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0, $328 = 0, $329 = 0, $33 = 0, $330 = 0, $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0;
- var $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0, $346 = 0, $347 = 0, $348 = 0, $349 = 0, $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0;
- var $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0, $364 = 0, $365 = 0, $366 = 0, $367 = 0, $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0;
- var $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0, $382 = 0, $383 = 0, $384 = 0, $385 = 0, $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0;
- var $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0, $40 = 0, $400 = 0, $401 = 0, $402 = 0, $403 = 0, $404 = 0, $405 = 0, $406 = 0, $407 = 0, $408 = 0, $409 = 0;
- var $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0, $415 = 0, $416 = 0, $417 = 0, $418 = 0, $419 = 0, $42 = 0, $420 = 0, $421 = 0, $422 = 0, $423 = 0, $424 = 0, $425 = 0, $426 = 0, $427 = 0;
- var $428 = 0, $429 = 0, $43 = 0, $430 = 0, $431 = 0, $432 = 0, $433 = 0, $434 = 0, $435 = 0, $436 = 0, $437 = 0, $438 = 0, $439 = 0, $44 = 0, $440 = 0, $441 = 0, $442 = 0, $443 = 0, $444 = 0, $445 = 0;
- var $446 = 0, $447 = 0, $448 = 0, $449 = 0, $45 = 0, $450 = 0, $451 = 0, $452 = 0, $453 = 0, $454 = 0, $455 = 0, $456 = 0, $457 = 0, $458 = 0, $459 = 0, $46 = 0, $460 = 0, $461 = 0, $462 = 0, $463 = 0;
- var $464 = 0, $465 = 0, $466 = 0, $467 = 0, $468 = 0, $469 = 0, $47 = 0, $470 = 0, $471 = 0, $472 = 0, $473 = 0, $474 = 0, $475 = 0, $476 = 0, $477 = 0, $478 = 0, $479 = 0, $48 = 0, $480 = 0, $481 = 0;
- var $482 = 0, $483 = 0, $484 = 0, $485 = 0, $486 = 0, $487 = 0, $488 = 0, $489 = 0, $49 = 0, $490 = 0, $491 = 0, $492 = 0, $493 = 0, $494 = 0, $495 = 0, $496 = 0, $497 = 0, $498 = 0, $499 = 0, $5 = 0;
- var $50 = 0, $500 = 0, $501 = 0, $502 = 0, $503 = 0, $504 = 0, $505 = 0, $506 = 0, $507 = 0, $508 = 0, $509 = 0, $51 = 0, $510 = 0, $511 = 0, $512 = 0, $513 = 0, $514 = 0, $515 = 0, $516 = 0, $517 = 0;
- var $518 = 0, $519 = 0, $52 = 0, $520 = 0, $521 = 0, $522 = 0, $523 = 0, $524 = 0, $525 = 0, $526 = 0, $527 = 0, $528 = 0, $529 = 0, $53 = 0, $530 = 0, $531 = 0, $532 = 0, $533 = 0, $534 = 0, $535 = 0;
- var $536 = 0, $537 = 0, $538 = 0, $539 = 0, $54 = 0, $540 = 0, $541 = 0, $542 = 0, $543 = 0, $544 = 0, $545 = 0, $546 = 0, $547 = 0, $548 = 0, $549 = 0, $55 = 0, $550 = 0, $551 = 0, $552 = 0, $553 = 0;
- var $554 = 0, $555 = 0, $556 = 0, $557 = 0, $558 = 0, $559 = 0, $56 = 0, $560 = 0, $561 = 0, $562 = 0, $563 = 0, $564 = 0, $565 = 0, $566 = 0, $567 = 0, $568 = 0, $569 = 0, $57 = 0, $570 = 0, $571 = 0;
- var $572 = 0, $573 = 0, $574 = 0, $575 = 0, $576 = 0, $577 = 0, $578 = 0, $579 = 0, $58 = 0, $580 = 0, $581 = 0, $582 = 0, $583 = 0, $584 = 0, $585 = 0, $586 = 0, $587 = 0, $588 = 0, $589 = 0, $59 = 0;
- var $590 = 0, $591 = 0, $592 = 0, $593 = 0, $594 = 0, $595 = 0, $596 = 0, $597 = 0, $598 = 0, $599 = 0, $6 = 0, $60 = 0, $600 = 0, $601 = 0, $602 = 0, $603 = 0, $604 = 0, $605 = 0, $606 = 0, $607 = 0;
- var $608 = 0, $609 = 0, $61 = 0, $610 = 0, $611 = 0, $612 = 0, $613 = 0, $614 = 0, $615 = 0, $616 = 0, $617 = 0, $618 = 0, $619 = 0, $62 = 0, $620 = 0, $621 = 0, $622 = 0, $623 = 0, $624 = 0, $625 = 0;
- var $626 = 0, $627 = 0, $628 = 0, $629 = 0, $63 = 0, $630 = 0, $631 = 0, $632 = 0, $633 = 0, $634 = 0, $635 = 0, $636 = 0, $637 = 0, $638 = 0, $639 = 0, $64 = 0, $640 = 0, $641 = 0, $642 = 0, $643 = 0;
- var $644 = 0, $645 = 0, $646 = 0, $647 = 0, $648 = 0, $649 = 0, $65 = 0, $650 = 0, $651 = 0, $652 = 0, $653 = 0, $654 = 0, $655 = 0, $656 = 0, $657 = 0, $658 = 0, $659 = 0, $66 = 0, $660 = 0, $661 = 0;
- var $662 = 0, $663 = 0, $664 = 0, $665 = 0, $666 = 0, $667 = 0, $668 = 0, $669 = 0, $67 = 0, $670 = 0, $671 = 0, $672 = 0, $673 = 0, $674 = 0, $675 = 0, $676 = 0, $677 = 0, $678 = 0, $679 = 0, $68 = 0;
- var $680 = 0, $681 = 0, $682 = 0, $683 = 0, $684 = 0, $685 = 0, $686 = 0, $687 = 0, $688 = 0, $689 = 0, $69 = 0, $690 = 0, $691 = 0, $692 = 0, $693 = 0, $694 = 0, $695 = 0, $696 = 0, $697 = 0, $698 = 0;
- var $699 = 0, $7 = 0, $70 = 0, $700 = 0, $701 = 0, $702 = 0, $703 = 0, $704 = 0, $705 = 0, $706 = 0, $707 = 0, $708 = 0, $709 = 0, $71 = 0, $710 = 0, $711 = 0, $712 = 0, $713 = 0, $714 = 0, $715 = 0;
- var $716 = 0, $717 = 0, $718 = 0, $719 = 0, $72 = 0, $720 = 0, $721 = 0, $722 = 0, $723 = 0, $724 = 0, $725 = 0, $726 = 0, $727 = 0, $728 = 0, $729 = 0, $73 = 0, $730 = 0, $731 = 0, $732 = 0, $733 = 0;
- var $734 = 0, $735 = 0, $736 = 0, $737 = 0, $738 = 0, $739 = 0, $74 = 0, $740 = 0, $741 = 0, $742 = 0, $743 = 0, $744 = 0, $745 = 0, $746 = 0, $747 = 0, $748 = 0, $749 = 0, $75 = 0, $750 = 0, $751 = 0;
- var $752 = 0, $753 = 0, $754 = 0, $755 = 0, $756 = 0, $757 = 0, $758 = 0, $759 = 0, $76 = 0, $760 = 0, $761 = 0, $762 = 0, $763 = 0, $764 = 0, $765 = 0, $766 = 0, $767 = 0, $768 = 0, $769 = 0, $77 = 0;
- var $770 = 0, $771 = 0, $772 = 0, $773 = 0, $774 = 0, $775 = 0, $776 = 0, $777 = 0, $778 = 0, $779 = 0, $78 = 0, $780 = 0, $781 = 0, $782 = 0, $783 = 0, $784 = 0, $785 = 0, $786 = 0, $787 = 0, $788 = 0;
- var $789 = 0, $79 = 0, $790 = 0, $791 = 0, $792 = 0, $793 = 0, $794 = 0, $795 = 0, $796 = 0, $797 = 0, $798 = 0, $799 = 0, $8 = 0, $80 = 0, $800 = 0, $801 = 0, $802 = 0, $803 = 0, $804 = 0, $805 = 0;
- var $806 = 0, $807 = 0, $808 = 0, $809 = 0, $81 = 0, $810 = 0, $811 = 0, $812 = 0, $813 = 0, $814 = 0, $815 = 0, $816 = 0, $817 = 0, $818 = 0, $819 = 0, $82 = 0, $820 = 0, $821 = 0, $822 = 0, $823 = 0;
- var $824 = 0, $825 = 0, $826 = 0, $827 = 0, $828 = 0, $829 = 0, $83 = 0, $830 = 0, $831 = 0, $832 = 0, $833 = 0, $834 = 0, $835 = 0, $836 = 0, $837 = 0, $838 = 0, $839 = 0, $84 = 0, $840 = 0, $841 = 0;
- var $842 = 0, $843 = 0, $844 = 0, $845 = 0, $846 = 0, $847 = 0, $848 = 0, $849 = 0, $85 = 0, $850 = 0, $851 = 0, $852 = 0, $853 = 0, $854 = 0, $855 = 0, $856 = 0, $857 = 0, $858 = 0, $859 = 0, $86 = 0;
- var $860 = 0, $861 = 0, $862 = 0, $863 = 0, $864 = 0, $865 = 0, $866 = 0, $867 = 0, $868 = 0, $869 = 0, $87 = 0, $870 = 0, $871 = 0, $872 = 0, $873 = 0, $874 = 0, $875 = 0, $876 = 0, $877 = 0, $878 = 0;
- var $879 = 0, $88 = 0, $880 = 0, $881 = 0, $882 = 0, $883 = 0, $884 = 0, $885 = 0, $886 = 0, $887 = 0, $888 = 0, $889 = 0, $89 = 0, $890 = 0, $891 = 0, $892 = 0, $893 = 0, $894 = 0, $895 = 0, $896 = 0;
- var $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0, $901 = 0, $902 = 0, $903 = 0, $904 = 0, $905 = 0, $906 = 0, $907 = 0, $908 = 0, $909 = 0, $91 = 0, $910 = 0, $911 = 0, $912 = 0, $913 = 0;
- var $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0, $92 = 0, $920 = 0, $921 = 0, $922 = 0, $923 = 0, $924 = 0, $925 = 0, $926 = 0, $927 = 0, $928 = 0, $929 = 0, $93 = 0, $930 = 0, $931 = 0;
- var $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0, $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0;
- var $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0, $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0, $965 = 0, $966 = 0, $967 = 0, $968 = 0;
- var $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0, $974 = 0, $975 = 0, $976 = 0, $977 = 0, $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0, $983 = 0, $984 = 0, $985 = 0, $986 = 0;
- var $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, $994 = 0, $995 = 0, $996 = 0, $997 = 0, $998 = 0, $999 = 0, $cond$i = 0, $cond$i$i = 0, $cond$i204 = 0, $exitcond$i$i = 0, $not$$i$i = 0, $not$$i22$i = 0;
- var $not$7$i = 0, $or$cond$i = 0, $or$cond$i211 = 0, $or$cond1$i = 0, $or$cond1$i210 = 0, $or$cond10$i = 0, $or$cond11$i = 0, $or$cond12$i = 0, $or$cond2$i = 0, $or$cond5$i = 0, $or$cond50$i = 0, $or$cond7$i = 0, label = 0, sp = 0;
+ var $$$0192$i = 0, $$$0193$i = 0, $$$4236$i = 0, $$$4351$i = 0, $$$i = 0, $$0 = 0, $$0$i$i = 0, $$0$i$i$i = 0, $$0$i18$i = 0, $$01$i$i = 0, $$0189$i = 0, $$0192$lcssa$i = 0, $$01928$i = 0, $$0193$lcssa$i = 0, $$01937$i = 0, $$0197 = 0, $$0199 = 0, $$0206$i$i = 0, $$0207$i$i = 0, $$0211$i$i = 0;
+ var $$0212$i$i = 0, $$024371$i = 0, $$0287$i$i = 0, $$0288$i$i = 0, $$0289$i$i = 0, $$0295$i$i = 0, $$0296$i$i = 0, $$0342$i = 0, $$0344$i = 0, $$0345$i = 0, $$0347$i = 0, $$0353$i = 0, $$0358$i = 0, $$0359$$i = 0, $$0359$i = 0, $$0361$i = 0, $$0362$i = 0, $$0368$i = 0, $$1196$i = 0, $$1198$i = 0;
+ var $$124470$i = 0, $$1291$i$i = 0, $$1293$i$i = 0, $$1343$i = 0, $$1348$i = 0, $$1363$i = 0, $$1370$i = 0, $$1374$i = 0, $$2234253237$i = 0, $$2247$ph$i = 0, $$2253$ph$i = 0, $$2355$i = 0, $$3$i = 0, $$3$i$i = 0, $$3$i201 = 0, $$3350$i = 0, $$3372$i = 0, $$4$lcssa$i = 0, $$4$ph$i = 0, $$415$i = 0;
+ var $$4236$i = 0, $$4351$lcssa$i = 0, $$435114$i = 0, $$4357$$4$i = 0, $$4357$ph$i = 0, $$435713$i = 0, $$723948$i = 0, $$749$i = 0, $$pre = 0, $$pre$i = 0, $$pre$i$i = 0, $$pre$i19$i = 0, $$pre$i210 = 0, $$pre$i212 = 0, $$pre$phi$i$iZ2D = 0, $$pre$phi$i20$iZ2D = 0, $$pre$phi$i211Z2D = 0, $$pre$phi$iZ2D = 0, $$pre$phi11$i$iZ2D = 0, $$pre$phiZ2D = 0;
+ var $$pre10$i$i = 0, $$sink1$i = 0, $$sink1$i$i = 0, $$sink16$i = 0, $$sink2$i = 0, $$sink2$i204 = 0, $$sink3$i = 0, $1 = 0, $10 = 0, $100 = 0, $1000 = 0, $1001 = 0, $1002 = 0, $1003 = 0, $1004 = 0, $1005 = 0, $1006 = 0, $1007 = 0, $1008 = 0, $1009 = 0;
+ var $101 = 0, $1010 = 0, $1011 = 0, $1012 = 0, $1013 = 0, $1014 = 0, $1015 = 0, $1016 = 0, $1017 = 0, $1018 = 0, $1019 = 0, $102 = 0, $1020 = 0, $1021 = 0, $1022 = 0, $1023 = 0, $1024 = 0, $1025 = 0, $1026 = 0, $1027 = 0;
+ var $1028 = 0, $1029 = 0, $103 = 0, $1030 = 0, $1031 = 0, $1032 = 0, $1033 = 0, $1034 = 0, $1035 = 0, $1036 = 0, $1037 = 0, $1038 = 0, $1039 = 0, $104 = 0, $1040 = 0, $1041 = 0, $1042 = 0, $1043 = 0, $1044 = 0, $1045 = 0;
+ var $1046 = 0, $1047 = 0, $1048 = 0, $1049 = 0, $105 = 0, $1050 = 0, $1051 = 0, $1052 = 0, $1053 = 0, $1054 = 0, $1055 = 0, $1056 = 0, $1057 = 0, $1058 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0;
+ var $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0;
+ var $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0;
+ var $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0;
+ var $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0;
+ var $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0;
+ var $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0;
+ var $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0;
+ var $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0;
+ var $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0;
+ var $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0;
+ var $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0;
+ var $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $321 = 0, $322 = 0, $323 = 0, $324 = 0, $325 = 0, $326 = 0, $327 = 0;
+ var $328 = 0, $329 = 0, $33 = 0, $330 = 0, $331 = 0, $332 = 0, $333 = 0, $334 = 0, $335 = 0, $336 = 0, $337 = 0, $338 = 0, $339 = 0, $34 = 0, $340 = 0, $341 = 0, $342 = 0, $343 = 0, $344 = 0, $345 = 0;
+ var $346 = 0, $347 = 0, $348 = 0, $349 = 0, $35 = 0, $350 = 0, $351 = 0, $352 = 0, $353 = 0, $354 = 0, $355 = 0, $356 = 0, $357 = 0, $358 = 0, $359 = 0, $36 = 0, $360 = 0, $361 = 0, $362 = 0, $363 = 0;
+ var $364 = 0, $365 = 0, $366 = 0, $367 = 0, $368 = 0, $369 = 0, $37 = 0, $370 = 0, $371 = 0, $372 = 0, $373 = 0, $374 = 0, $375 = 0, $376 = 0, $377 = 0, $378 = 0, $379 = 0, $38 = 0, $380 = 0, $381 = 0;
+ var $382 = 0, $383 = 0, $384 = 0, $385 = 0, $386 = 0, $387 = 0, $388 = 0, $389 = 0, $39 = 0, $390 = 0, $391 = 0, $392 = 0, $393 = 0, $394 = 0, $395 = 0, $396 = 0, $397 = 0, $398 = 0, $399 = 0, $4 = 0;
+ var $40 = 0, $400 = 0, $401 = 0, $402 = 0, $403 = 0, $404 = 0, $405 = 0, $406 = 0, $407 = 0, $408 = 0, $409 = 0, $41 = 0, $410 = 0, $411 = 0, $412 = 0, $413 = 0, $414 = 0, $415 = 0, $416 = 0, $417 = 0;
+ var $418 = 0, $419 = 0, $42 = 0, $420 = 0, $421 = 0, $422 = 0, $423 = 0, $424 = 0, $425 = 0, $426 = 0, $427 = 0, $428 = 0, $429 = 0, $43 = 0, $430 = 0, $431 = 0, $432 = 0, $433 = 0, $434 = 0, $435 = 0;
+ var $436 = 0, $437 = 0, $438 = 0, $439 = 0, $44 = 0, $440 = 0, $441 = 0, $442 = 0, $443 = 0, $444 = 0, $445 = 0, $446 = 0, $447 = 0, $448 = 0, $449 = 0, $45 = 0, $450 = 0, $451 = 0, $452 = 0, $453 = 0;
+ var $454 = 0, $455 = 0, $456 = 0, $457 = 0, $458 = 0, $459 = 0, $46 = 0, $460 = 0, $461 = 0, $462 = 0, $463 = 0, $464 = 0, $465 = 0, $466 = 0, $467 = 0, $468 = 0, $469 = 0, $47 = 0, $470 = 0, $471 = 0;
+ var $472 = 0, $473 = 0, $474 = 0, $475 = 0, $476 = 0, $477 = 0, $478 = 0, $479 = 0, $48 = 0, $480 = 0, $481 = 0, $482 = 0, $483 = 0, $484 = 0, $485 = 0, $486 = 0, $487 = 0, $488 = 0, $489 = 0, $49 = 0;
+ var $490 = 0, $491 = 0, $492 = 0, $493 = 0, $494 = 0, $495 = 0, $496 = 0, $497 = 0, $498 = 0, $499 = 0, $5 = 0, $50 = 0, $500 = 0, $501 = 0, $502 = 0, $503 = 0, $504 = 0, $505 = 0, $506 = 0, $507 = 0;
+ var $508 = 0, $509 = 0, $51 = 0, $510 = 0, $511 = 0, $512 = 0, $513 = 0, $514 = 0, $515 = 0, $516 = 0, $517 = 0, $518 = 0, $519 = 0, $52 = 0, $520 = 0, $521 = 0, $522 = 0, $523 = 0, $524 = 0, $525 = 0;
+ var $526 = 0, $527 = 0, $528 = 0, $529 = 0, $53 = 0, $530 = 0, $531 = 0, $532 = 0, $533 = 0, $534 = 0, $535 = 0, $536 = 0, $537 = 0, $538 = 0, $539 = 0, $54 = 0, $540 = 0, $541 = 0, $542 = 0, $543 = 0;
+ var $544 = 0, $545 = 0, $546 = 0, $547 = 0, $548 = 0, $549 = 0, $55 = 0, $550 = 0, $551 = 0, $552 = 0, $553 = 0, $554 = 0, $555 = 0, $556 = 0, $557 = 0, $558 = 0, $559 = 0, $56 = 0, $560 = 0, $561 = 0;
+ var $562 = 0, $563 = 0, $564 = 0, $565 = 0, $566 = 0, $567 = 0, $568 = 0, $569 = 0, $57 = 0, $570 = 0, $571 = 0, $572 = 0, $573 = 0, $574 = 0, $575 = 0, $576 = 0, $577 = 0, $578 = 0, $579 = 0, $58 = 0;
+ var $580 = 0, $581 = 0, $582 = 0, $583 = 0, $584 = 0, $585 = 0, $586 = 0, $587 = 0, $588 = 0, $589 = 0, $59 = 0, $590 = 0, $591 = 0, $592 = 0, $593 = 0, $594 = 0, $595 = 0, $596 = 0, $597 = 0, $598 = 0;
+ var $599 = 0, $6 = 0, $60 = 0, $600 = 0, $601 = 0, $602 = 0, $603 = 0, $604 = 0, $605 = 0, $606 = 0, $607 = 0, $608 = 0, $609 = 0, $61 = 0, $610 = 0, $611 = 0, $612 = 0, $613 = 0, $614 = 0, $615 = 0;
+ var $616 = 0, $617 = 0, $618 = 0, $619 = 0, $62 = 0, $620 = 0, $621 = 0, $622 = 0, $623 = 0, $624 = 0, $625 = 0, $626 = 0, $627 = 0, $628 = 0, $629 = 0, $63 = 0, $630 = 0, $631 = 0, $632 = 0, $633 = 0;
+ var $634 = 0, $635 = 0, $636 = 0, $637 = 0, $638 = 0, $639 = 0, $64 = 0, $640 = 0, $641 = 0, $642 = 0, $643 = 0, $644 = 0, $645 = 0, $646 = 0, $647 = 0, $648 = 0, $649 = 0, $65 = 0, $650 = 0, $651 = 0;
+ var $652 = 0, $653 = 0, $654 = 0, $655 = 0, $656 = 0, $657 = 0, $658 = 0, $659 = 0, $66 = 0, $660 = 0, $661 = 0, $662 = 0, $663 = 0, $664 = 0, $665 = 0, $666 = 0, $667 = 0, $668 = 0, $669 = 0, $67 = 0;
+ var $670 = 0, $671 = 0, $672 = 0, $673 = 0, $674 = 0, $675 = 0, $676 = 0, $677 = 0, $678 = 0, $679 = 0, $68 = 0, $680 = 0, $681 = 0, $682 = 0, $683 = 0, $684 = 0, $685 = 0, $686 = 0, $687 = 0, $688 = 0;
+ var $689 = 0, $69 = 0, $690 = 0, $691 = 0, $692 = 0, $693 = 0, $694 = 0, $695 = 0, $696 = 0, $697 = 0, $698 = 0, $699 = 0, $7 = 0, $70 = 0, $700 = 0, $701 = 0, $702 = 0, $703 = 0, $704 = 0, $705 = 0;
+ var $706 = 0, $707 = 0, $708 = 0, $709 = 0, $71 = 0, $710 = 0, $711 = 0, $712 = 0, $713 = 0, $714 = 0, $715 = 0, $716 = 0, $717 = 0, $718 = 0, $719 = 0, $72 = 0, $720 = 0, $721 = 0, $722 = 0, $723 = 0;
+ var $724 = 0, $725 = 0, $726 = 0, $727 = 0, $728 = 0, $729 = 0, $73 = 0, $730 = 0, $731 = 0, $732 = 0, $733 = 0, $734 = 0, $735 = 0, $736 = 0, $737 = 0, $738 = 0, $739 = 0, $74 = 0, $740 = 0, $741 = 0;
+ var $742 = 0, $743 = 0, $744 = 0, $745 = 0, $746 = 0, $747 = 0, $748 = 0, $749 = 0, $75 = 0, $750 = 0, $751 = 0, $752 = 0, $753 = 0, $754 = 0, $755 = 0, $756 = 0, $757 = 0, $758 = 0, $759 = 0, $76 = 0;
+ var $760 = 0, $761 = 0, $762 = 0, $763 = 0, $764 = 0, $765 = 0, $766 = 0, $767 = 0, $768 = 0, $769 = 0, $77 = 0, $770 = 0, $771 = 0, $772 = 0, $773 = 0, $774 = 0, $775 = 0, $776 = 0, $777 = 0, $778 = 0;
+ var $779 = 0, $78 = 0, $780 = 0, $781 = 0, $782 = 0, $783 = 0, $784 = 0, $785 = 0, $786 = 0, $787 = 0, $788 = 0, $789 = 0, $79 = 0, $790 = 0, $791 = 0, $792 = 0, $793 = 0, $794 = 0, $795 = 0, $796 = 0;
+ var $797 = 0, $798 = 0, $799 = 0, $8 = 0, $80 = 0, $800 = 0, $801 = 0, $802 = 0, $803 = 0, $804 = 0, $805 = 0, $806 = 0, $807 = 0, $808 = 0, $809 = 0, $81 = 0, $810 = 0, $811 = 0, $812 = 0, $813 = 0;
+ var $814 = 0, $815 = 0, $816 = 0, $817 = 0, $818 = 0, $819 = 0, $82 = 0, $820 = 0, $821 = 0, $822 = 0, $823 = 0, $824 = 0, $825 = 0, $826 = 0, $827 = 0, $828 = 0, $829 = 0, $83 = 0, $830 = 0, $831 = 0;
+ var $832 = 0, $833 = 0, $834 = 0, $835 = 0, $836 = 0, $837 = 0, $838 = 0, $839 = 0, $84 = 0, $840 = 0, $841 = 0, $842 = 0, $843 = 0, $844 = 0, $845 = 0, $846 = 0, $847 = 0, $848 = 0, $849 = 0, $85 = 0;
+ var $850 = 0, $851 = 0, $852 = 0, $853 = 0, $854 = 0, $855 = 0, $856 = 0, $857 = 0, $858 = 0, $859 = 0, $86 = 0, $860 = 0, $861 = 0, $862 = 0, $863 = 0, $864 = 0, $865 = 0, $866 = 0, $867 = 0, $868 = 0;
+ var $869 = 0, $87 = 0, $870 = 0, $871 = 0, $872 = 0, $873 = 0, $874 = 0, $875 = 0, $876 = 0, $877 = 0, $878 = 0, $879 = 0, $88 = 0, $880 = 0, $881 = 0, $882 = 0, $883 = 0, $884 = 0, $885 = 0, $886 = 0;
+ var $887 = 0, $888 = 0, $889 = 0, $89 = 0, $890 = 0, $891 = 0, $892 = 0, $893 = 0, $894 = 0, $895 = 0, $896 = 0, $897 = 0, $898 = 0, $899 = 0, $9 = 0, $90 = 0, $900 = 0, $901 = 0, $902 = 0, $903 = 0;
+ var $904 = 0, $905 = 0, $906 = 0, $907 = 0, $908 = 0, $909 = 0, $91 = 0, $910 = 0, $911 = 0, $912 = 0, $913 = 0, $914 = 0, $915 = 0, $916 = 0, $917 = 0, $918 = 0, $919 = 0, $92 = 0, $920 = 0, $921 = 0;
+ var $922 = 0, $923 = 0, $924 = 0, $925 = 0, $926 = 0, $927 = 0, $928 = 0, $929 = 0, $93 = 0, $930 = 0, $931 = 0, $932 = 0, $933 = 0, $934 = 0, $935 = 0, $936 = 0, $937 = 0, $938 = 0, $939 = 0, $94 = 0;
+ var $940 = 0, $941 = 0, $942 = 0, $943 = 0, $944 = 0, $945 = 0, $946 = 0, $947 = 0, $948 = 0, $949 = 0, $95 = 0, $950 = 0, $951 = 0, $952 = 0, $953 = 0, $954 = 0, $955 = 0, $956 = 0, $957 = 0, $958 = 0;
+ var $959 = 0, $96 = 0, $960 = 0, $961 = 0, $962 = 0, $963 = 0, $964 = 0, $965 = 0, $966 = 0, $967 = 0, $968 = 0, $969 = 0, $97 = 0, $970 = 0, $971 = 0, $972 = 0, $973 = 0, $974 = 0, $975 = 0, $976 = 0;
+ var $977 = 0, $978 = 0, $979 = 0, $98 = 0, $980 = 0, $981 = 0, $982 = 0, $983 = 0, $984 = 0, $985 = 0, $986 = 0, $987 = 0, $988 = 0, $989 = 0, $99 = 0, $990 = 0, $991 = 0, $992 = 0, $993 = 0, $994 = 0;
+ var $995 = 0, $996 = 0, $997 = 0, $998 = 0, $999 = 0, $cond$i = 0, $cond$i$i = 0, $cond$i208 = 0, $exitcond$i$i = 0, $not$$i = 0, $not$$i$i = 0, $not$$i17$i = 0, $not$$i209 = 0, $not$$i216 = 0, $not$1$i = 0, $not$1$i203 = 0, $not$5$i = 0, $not$7$i$i = 0, $not$8$i = 0, $not$9$i = 0;
+ var $or$cond$i = 0, $or$cond$i214 = 0, $or$cond1$i = 0, $or$cond10$i = 0, $or$cond11$i = 0, $or$cond11$not$i = 0, $or$cond12$i = 0, $or$cond2$i = 0, $or$cond2$i215 = 0, $or$cond5$i = 0, $or$cond50$i = 0, $or$cond51$i = 0, $or$cond7$i = 0, label = 0, sp = 0;
  sp = STACKTOP;
  STACKTOP = STACKTOP + 16|0;
  $1 = sp;
@@ -14584,7 +14609,7 @@ function _malloc($0) {
    $5 = $4 & -8;
    $6 = $3 ? 16 : $5;
    $7 = $6 >>> 3;
-   $8 = HEAP32[470]|0;
+   $8 = HEAP32[536]|0;
    $9 = $8 >>> $7;
    $10 = $9 & 3;
    $11 = ($10|0)==(0);
@@ -14593,7 +14618,7 @@ function _malloc($0) {
     $13 = $12 ^ 1;
     $14 = (($13) + ($7))|0;
     $15 = $14 << 1;
-    $16 = (1920 + ($15<<2)|0);
+    $16 = (2184 + ($15<<2)|0);
     $17 = ((($16)) + 8|0);
     $18 = HEAP32[$17>>2]|0;
     $19 = ((($18)) + 8|0);
@@ -14604,9 +14629,9 @@ function _malloc($0) {
       $22 = 1 << $14;
       $23 = $22 ^ -1;
       $24 = $8 & $23;
-      HEAP32[470] = $24;
+      HEAP32[536] = $24;
      } else {
-      $25 = HEAP32[(1896)>>2]|0;
+      $25 = HEAP32[(2160)>>2]|0;
       $26 = ($20>>>0)<($25>>>0);
       if ($26) {
        _abort();
@@ -14637,7 +14662,7 @@ function _malloc($0) {
     $$0 = $19;
     STACKTOP = sp;return ($$0|0);
    }
-   $37 = HEAP32[(1888)>>2]|0;
+   $37 = HEAP32[(2152)>>2]|0;
    $38 = ($6>>>0)>($37>>>0);
    if ($38) {
     $39 = ($9|0)==(0);
@@ -14671,7 +14696,7 @@ function _malloc($0) {
      $66 = $62 >>> $64;
      $67 = (($65) + ($66))|0;
      $68 = $67 << 1;
-     $69 = (1920 + ($68<<2)|0);
+     $69 = (2184 + ($68<<2)|0);
      $70 = ((($69)) + 8|0);
      $71 = HEAP32[$70>>2]|0;
      $72 = ((($71)) + 8|0);
@@ -14682,10 +14707,10 @@ function _malloc($0) {
        $75 = 1 << $67;
        $76 = $75 ^ -1;
        $77 = $8 & $76;
-       HEAP32[470] = $77;
+       HEAP32[536] = $77;
        $98 = $77;
       } else {
-       $78 = HEAP32[(1896)>>2]|0;
+       $78 = HEAP32[(2160)>>2]|0;
        $79 = ($73>>>0)<($78>>>0);
        if ($79) {
         _abort();
@@ -14718,22 +14743,22 @@ function _malloc($0) {
      HEAP32[$90>>2] = $84;
      $91 = ($37|0)==(0);
      if (!($91)) {
-      $92 = HEAP32[(1900)>>2]|0;
+      $92 = HEAP32[(2164)>>2]|0;
       $93 = $37 >>> 3;
       $94 = $93 << 1;
-      $95 = (1920 + ($94<<2)|0);
+      $95 = (2184 + ($94<<2)|0);
       $96 = 1 << $93;
       $97 = $98 & $96;
       $99 = ($97|0)==(0);
       if ($99) {
        $100 = $98 | $96;
-       HEAP32[470] = $100;
+       HEAP32[536] = $100;
        $$pre = ((($95)) + 8|0);
        $$0199 = $95;$$pre$phiZ2D = $$pre;
       } else {
        $101 = ((($95)) + 8|0);
        $102 = HEAP32[$101>>2]|0;
-       $103 = HEAP32[(1896)>>2]|0;
+       $103 = HEAP32[(2160)>>2]|0;
        $104 = ($102>>>0)<($103>>>0);
        if ($104) {
         _abort();
@@ -14750,12 +14775,12 @@ function _malloc($0) {
       $107 = ((($92)) + 12|0);
       HEAP32[$107>>2] = $95;
      }
-     HEAP32[(1888)>>2] = $84;
-     HEAP32[(1900)>>2] = $87;
+     HEAP32[(2152)>>2] = $84;
+     HEAP32[(2164)>>2] = $87;
      $$0 = $72;
      STACKTOP = sp;return ($$0|0);
     }
-    $108 = HEAP32[(1884)>>2]|0;
+    $108 = HEAP32[(2148)>>2]|0;
     $109 = ($108|0)==(0);
     if ($109) {
      $$0197 = $6;
@@ -14783,121 +14808,129 @@ function _malloc($0) {
      $130 = $126 | $129;
      $131 = $127 >>> $129;
      $132 = (($130) + ($131))|0;
-     $133 = (2184 + ($132<<2)|0);
+     $133 = (2448 + ($132<<2)|0);
      $134 = HEAP32[$133>>2]|0;
      $135 = ((($134)) + 4|0);
      $136 = HEAP32[$135>>2]|0;
      $137 = $136 & -8;
      $138 = (($137) - ($6))|0;
-     $$0189$i = $134;$$0190$i = $134;$$0191$i = $138;
-     while(1) {
-      $139 = ((($$0189$i)) + 16|0);
-      $140 = HEAP32[$139>>2]|0;
-      $141 = ($140|0)==(0|0);
-      if ($141) {
-       $142 = ((($$0189$i)) + 20|0);
-       $143 = HEAP32[$142>>2]|0;
-       $144 = ($143|0)==(0|0);
-       if ($144) {
+     $139 = ((($134)) + 16|0);
+     $140 = HEAP32[$139>>2]|0;
+     $not$5$i = ($140|0)==(0|0);
+     $$sink16$i = $not$5$i&1;
+     $141 = (((($134)) + 16|0) + ($$sink16$i<<2)|0);
+     $142 = HEAP32[$141>>2]|0;
+     $143 = ($142|0)==(0|0);
+     if ($143) {
+      $$0192$lcssa$i = $134;$$0193$lcssa$i = $138;
+     } else {
+      $$01928$i = $134;$$01937$i = $138;$145 = $142;
+      while(1) {
+       $144 = ((($145)) + 4|0);
+       $146 = HEAP32[$144>>2]|0;
+       $147 = $146 & -8;
+       $148 = (($147) - ($6))|0;
+       $149 = ($148>>>0)<($$01937$i>>>0);
+       $$$0193$i = $149 ? $148 : $$01937$i;
+       $$$0192$i = $149 ? $145 : $$01928$i;
+       $150 = ((($145)) + 16|0);
+       $151 = HEAP32[$150>>2]|0;
+       $not$$i = ($151|0)==(0|0);
+       $$sink1$i = $not$$i&1;
+       $152 = (((($145)) + 16|0) + ($$sink1$i<<2)|0);
+       $153 = HEAP32[$152>>2]|0;
+       $154 = ($153|0)==(0|0);
+       if ($154) {
+        $$0192$lcssa$i = $$$0192$i;$$0193$lcssa$i = $$$0193$i;
         break;
        } else {
-        $146 = $143;
+        $$01928$i = $$$0192$i;$$01937$i = $$$0193$i;$145 = $153;
        }
-      } else {
-       $146 = $140;
       }
-      $145 = ((($146)) + 4|0);
-      $147 = HEAP32[$145>>2]|0;
-      $148 = $147 & -8;
-      $149 = (($148) - ($6))|0;
-      $150 = ($149>>>0)<($$0191$i>>>0);
-      $$$0191$i = $150 ? $149 : $$0191$i;
-      $$$0190$i = $150 ? $146 : $$0190$i;
-      $$0189$i = $146;$$0190$i = $$$0190$i;$$0191$i = $$$0191$i;
      }
-     $151 = HEAP32[(1896)>>2]|0;
-     $152 = ($$0190$i>>>0)<($151>>>0);
-     if ($152) {
+     $155 = HEAP32[(2160)>>2]|0;
+     $156 = ($$0192$lcssa$i>>>0)<($155>>>0);
+     if ($156) {
       _abort();
       // unreachable;
      }
-     $153 = (($$0190$i) + ($6)|0);
-     $154 = ($$0190$i>>>0)<($153>>>0);
-     if (!($154)) {
+     $157 = (($$0192$lcssa$i) + ($6)|0);
+     $158 = ($$0192$lcssa$i>>>0)<($157>>>0);
+     if (!($158)) {
       _abort();
       // unreachable;
      }
-     $155 = ((($$0190$i)) + 24|0);
-     $156 = HEAP32[$155>>2]|0;
-     $157 = ((($$0190$i)) + 12|0);
-     $158 = HEAP32[$157>>2]|0;
-     $159 = ($158|0)==($$0190$i|0);
+     $159 = ((($$0192$lcssa$i)) + 24|0);
+     $160 = HEAP32[$159>>2]|0;
+     $161 = ((($$0192$lcssa$i)) + 12|0);
+     $162 = HEAP32[$161>>2]|0;
+     $163 = ($162|0)==($$0192$lcssa$i|0);
      do {
-      if ($159) {
-       $169 = ((($$0190$i)) + 20|0);
-       $170 = HEAP32[$169>>2]|0;
-       $171 = ($170|0)==(0|0);
-       if ($171) {
-        $172 = ((($$0190$i)) + 16|0);
-        $173 = HEAP32[$172>>2]|0;
-        $174 = ($173|0)==(0|0);
-        if ($174) {
+      if ($163) {
+       $173 = ((($$0192$lcssa$i)) + 20|0);
+       $174 = HEAP32[$173>>2]|0;
+       $175 = ($174|0)==(0|0);
+       if ($175) {
+        $176 = ((($$0192$lcssa$i)) + 16|0);
+        $177 = HEAP32[$176>>2]|0;
+        $178 = ($177|0)==(0|0);
+        if ($178) {
          $$3$i = 0;
          break;
         } else {
-         $$1194$i = $173;$$1196$i = $172;
+         $$1196$i = $177;$$1198$i = $176;
         }
        } else {
-        $$1194$i = $170;$$1196$i = $169;
+        $$1196$i = $174;$$1198$i = $173;
        }
        while(1) {
-        $175 = ((($$1194$i)) + 20|0);
-        $176 = HEAP32[$175>>2]|0;
-        $177 = ($176|0)==(0|0);
-        if (!($177)) {
-         $$1194$i = $176;$$1196$i = $175;
+        $179 = ((($$1196$i)) + 20|0);
+        $180 = HEAP32[$179>>2]|0;
+        $181 = ($180|0)==(0|0);
+        if (!($181)) {
+         $$1196$i = $180;$$1198$i = $179;
          continue;
         }
-        $178 = ((($$1194$i)) + 16|0);
-        $179 = HEAP32[$178>>2]|0;
-        $180 = ($179|0)==(0|0);
-        if ($180) {
+        $182 = ((($$1196$i)) + 16|0);
+        $183 = HEAP32[$182>>2]|0;
+        $184 = ($183|0)==(0|0);
+        if ($184) {
          break;
         } else {
-         $$1194$i = $179;$$1196$i = $178;
+         $$1196$i = $183;$$1198$i = $182;
         }
        }
-       $181 = ($$1196$i>>>0)<($151>>>0);
-       if ($181) {
+       $185 = ($$1198$i>>>0)<($155>>>0);
+       if ($185) {
         _abort();
         // unreachable;
        } else {
-        HEAP32[$$1196$i>>2] = 0;
-        $$3$i = $$1194$i;
+        HEAP32[$$1198$i>>2] = 0;
+        $$3$i = $$1196$i;
         break;
        }
       } else {
-       $160 = ((($$0190$i)) + 8|0);
-       $161 = HEAP32[$160>>2]|0;
-       $162 = ($161>>>0)<($151>>>0);
-       if ($162) {
+       $164 = ((($$0192$lcssa$i)) + 8|0);
+       $165 = HEAP32[$164>>2]|0;
+       $166 = ($165>>>0)<($155>>>0);
+       if ($166) {
         _abort();
         // unreachable;
        }
-       $163 = ((($161)) + 12|0);
-       $164 = HEAP32[$163>>2]|0;
-       $165 = ($164|0)==($$0190$i|0);
-       if (!($165)) {
+       $167 = ((($165)) + 12|0);
+       $168 = HEAP32[$167>>2]|0;
+       $169 = ($168|0)==($$0192$lcssa$i|0);
+       if (!($169)) {
         _abort();
         // unreachable;
        }
-       $166 = ((($158)) + 8|0);
-       $167 = HEAP32[$166>>2]|0;
-       $168 = ($167|0)==($$0190$i|0);
-       if ($168) {
-        HEAP32[$163>>2] = $158;
-        HEAP32[$166>>2] = $161;
-        $$3$i = $158;
+       $170 = ((($162)) + 8|0);
+       $171 = HEAP32[$170>>2]|0;
+       $172 = ($171|0)==($$0192$lcssa$i|0);
+       if ($172) {
+        HEAP32[$167>>2] = $162;
+        HEAP32[$170>>2] = $165;
+        $$3$i = $162;
         break;
        } else {
         _abort();
@@ -14905,428 +14938,426 @@ function _malloc($0) {
        }
       }
      } while(0);
-     $182 = ($156|0)==(0|0);
-     do {
-      if (!($182)) {
-       $183 = ((($$0190$i)) + 28|0);
-       $184 = HEAP32[$183>>2]|0;
-       $185 = (2184 + ($184<<2)|0);
-       $186 = HEAP32[$185>>2]|0;
-       $187 = ($$0190$i|0)==($186|0);
-       if ($187) {
-        HEAP32[$185>>2] = $$3$i;
-        $cond$i = ($$3$i|0)==(0|0);
-        if ($cond$i) {
-         $188 = 1 << $184;
-         $189 = $188 ^ -1;
-         $190 = $108 & $189;
-         HEAP32[(1884)>>2] = $190;
-         break;
-        }
-       } else {
-        $191 = HEAP32[(1896)>>2]|0;
-        $192 = ($156>>>0)<($191>>>0);
-        if ($192) {
-         _abort();
-         // unreachable;
-        }
-        $193 = ((($156)) + 16|0);
-        $194 = HEAP32[$193>>2]|0;
-        $195 = ($194|0)==($$0190$i|0);
-        if ($195) {
-         HEAP32[$193>>2] = $$3$i;
-        } else {
-         $196 = ((($156)) + 20|0);
-         HEAP32[$196>>2] = $$3$i;
-        }
-        $197 = ($$3$i|0)==(0|0);
-        if ($197) {
-         break;
-        }
-       }
-       $198 = HEAP32[(1896)>>2]|0;
-       $199 = ($$3$i>>>0)<($198>>>0);
-       if ($199) {
-        _abort();
-        // unreachable;
-       }
-       $200 = ((($$3$i)) + 24|0);
-       HEAP32[$200>>2] = $156;
-       $201 = ((($$0190$i)) + 16|0);
-       $202 = HEAP32[$201>>2]|0;
-       $203 = ($202|0)==(0|0);
+     $186 = ($160|0)==(0|0);
+     L73: do {
+      if (!($186)) {
+       $187 = ((($$0192$lcssa$i)) + 28|0);
+       $188 = HEAP32[$187>>2]|0;
+       $189 = (2448 + ($188<<2)|0);
+       $190 = HEAP32[$189>>2]|0;
+       $191 = ($$0192$lcssa$i|0)==($190|0);
        do {
-        if (!($203)) {
-         $204 = ($202>>>0)<($198>>>0);
-         if ($204) {
+        if ($191) {
+         HEAP32[$189>>2] = $$3$i;
+         $cond$i = ($$3$i|0)==(0|0);
+         if ($cond$i) {
+          $192 = 1 << $188;
+          $193 = $192 ^ -1;
+          $194 = $108 & $193;
+          HEAP32[(2148)>>2] = $194;
+          break L73;
+         }
+        } else {
+         $195 = HEAP32[(2160)>>2]|0;
+         $196 = ($160>>>0)<($195>>>0);
+         if ($196) {
           _abort();
           // unreachable;
          } else {
-          $205 = ((($$3$i)) + 16|0);
-          HEAP32[$205>>2] = $202;
-          $206 = ((($202)) + 24|0);
-          HEAP32[$206>>2] = $$3$i;
+          $197 = ((($160)) + 16|0);
+          $198 = HEAP32[$197>>2]|0;
+          $not$1$i = ($198|0)!=($$0192$lcssa$i|0);
+          $$sink2$i = $not$1$i&1;
+          $199 = (((($160)) + 16|0) + ($$sink2$i<<2)|0);
+          HEAP32[$199>>2] = $$3$i;
+          $200 = ($$3$i|0)==(0|0);
+          if ($200) {
+           break L73;
+          } else {
+           break;
+          }
+         }
+        }
+       } while(0);
+       $201 = HEAP32[(2160)>>2]|0;
+       $202 = ($$3$i>>>0)<($201>>>0);
+       if ($202) {
+        _abort();
+        // unreachable;
+       }
+       $203 = ((($$3$i)) + 24|0);
+       HEAP32[$203>>2] = $160;
+       $204 = ((($$0192$lcssa$i)) + 16|0);
+       $205 = HEAP32[$204>>2]|0;
+       $206 = ($205|0)==(0|0);
+       do {
+        if (!($206)) {
+         $207 = ($205>>>0)<($201>>>0);
+         if ($207) {
+          _abort();
+          // unreachable;
+         } else {
+          $208 = ((($$3$i)) + 16|0);
+          HEAP32[$208>>2] = $205;
+          $209 = ((($205)) + 24|0);
+          HEAP32[$209>>2] = $$3$i;
           break;
          }
         }
        } while(0);
-       $207 = ((($$0190$i)) + 20|0);
-       $208 = HEAP32[$207>>2]|0;
-       $209 = ($208|0)==(0|0);
-       if (!($209)) {
-        $210 = HEAP32[(1896)>>2]|0;
-        $211 = ($208>>>0)<($210>>>0);
-        if ($211) {
+       $210 = ((($$0192$lcssa$i)) + 20|0);
+       $211 = HEAP32[$210>>2]|0;
+       $212 = ($211|0)==(0|0);
+       if (!($212)) {
+        $213 = HEAP32[(2160)>>2]|0;
+        $214 = ($211>>>0)<($213>>>0);
+        if ($214) {
          _abort();
          // unreachable;
         } else {
-         $212 = ((($$3$i)) + 20|0);
-         HEAP32[$212>>2] = $208;
-         $213 = ((($208)) + 24|0);
-         HEAP32[$213>>2] = $$3$i;
+         $215 = ((($$3$i)) + 20|0);
+         HEAP32[$215>>2] = $211;
+         $216 = ((($211)) + 24|0);
+         HEAP32[$216>>2] = $$3$i;
          break;
         }
        }
       }
      } while(0);
-     $214 = ($$0191$i>>>0)<(16);
-     if ($214) {
-      $215 = (($$0191$i) + ($6))|0;
-      $216 = $215 | 3;
-      $217 = ((($$0190$i)) + 4|0);
-      HEAP32[$217>>2] = $216;
-      $218 = (($$0190$i) + ($215)|0);
-      $219 = ((($218)) + 4|0);
-      $220 = HEAP32[$219>>2]|0;
-      $221 = $220 | 1;
-      HEAP32[$219>>2] = $221;
+     $217 = ($$0193$lcssa$i>>>0)<(16);
+     if ($217) {
+      $218 = (($$0193$lcssa$i) + ($6))|0;
+      $219 = $218 | 3;
+      $220 = ((($$0192$lcssa$i)) + 4|0);
+      HEAP32[$220>>2] = $219;
+      $221 = (($$0192$lcssa$i) + ($218)|0);
+      $222 = ((($221)) + 4|0);
+      $223 = HEAP32[$222>>2]|0;
+      $224 = $223 | 1;
+      HEAP32[$222>>2] = $224;
      } else {
-      $222 = $6 | 3;
-      $223 = ((($$0190$i)) + 4|0);
-      HEAP32[$223>>2] = $222;
-      $224 = $$0191$i | 1;
-      $225 = ((($153)) + 4|0);
-      HEAP32[$225>>2] = $224;
-      $226 = (($153) + ($$0191$i)|0);
-      HEAP32[$226>>2] = $$0191$i;
-      $227 = ($37|0)==(0);
-      if (!($227)) {
-       $228 = HEAP32[(1900)>>2]|0;
-       $229 = $37 >>> 3;
-       $230 = $229 << 1;
-       $231 = (1920 + ($230<<2)|0);
-       $232 = 1 << $229;
-       $233 = $8 & $232;
-       $234 = ($233|0)==(0);
-       if ($234) {
-        $235 = $8 | $232;
-        HEAP32[470] = $235;
-        $$pre$i = ((($231)) + 8|0);
-        $$0187$i = $231;$$pre$phi$iZ2D = $$pre$i;
+      $225 = $6 | 3;
+      $226 = ((($$0192$lcssa$i)) + 4|0);
+      HEAP32[$226>>2] = $225;
+      $227 = $$0193$lcssa$i | 1;
+      $228 = ((($157)) + 4|0);
+      HEAP32[$228>>2] = $227;
+      $229 = (($157) + ($$0193$lcssa$i)|0);
+      HEAP32[$229>>2] = $$0193$lcssa$i;
+      $230 = ($37|0)==(0);
+      if (!($230)) {
+       $231 = HEAP32[(2164)>>2]|0;
+       $232 = $37 >>> 3;
+       $233 = $232 << 1;
+       $234 = (2184 + ($233<<2)|0);
+       $235 = 1 << $232;
+       $236 = $8 & $235;
+       $237 = ($236|0)==(0);
+       if ($237) {
+        $238 = $8 | $235;
+        HEAP32[536] = $238;
+        $$pre$i = ((($234)) + 8|0);
+        $$0189$i = $234;$$pre$phi$iZ2D = $$pre$i;
        } else {
-        $236 = ((($231)) + 8|0);
-        $237 = HEAP32[$236>>2]|0;
-        $238 = HEAP32[(1896)>>2]|0;
-        $239 = ($237>>>0)<($238>>>0);
-        if ($239) {
+        $239 = ((($234)) + 8|0);
+        $240 = HEAP32[$239>>2]|0;
+        $241 = HEAP32[(2160)>>2]|0;
+        $242 = ($240>>>0)<($241>>>0);
+        if ($242) {
          _abort();
          // unreachable;
         } else {
-         $$0187$i = $237;$$pre$phi$iZ2D = $236;
+         $$0189$i = $240;$$pre$phi$iZ2D = $239;
         }
        }
-       HEAP32[$$pre$phi$iZ2D>>2] = $228;
-       $240 = ((($$0187$i)) + 12|0);
-       HEAP32[$240>>2] = $228;
-       $241 = ((($228)) + 8|0);
-       HEAP32[$241>>2] = $$0187$i;
-       $242 = ((($228)) + 12|0);
-       HEAP32[$242>>2] = $231;
+       HEAP32[$$pre$phi$iZ2D>>2] = $231;
+       $243 = ((($$0189$i)) + 12|0);
+       HEAP32[$243>>2] = $231;
+       $244 = ((($231)) + 8|0);
+       HEAP32[$244>>2] = $$0189$i;
+       $245 = ((($231)) + 12|0);
+       HEAP32[$245>>2] = $234;
       }
-      HEAP32[(1888)>>2] = $$0191$i;
-      HEAP32[(1900)>>2] = $153;
+      HEAP32[(2152)>>2] = $$0193$lcssa$i;
+      HEAP32[(2164)>>2] = $157;
      }
-     $243 = ((($$0190$i)) + 8|0);
-     $$0 = $243;
+     $246 = ((($$0192$lcssa$i)) + 8|0);
+     $$0 = $246;
      STACKTOP = sp;return ($$0|0);
     }
    } else {
     $$0197 = $6;
    }
   } else {
-   $244 = ($0>>>0)>(4294967231);
-   if ($244) {
+   $247 = ($0>>>0)>(4294967231);
+   if ($247) {
     $$0197 = -1;
    } else {
-    $245 = (($0) + 11)|0;
-    $246 = $245 & -8;
-    $247 = HEAP32[(1884)>>2]|0;
-    $248 = ($247|0)==(0);
-    if ($248) {
-     $$0197 = $246;
+    $248 = (($0) + 11)|0;
+    $249 = $248 & -8;
+    $250 = HEAP32[(2148)>>2]|0;
+    $251 = ($250|0)==(0);
+    if ($251) {
+     $$0197 = $249;
     } else {
-     $249 = (0 - ($246))|0;
-     $250 = $245 >>> 8;
-     $251 = ($250|0)==(0);
-     if ($251) {
-      $$0356$i = 0;
+     $252 = (0 - ($249))|0;
+     $253 = $248 >>> 8;
+     $254 = ($253|0)==(0);
+     if ($254) {
+      $$0358$i = 0;
      } else {
-      $252 = ($246>>>0)>(16777215);
-      if ($252) {
-       $$0356$i = 31;
+      $255 = ($249>>>0)>(16777215);
+      if ($255) {
+       $$0358$i = 31;
       } else {
-       $253 = (($250) + 1048320)|0;
-       $254 = $253 >>> 16;
-       $255 = $254 & 8;
-       $256 = $250 << $255;
-       $257 = (($256) + 520192)|0;
-       $258 = $257 >>> 16;
-       $259 = $258 & 4;
-       $260 = $259 | $255;
-       $261 = $256 << $259;
-       $262 = (($261) + 245760)|0;
-       $263 = $262 >>> 16;
-       $264 = $263 & 2;
-       $265 = $260 | $264;
-       $266 = (14 - ($265))|0;
-       $267 = $261 << $264;
-       $268 = $267 >>> 15;
-       $269 = (($266) + ($268))|0;
-       $270 = $269 << 1;
-       $271 = (($269) + 7)|0;
-       $272 = $246 >>> $271;
-       $273 = $272 & 1;
-       $274 = $273 | $270;
-       $$0356$i = $274;
+       $256 = (($253) + 1048320)|0;
+       $257 = $256 >>> 16;
+       $258 = $257 & 8;
+       $259 = $253 << $258;
+       $260 = (($259) + 520192)|0;
+       $261 = $260 >>> 16;
+       $262 = $261 & 4;
+       $263 = $262 | $258;
+       $264 = $259 << $262;
+       $265 = (($264) + 245760)|0;
+       $266 = $265 >>> 16;
+       $267 = $266 & 2;
+       $268 = $263 | $267;
+       $269 = (14 - ($268))|0;
+       $270 = $264 << $267;
+       $271 = $270 >>> 15;
+       $272 = (($269) + ($271))|0;
+       $273 = $272 << 1;
+       $274 = (($272) + 7)|0;
+       $275 = $249 >>> $274;
+       $276 = $275 & 1;
+       $277 = $276 | $273;
+       $$0358$i = $277;
       }
      }
-     $275 = (2184 + ($$0356$i<<2)|0);
-     $276 = HEAP32[$275>>2]|0;
-     $277 = ($276|0)==(0|0);
-     L123: do {
-      if ($277) {
-       $$2353$i = 0;$$3$i201 = 0;$$3348$i = $249;
-       label = 86;
+     $278 = (2448 + ($$0358$i<<2)|0);
+     $279 = HEAP32[$278>>2]|0;
+     $280 = ($279|0)==(0|0);
+     L117: do {
+      if ($280) {
+       $$2355$i = 0;$$3$i201 = 0;$$3350$i = $252;
+       label = 81;
       } else {
-       $278 = ($$0356$i|0)==(31);
-       $279 = $$0356$i >>> 1;
-       $280 = (25 - ($279))|0;
-       $281 = $278 ? 0 : $280;
-       $282 = $246 << $281;
-       $$0340$i = 0;$$0345$i = $249;$$0351$i = $276;$$0357$i = $282;$$0360$i = 0;
+       $281 = ($$0358$i|0)==(31);
+       $282 = $$0358$i >>> 1;
+       $283 = (25 - ($282))|0;
+       $284 = $281 ? 0 : $283;
+       $285 = $249 << $284;
+       $$0342$i = 0;$$0347$i = $252;$$0353$i = $279;$$0359$i = $285;$$0362$i = 0;
        while(1) {
-        $283 = ((($$0351$i)) + 4|0);
-        $284 = HEAP32[$283>>2]|0;
-        $285 = $284 & -8;
-        $286 = (($285) - ($246))|0;
-        $287 = ($286>>>0)<($$0345$i>>>0);
-        if ($287) {
-         $288 = ($286|0)==(0);
-         if ($288) {
-          $$413$i = $$0351$i;$$434912$i = 0;$$435511$i = $$0351$i;
-          label = 90;
-          break L123;
+        $286 = ((($$0353$i)) + 4|0);
+        $287 = HEAP32[$286>>2]|0;
+        $288 = $287 & -8;
+        $289 = (($288) - ($249))|0;
+        $290 = ($289>>>0)<($$0347$i>>>0);
+        if ($290) {
+         $291 = ($289|0)==(0);
+         if ($291) {
+          $$415$i = $$0353$i;$$435114$i = 0;$$435713$i = $$0353$i;
+          label = 85;
+          break L117;
          } else {
-          $$1341$i = $$0351$i;$$1346$i = $286;
+          $$1343$i = $$0353$i;$$1348$i = $289;
          }
         } else {
-         $$1341$i = $$0340$i;$$1346$i = $$0345$i;
+         $$1343$i = $$0342$i;$$1348$i = $$0347$i;
         }
-        $289 = ((($$0351$i)) + 20|0);
-        $290 = HEAP32[$289>>2]|0;
-        $291 = $$0357$i >>> 31;
-        $292 = (((($$0351$i)) + 16|0) + ($291<<2)|0);
+        $292 = ((($$0353$i)) + 20|0);
         $293 = HEAP32[$292>>2]|0;
-        $294 = ($290|0)==(0|0);
-        $295 = ($290|0)==($293|0);
-        $or$cond1$i = $294 | $295;
-        $$1361$i = $or$cond1$i ? $$0360$i : $290;
-        $296 = ($293|0)==(0|0);
-        $297 = $296&1;
-        $298 = $297 ^ 1;
-        $$0357$$i = $$0357$i << $298;
-        if ($296) {
-         $$2353$i = $$1361$i;$$3$i201 = $$1341$i;$$3348$i = $$1346$i;
-         label = 86;
+        $294 = $$0359$i >>> 31;
+        $295 = (((($$0353$i)) + 16|0) + ($294<<2)|0);
+        $296 = HEAP32[$295>>2]|0;
+        $297 = ($293|0)==(0|0);
+        $298 = ($293|0)==($296|0);
+        $or$cond2$i = $297 | $298;
+        $$1363$i = $or$cond2$i ? $$0362$i : $293;
+        $299 = ($296|0)==(0|0);
+        $not$8$i = $299 ^ 1;
+        $300 = $not$8$i&1;
+        $$0359$$i = $$0359$i << $300;
+        if ($299) {
+         $$2355$i = $$1363$i;$$3$i201 = $$1343$i;$$3350$i = $$1348$i;
+         label = 81;
          break;
         } else {
-         $$0340$i = $$1341$i;$$0345$i = $$1346$i;$$0351$i = $293;$$0357$i = $$0357$$i;$$0360$i = $$1361$i;
+         $$0342$i = $$1343$i;$$0347$i = $$1348$i;$$0353$i = $296;$$0359$i = $$0359$$i;$$0362$i = $$1363$i;
         }
        }
       }
      } while(0);
-     if ((label|0) == 86) {
-      $299 = ($$2353$i|0)==(0|0);
-      $300 = ($$3$i201|0)==(0|0);
-      $or$cond$i = $299 & $300;
+     if ((label|0) == 81) {
+      $301 = ($$2355$i|0)==(0|0);
+      $302 = ($$3$i201|0)==(0|0);
+      $or$cond$i = $301 & $302;
       if ($or$cond$i) {
-       $301 = 2 << $$0356$i;
-       $302 = (0 - ($301))|0;
-       $303 = $301 | $302;
-       $304 = $247 & $303;
-       $305 = ($304|0)==(0);
-       if ($305) {
-        $$0197 = $246;
+       $303 = 2 << $$0358$i;
+       $304 = (0 - ($303))|0;
+       $305 = $303 | $304;
+       $306 = $250 & $305;
+       $307 = ($306|0)==(0);
+       if ($307) {
+        $$0197 = $249;
         break;
        }
-       $306 = (0 - ($304))|0;
-       $307 = $304 & $306;
-       $308 = (($307) + -1)|0;
-       $309 = $308 >>> 12;
-       $310 = $309 & 16;
-       $311 = $308 >>> $310;
-       $312 = $311 >>> 5;
-       $313 = $312 & 8;
-       $314 = $313 | $310;
-       $315 = $311 >>> $313;
-       $316 = $315 >>> 2;
-       $317 = $316 & 4;
-       $318 = $314 | $317;
-       $319 = $315 >>> $317;
-       $320 = $319 >>> 1;
-       $321 = $320 & 2;
-       $322 = $318 | $321;
-       $323 = $319 >>> $321;
-       $324 = $323 >>> 1;
-       $325 = $324 & 1;
-       $326 = $322 | $325;
-       $327 = $323 >>> $325;
-       $328 = (($326) + ($327))|0;
-       $329 = (2184 + ($328<<2)|0);
-       $330 = HEAP32[$329>>2]|0;
-       $$4355$ph$i = $330;
+       $308 = (0 - ($306))|0;
+       $309 = $306 & $308;
+       $310 = (($309) + -1)|0;
+       $311 = $310 >>> 12;
+       $312 = $311 & 16;
+       $313 = $310 >>> $312;
+       $314 = $313 >>> 5;
+       $315 = $314 & 8;
+       $316 = $315 | $312;
+       $317 = $313 >>> $315;
+       $318 = $317 >>> 2;
+       $319 = $318 & 4;
+       $320 = $316 | $319;
+       $321 = $317 >>> $319;
+       $322 = $321 >>> 1;
+       $323 = $322 & 2;
+       $324 = $320 | $323;
+       $325 = $321 >>> $323;
+       $326 = $325 >>> 1;
+       $327 = $326 & 1;
+       $328 = $324 | $327;
+       $329 = $325 >>> $327;
+       $330 = (($328) + ($329))|0;
+       $331 = (2448 + ($330<<2)|0);
+       $332 = HEAP32[$331>>2]|0;
+       $$4$ph$i = 0;$$4357$ph$i = $332;
       } else {
-       $$4355$ph$i = $$2353$i;
+       $$4$ph$i = $$3$i201;$$4357$ph$i = $$2355$i;
       }
-      $331 = ($$4355$ph$i|0)==(0|0);
-      if ($331) {
-       $$4$lcssa$i = $$3$i201;$$4349$lcssa$i = $$3348$i;
+      $333 = ($$4357$ph$i|0)==(0|0);
+      if ($333) {
+       $$4$lcssa$i = $$4$ph$i;$$4351$lcssa$i = $$3350$i;
       } else {
-       $$413$i = $$3$i201;$$434912$i = $$3348$i;$$435511$i = $$4355$ph$i;
-       label = 90;
+       $$415$i = $$4$ph$i;$$435114$i = $$3350$i;$$435713$i = $$4357$ph$i;
+       label = 85;
       }
      }
-     if ((label|0) == 90) {
+     if ((label|0) == 85) {
       while(1) {
        label = 0;
-       $332 = ((($$435511$i)) + 4|0);
-       $333 = HEAP32[$332>>2]|0;
-       $334 = $333 & -8;
-       $335 = (($334) - ($246))|0;
-       $336 = ($335>>>0)<($$434912$i>>>0);
-       $$$4349$i = $336 ? $335 : $$434912$i;
-       $$4355$$4$i = $336 ? $$435511$i : $$413$i;
-       $337 = ((($$435511$i)) + 16|0);
-       $338 = HEAP32[$337>>2]|0;
-       $339 = ($338|0)==(0|0);
-       if (!($339)) {
-        $$413$i = $$4355$$4$i;$$434912$i = $$$4349$i;$$435511$i = $338;
-        label = 90;
-        continue;
-       }
-       $340 = ((($$435511$i)) + 20|0);
-       $341 = HEAP32[$340>>2]|0;
-       $342 = ($341|0)==(0|0);
-       if ($342) {
-        $$4$lcssa$i = $$4355$$4$i;$$4349$lcssa$i = $$$4349$i;
+       $334 = ((($$435713$i)) + 4|0);
+       $335 = HEAP32[$334>>2]|0;
+       $336 = $335 & -8;
+       $337 = (($336) - ($249))|0;
+       $338 = ($337>>>0)<($$435114$i>>>0);
+       $$$4351$i = $338 ? $337 : $$435114$i;
+       $$4357$$4$i = $338 ? $$435713$i : $$415$i;
+       $339 = ((($$435713$i)) + 16|0);
+       $340 = HEAP32[$339>>2]|0;
+       $not$1$i203 = ($340|0)==(0|0);
+       $$sink2$i204 = $not$1$i203&1;
+       $341 = (((($$435713$i)) + 16|0) + ($$sink2$i204<<2)|0);
+       $342 = HEAP32[$341>>2]|0;
+       $343 = ($342|0)==(0|0);
+       if ($343) {
+        $$4$lcssa$i = $$4357$$4$i;$$4351$lcssa$i = $$$4351$i;
         break;
        } else {
-        $$413$i = $$4355$$4$i;$$434912$i = $$$4349$i;$$435511$i = $341;
-        label = 90;
+        $$415$i = $$4357$$4$i;$$435114$i = $$$4351$i;$$435713$i = $342;
+        label = 85;
        }
       }
      }
-     $343 = ($$4$lcssa$i|0)==(0|0);
-     if ($343) {
-      $$0197 = $246;
+     $344 = ($$4$lcssa$i|0)==(0|0);
+     if ($344) {
+      $$0197 = $249;
      } else {
-      $344 = HEAP32[(1888)>>2]|0;
-      $345 = (($344) - ($246))|0;
-      $346 = ($$4349$lcssa$i>>>0)<($345>>>0);
-      if ($346) {
-       $347 = HEAP32[(1896)>>2]|0;
-       $348 = ($$4$lcssa$i>>>0)<($347>>>0);
-       if ($348) {
+      $345 = HEAP32[(2152)>>2]|0;
+      $346 = (($345) - ($249))|0;
+      $347 = ($$4351$lcssa$i>>>0)<($346>>>0);
+      if ($347) {
+       $348 = HEAP32[(2160)>>2]|0;
+       $349 = ($$4$lcssa$i>>>0)<($348>>>0);
+       if ($349) {
         _abort();
         // unreachable;
        }
-       $349 = (($$4$lcssa$i) + ($246)|0);
-       $350 = ($$4$lcssa$i>>>0)<($349>>>0);
-       if (!($350)) {
+       $350 = (($$4$lcssa$i) + ($249)|0);
+       $351 = ($$4$lcssa$i>>>0)<($350>>>0);
+       if (!($351)) {
         _abort();
         // unreachable;
        }
-       $351 = ((($$4$lcssa$i)) + 24|0);
-       $352 = HEAP32[$351>>2]|0;
-       $353 = ((($$4$lcssa$i)) + 12|0);
-       $354 = HEAP32[$353>>2]|0;
-       $355 = ($354|0)==($$4$lcssa$i|0);
+       $352 = ((($$4$lcssa$i)) + 24|0);
+       $353 = HEAP32[$352>>2]|0;
+       $354 = ((($$4$lcssa$i)) + 12|0);
+       $355 = HEAP32[$354>>2]|0;
+       $356 = ($355|0)==($$4$lcssa$i|0);
        do {
-        if ($355) {
-         $365 = ((($$4$lcssa$i)) + 20|0);
-         $366 = HEAP32[$365>>2]|0;
-         $367 = ($366|0)==(0|0);
-         if ($367) {
-          $368 = ((($$4$lcssa$i)) + 16|0);
-          $369 = HEAP32[$368>>2]|0;
-          $370 = ($369|0)==(0|0);
-          if ($370) {
-           $$3370$i = 0;
+        if ($356) {
+         $366 = ((($$4$lcssa$i)) + 20|0);
+         $367 = HEAP32[$366>>2]|0;
+         $368 = ($367|0)==(0|0);
+         if ($368) {
+          $369 = ((($$4$lcssa$i)) + 16|0);
+          $370 = HEAP32[$369>>2]|0;
+          $371 = ($370|0)==(0|0);
+          if ($371) {
+           $$3372$i = 0;
            break;
           } else {
-           $$1368$i = $369;$$1372$i = $368;
+           $$1370$i = $370;$$1374$i = $369;
           }
          } else {
-          $$1368$i = $366;$$1372$i = $365;
+          $$1370$i = $367;$$1374$i = $366;
          }
          while(1) {
-          $371 = ((($$1368$i)) + 20|0);
-          $372 = HEAP32[$371>>2]|0;
-          $373 = ($372|0)==(0|0);
-          if (!($373)) {
-           $$1368$i = $372;$$1372$i = $371;
+          $372 = ((($$1370$i)) + 20|0);
+          $373 = HEAP32[$372>>2]|0;
+          $374 = ($373|0)==(0|0);
+          if (!($374)) {
+           $$1370$i = $373;$$1374$i = $372;
            continue;
           }
-          $374 = ((($$1368$i)) + 16|0);
-          $375 = HEAP32[$374>>2]|0;
-          $376 = ($375|0)==(0|0);
-          if ($376) {
+          $375 = ((($$1370$i)) + 16|0);
+          $376 = HEAP32[$375>>2]|0;
+          $377 = ($376|0)==(0|0);
+          if ($377) {
            break;
           } else {
-           $$1368$i = $375;$$1372$i = $374;
+           $$1370$i = $376;$$1374$i = $375;
           }
          }
-         $377 = ($$1372$i>>>0)<($347>>>0);
-         if ($377) {
+         $378 = ($$1374$i>>>0)<($348>>>0);
+         if ($378) {
           _abort();
           // unreachable;
          } else {
-          HEAP32[$$1372$i>>2] = 0;
-          $$3370$i = $$1368$i;
+          HEAP32[$$1374$i>>2] = 0;
+          $$3372$i = $$1370$i;
           break;
          }
         } else {
-         $356 = ((($$4$lcssa$i)) + 8|0);
-         $357 = HEAP32[$356>>2]|0;
-         $358 = ($357>>>0)<($347>>>0);
-         if ($358) {
+         $357 = ((($$4$lcssa$i)) + 8|0);
+         $358 = HEAP32[$357>>2]|0;
+         $359 = ($358>>>0)<($348>>>0);
+         if ($359) {
           _abort();
           // unreachable;
          }
-         $359 = ((($357)) + 12|0);
-         $360 = HEAP32[$359>>2]|0;
-         $361 = ($360|0)==($$4$lcssa$i|0);
-         if (!($361)) {
+         $360 = ((($358)) + 12|0);
+         $361 = HEAP32[$360>>2]|0;
+         $362 = ($361|0)==($$4$lcssa$i|0);
+         if (!($362)) {
           _abort();
           // unreachable;
          }
-         $362 = ((($354)) + 8|0);
-         $363 = HEAP32[$362>>2]|0;
-         $364 = ($363|0)==($$4$lcssa$i|0);
-         if ($364) {
-          HEAP32[$359>>2] = $354;
-          HEAP32[$362>>2] = $357;
-          $$3370$i = $354;
+         $363 = ((($355)) + 8|0);
+         $364 = HEAP32[$363>>2]|0;
+         $365 = ($364|0)==($$4$lcssa$i|0);
+         if ($365) {
+          HEAP32[$360>>2] = $355;
+          HEAP32[$363>>2] = $358;
+          $$3372$i = $355;
           break;
          } else {
           _abort();
@@ -15334,57 +15365,59 @@ function _malloc($0) {
          }
         }
        } while(0);
-       $378 = ($352|0)==(0|0);
-       do {
-        if ($378) {
-         $470 = $247;
+       $379 = ($353|0)==(0|0);
+       L164: do {
+        if ($379) {
+         $470 = $250;
         } else {
-         $379 = ((($$4$lcssa$i)) + 28|0);
-         $380 = HEAP32[$379>>2]|0;
-         $381 = (2184 + ($380<<2)|0);
-         $382 = HEAP32[$381>>2]|0;
-         $383 = ($$4$lcssa$i|0)==($382|0);
-         if ($383) {
-          HEAP32[$381>>2] = $$3370$i;
-          $cond$i204 = ($$3370$i|0)==(0|0);
-          if ($cond$i204) {
-           $384 = 1 << $380;
-           $385 = $384 ^ -1;
-           $386 = $247 & $385;
-           HEAP32[(1884)>>2] = $386;
-           $470 = $386;
-           break;
-          }
-         } else {
-          $387 = HEAP32[(1896)>>2]|0;
-          $388 = ($352>>>0)<($387>>>0);
-          if ($388) {
-           _abort();
-           // unreachable;
-          }
-          $389 = ((($352)) + 16|0);
-          $390 = HEAP32[$389>>2]|0;
-          $391 = ($390|0)==($$4$lcssa$i|0);
-          if ($391) {
-           HEAP32[$389>>2] = $$3370$i;
+         $380 = ((($$4$lcssa$i)) + 28|0);
+         $381 = HEAP32[$380>>2]|0;
+         $382 = (2448 + ($381<<2)|0);
+         $383 = HEAP32[$382>>2]|0;
+         $384 = ($$4$lcssa$i|0)==($383|0);
+         do {
+          if ($384) {
+           HEAP32[$382>>2] = $$3372$i;
+           $cond$i208 = ($$3372$i|0)==(0|0);
+           if ($cond$i208) {
+            $385 = 1 << $381;
+            $386 = $385 ^ -1;
+            $387 = $250 & $386;
+            HEAP32[(2148)>>2] = $387;
+            $470 = $387;
+            break L164;
+           }
           } else {
-           $392 = ((($352)) + 20|0);
-           HEAP32[$392>>2] = $$3370$i;
+           $388 = HEAP32[(2160)>>2]|0;
+           $389 = ($353>>>0)<($388>>>0);
+           if ($389) {
+            _abort();
+            // unreachable;
+           } else {
+            $390 = ((($353)) + 16|0);
+            $391 = HEAP32[$390>>2]|0;
+            $not$$i209 = ($391|0)!=($$4$lcssa$i|0);
+            $$sink3$i = $not$$i209&1;
+            $392 = (((($353)) + 16|0) + ($$sink3$i<<2)|0);
+            HEAP32[$392>>2] = $$3372$i;
+            $393 = ($$3372$i|0)==(0|0);
+            if ($393) {
+             $470 = $250;
+             break L164;
+            } else {
+             break;
+            }
+           }
           }
-          $393 = ($$3370$i|0)==(0|0);
-          if ($393) {
-           $470 = $247;
-           break;
-          }
-         }
-         $394 = HEAP32[(1896)>>2]|0;
-         $395 = ($$3370$i>>>0)<($394>>>0);
+         } while(0);
+         $394 = HEAP32[(2160)>>2]|0;
+         $395 = ($$3372$i>>>0)<($394>>>0);
          if ($395) {
           _abort();
           // unreachable;
          }
-         $396 = ((($$3370$i)) + 24|0);
-         HEAP32[$396>>2] = $352;
+         $396 = ((($$3372$i)) + 24|0);
+         HEAP32[$396>>2] = $353;
          $397 = ((($$4$lcssa$i)) + 16|0);
          $398 = HEAP32[$397>>2]|0;
          $399 = ($398|0)==(0|0);
@@ -15395,10 +15428,10 @@ function _malloc($0) {
             _abort();
             // unreachable;
            } else {
-            $401 = ((($$3370$i)) + 16|0);
+            $401 = ((($$3372$i)) + 16|0);
             HEAP32[$401>>2] = $398;
             $402 = ((($398)) + 24|0);
-            HEAP32[$402>>2] = $$3370$i;
+            HEAP32[$402>>2] = $$3372$i;
             break;
            }
           }
@@ -15407,28 +15440,28 @@ function _malloc($0) {
          $404 = HEAP32[$403>>2]|0;
          $405 = ($404|0)==(0|0);
          if ($405) {
-          $470 = $247;
+          $470 = $250;
          } else {
-          $406 = HEAP32[(1896)>>2]|0;
+          $406 = HEAP32[(2160)>>2]|0;
           $407 = ($404>>>0)<($406>>>0);
           if ($407) {
            _abort();
            // unreachable;
           } else {
-           $408 = ((($$3370$i)) + 20|0);
+           $408 = ((($$3372$i)) + 20|0);
            HEAP32[$408>>2] = $404;
            $409 = ((($404)) + 24|0);
-           HEAP32[$409>>2] = $$3370$i;
-           $470 = $247;
+           HEAP32[$409>>2] = $$3372$i;
+           $470 = $250;
            break;
           }
          }
         }
        } while(0);
-       $410 = ($$4349$lcssa$i>>>0)<(16);
+       $410 = ($$4351$lcssa$i>>>0)<(16);
        do {
         if ($410) {
-         $411 = (($$4349$lcssa$i) + ($246))|0;
+         $411 = (($$4351$lcssa$i) + ($249))|0;
          $412 = $411 | 3;
          $413 = ((($$4$lcssa$i)) + 4|0);
          HEAP32[$413>>2] = $412;
@@ -15438,57 +15471,57 @@ function _malloc($0) {
          $417 = $416 | 1;
          HEAP32[$415>>2] = $417;
         } else {
-         $418 = $246 | 3;
+         $418 = $249 | 3;
          $419 = ((($$4$lcssa$i)) + 4|0);
          HEAP32[$419>>2] = $418;
-         $420 = $$4349$lcssa$i | 1;
-         $421 = ((($349)) + 4|0);
+         $420 = $$4351$lcssa$i | 1;
+         $421 = ((($350)) + 4|0);
          HEAP32[$421>>2] = $420;
-         $422 = (($349) + ($$4349$lcssa$i)|0);
-         HEAP32[$422>>2] = $$4349$lcssa$i;
-         $423 = $$4349$lcssa$i >>> 3;
-         $424 = ($$4349$lcssa$i>>>0)<(256);
+         $422 = (($350) + ($$4351$lcssa$i)|0);
+         HEAP32[$422>>2] = $$4351$lcssa$i;
+         $423 = $$4351$lcssa$i >>> 3;
+         $424 = ($$4351$lcssa$i>>>0)<(256);
          if ($424) {
           $425 = $423 << 1;
-          $426 = (1920 + ($425<<2)|0);
-          $427 = HEAP32[470]|0;
+          $426 = (2184 + ($425<<2)|0);
+          $427 = HEAP32[536]|0;
           $428 = 1 << $423;
           $429 = $427 & $428;
           $430 = ($429|0)==(0);
           if ($430) {
            $431 = $427 | $428;
-           HEAP32[470] = $431;
-           $$pre$i205 = ((($426)) + 8|0);
-           $$0366$i = $426;$$pre$phi$i206Z2D = $$pre$i205;
+           HEAP32[536] = $431;
+           $$pre$i210 = ((($426)) + 8|0);
+           $$0368$i = $426;$$pre$phi$i211Z2D = $$pre$i210;
           } else {
            $432 = ((($426)) + 8|0);
            $433 = HEAP32[$432>>2]|0;
-           $434 = HEAP32[(1896)>>2]|0;
+           $434 = HEAP32[(2160)>>2]|0;
            $435 = ($433>>>0)<($434>>>0);
            if ($435) {
             _abort();
             // unreachable;
            } else {
-            $$0366$i = $433;$$pre$phi$i206Z2D = $432;
+            $$0368$i = $433;$$pre$phi$i211Z2D = $432;
            }
           }
-          HEAP32[$$pre$phi$i206Z2D>>2] = $349;
-          $436 = ((($$0366$i)) + 12|0);
-          HEAP32[$436>>2] = $349;
-          $437 = ((($349)) + 8|0);
-          HEAP32[$437>>2] = $$0366$i;
-          $438 = ((($349)) + 12|0);
+          HEAP32[$$pre$phi$i211Z2D>>2] = $350;
+          $436 = ((($$0368$i)) + 12|0);
+          HEAP32[$436>>2] = $350;
+          $437 = ((($350)) + 8|0);
+          HEAP32[$437>>2] = $$0368$i;
+          $438 = ((($350)) + 12|0);
           HEAP32[$438>>2] = $426;
           break;
          }
-         $439 = $$4349$lcssa$i >>> 8;
+         $439 = $$4351$lcssa$i >>> 8;
          $440 = ($439|0)==(0);
          if ($440) {
-          $$0359$i = 0;
+          $$0361$i = 0;
          } else {
-          $441 = ($$4349$lcssa$i>>>0)>(16777215);
+          $441 = ($$4351$lcssa$i>>>0)>(16777215);
           if ($441) {
-           $$0359$i = 31;
+           $$0361$i = 31;
           } else {
            $442 = (($439) + 1048320)|0;
            $443 = $442 >>> 16;
@@ -15509,95 +15542,95 @@ function _malloc($0) {
            $458 = (($455) + ($457))|0;
            $459 = $458 << 1;
            $460 = (($458) + 7)|0;
-           $461 = $$4349$lcssa$i >>> $460;
+           $461 = $$4351$lcssa$i >>> $460;
            $462 = $461 & 1;
            $463 = $462 | $459;
-           $$0359$i = $463;
+           $$0361$i = $463;
           }
          }
-         $464 = (2184 + ($$0359$i<<2)|0);
-         $465 = ((($349)) + 28|0);
-         HEAP32[$465>>2] = $$0359$i;
-         $466 = ((($349)) + 16|0);
+         $464 = (2448 + ($$0361$i<<2)|0);
+         $465 = ((($350)) + 28|0);
+         HEAP32[$465>>2] = $$0361$i;
+         $466 = ((($350)) + 16|0);
          $467 = ((($466)) + 4|0);
          HEAP32[$467>>2] = 0;
          HEAP32[$466>>2] = 0;
-         $468 = 1 << $$0359$i;
+         $468 = 1 << $$0361$i;
          $469 = $470 & $468;
          $471 = ($469|0)==(0);
          if ($471) {
           $472 = $470 | $468;
-          HEAP32[(1884)>>2] = $472;
-          HEAP32[$464>>2] = $349;
-          $473 = ((($349)) + 24|0);
+          HEAP32[(2148)>>2] = $472;
+          HEAP32[$464>>2] = $350;
+          $473 = ((($350)) + 24|0);
           HEAP32[$473>>2] = $464;
-          $474 = ((($349)) + 12|0);
-          HEAP32[$474>>2] = $349;
-          $475 = ((($349)) + 8|0);
-          HEAP32[$475>>2] = $349;
+          $474 = ((($350)) + 12|0);
+          HEAP32[$474>>2] = $350;
+          $475 = ((($350)) + 8|0);
+          HEAP32[$475>>2] = $350;
           break;
          }
          $476 = HEAP32[$464>>2]|0;
-         $477 = ($$0359$i|0)==(31);
-         $478 = $$0359$i >>> 1;
+         $477 = ($$0361$i|0)==(31);
+         $478 = $$0361$i >>> 1;
          $479 = (25 - ($478))|0;
          $480 = $477 ? 0 : $479;
-         $481 = $$4349$lcssa$i << $480;
-         $$0342$i = $481;$$0343$i = $476;
+         $481 = $$4351$lcssa$i << $480;
+         $$0344$i = $481;$$0345$i = $476;
          while(1) {
-          $482 = ((($$0343$i)) + 4|0);
+          $482 = ((($$0345$i)) + 4|0);
           $483 = HEAP32[$482>>2]|0;
           $484 = $483 & -8;
-          $485 = ($484|0)==($$4349$lcssa$i|0);
+          $485 = ($484|0)==($$4351$lcssa$i|0);
           if ($485) {
-           label = 148;
+           label = 139;
            break;
           }
-          $486 = $$0342$i >>> 31;
-          $487 = (((($$0343$i)) + 16|0) + ($486<<2)|0);
-          $488 = $$0342$i << 1;
+          $486 = $$0344$i >>> 31;
+          $487 = (((($$0345$i)) + 16|0) + ($486<<2)|0);
+          $488 = $$0344$i << 1;
           $489 = HEAP32[$487>>2]|0;
           $490 = ($489|0)==(0|0);
           if ($490) {
-           label = 145;
+           label = 136;
            break;
           } else {
-           $$0342$i = $488;$$0343$i = $489;
+           $$0344$i = $488;$$0345$i = $489;
           }
          }
-         if ((label|0) == 145) {
-          $491 = HEAP32[(1896)>>2]|0;
+         if ((label|0) == 136) {
+          $491 = HEAP32[(2160)>>2]|0;
           $492 = ($487>>>0)<($491>>>0);
           if ($492) {
            _abort();
            // unreachable;
           } else {
-           HEAP32[$487>>2] = $349;
-           $493 = ((($349)) + 24|0);
-           HEAP32[$493>>2] = $$0343$i;
-           $494 = ((($349)) + 12|0);
-           HEAP32[$494>>2] = $349;
-           $495 = ((($349)) + 8|0);
-           HEAP32[$495>>2] = $349;
+           HEAP32[$487>>2] = $350;
+           $493 = ((($350)) + 24|0);
+           HEAP32[$493>>2] = $$0345$i;
+           $494 = ((($350)) + 12|0);
+           HEAP32[$494>>2] = $350;
+           $495 = ((($350)) + 8|0);
+           HEAP32[$495>>2] = $350;
            break;
           }
          }
-         else if ((label|0) == 148) {
-          $496 = ((($$0343$i)) + 8|0);
+         else if ((label|0) == 139) {
+          $496 = ((($$0345$i)) + 8|0);
           $497 = HEAP32[$496>>2]|0;
-          $498 = HEAP32[(1896)>>2]|0;
+          $498 = HEAP32[(2160)>>2]|0;
           $499 = ($497>>>0)>=($498>>>0);
-          $not$7$i = ($$0343$i>>>0)>=($498>>>0);
-          $500 = $499 & $not$7$i;
+          $not$9$i = ($$0345$i>>>0)>=($498>>>0);
+          $500 = $499 & $not$9$i;
           if ($500) {
            $501 = ((($497)) + 12|0);
-           HEAP32[$501>>2] = $349;
-           HEAP32[$496>>2] = $349;
-           $502 = ((($349)) + 8|0);
+           HEAP32[$501>>2] = $350;
+           HEAP32[$496>>2] = $350;
+           $502 = ((($350)) + 8|0);
            HEAP32[$502>>2] = $497;
-           $503 = ((($349)) + 12|0);
-           HEAP32[$503>>2] = $$0343$i;
-           $504 = ((($349)) + 24|0);
+           $503 = ((($350)) + 12|0);
+           HEAP32[$503>>2] = $$0345$i;
+           $504 = ((($350)) + 24|0);
            HEAP32[$504>>2] = 0;
            break;
           } else {
@@ -15611,23 +15644,23 @@ function _malloc($0) {
        $$0 = $505;
        STACKTOP = sp;return ($$0|0);
       } else {
-       $$0197 = $246;
+       $$0197 = $249;
       }
      }
     }
    }
   }
  } while(0);
- $506 = HEAP32[(1888)>>2]|0;
+ $506 = HEAP32[(2152)>>2]|0;
  $507 = ($506>>>0)<($$0197>>>0);
  if (!($507)) {
   $508 = (($506) - ($$0197))|0;
-  $509 = HEAP32[(1900)>>2]|0;
+  $509 = HEAP32[(2164)>>2]|0;
   $510 = ($508>>>0)>(15);
   if ($510) {
    $511 = (($509) + ($$0197)|0);
-   HEAP32[(1900)>>2] = $511;
-   HEAP32[(1888)>>2] = $508;
+   HEAP32[(2164)>>2] = $511;
+   HEAP32[(2152)>>2] = $508;
    $512 = $508 | 1;
    $513 = ((($511)) + 4|0);
    HEAP32[$513>>2] = $512;
@@ -15637,8 +15670,8 @@ function _malloc($0) {
    $516 = ((($509)) + 4|0);
    HEAP32[$516>>2] = $515;
   } else {
-   HEAP32[(1888)>>2] = 0;
-   HEAP32[(1900)>>2] = 0;
+   HEAP32[(2152)>>2] = 0;
+   HEAP32[(2164)>>2] = 0;
    $517 = $506 | 3;
    $518 = ((($509)) + 4|0);
    HEAP32[$518>>2] = $517;
@@ -15652,14 +15685,14 @@ function _malloc($0) {
   $$0 = $523;
   STACKTOP = sp;return ($$0|0);
  }
- $524 = HEAP32[(1892)>>2]|0;
+ $524 = HEAP32[(2156)>>2]|0;
  $525 = ($524>>>0)>($$0197>>>0);
  if ($525) {
   $526 = (($524) - ($$0197))|0;
-  HEAP32[(1892)>>2] = $526;
-  $527 = HEAP32[(1904)>>2]|0;
+  HEAP32[(2156)>>2] = $526;
+  $527 = HEAP32[(2168)>>2]|0;
   $528 = (($527) + ($$0197)|0);
-  HEAP32[(1904)>>2] = $528;
+  HEAP32[(2168)>>2] = $528;
   $529 = $526 | 1;
   $530 = ((($528)) + 4|0);
   HEAP32[$530>>2] = $529;
@@ -15670,24 +15703,24 @@ function _malloc($0) {
   $$0 = $533;
   STACKTOP = sp;return ($$0|0);
  }
- $534 = HEAP32[588]|0;
+ $534 = HEAP32[654]|0;
  $535 = ($534|0)==(0);
  if ($535) {
-  HEAP32[(2360)>>2] = 4096;
-  HEAP32[(2356)>>2] = 4096;
-  HEAP32[(2364)>>2] = -1;
-  HEAP32[(2368)>>2] = -1;
-  HEAP32[(2372)>>2] = 0;
-  HEAP32[(2324)>>2] = 0;
+  HEAP32[(2624)>>2] = 4096;
+  HEAP32[(2620)>>2] = 4096;
+  HEAP32[(2628)>>2] = -1;
+  HEAP32[(2632)>>2] = -1;
+  HEAP32[(2636)>>2] = 0;
+  HEAP32[(2588)>>2] = 0;
   $536 = $1;
   $537 = $536 & -16;
   $538 = $537 ^ 1431655768;
   HEAP32[$1>>2] = $538;
-  HEAP32[588] = $538;
+  HEAP32[654] = $538;
   $542 = 4096;
  } else {
-  $$pre$i208 = HEAP32[(2360)>>2]|0;
-  $542 = $$pre$i208;
+  $$pre$i212 = HEAP32[(2624)>>2]|0;
+  $542 = $$pre$i212;
  }
  $539 = (($$0197) + 48)|0;
  $540 = (($$0197) + 47)|0;
@@ -15699,36 +15732,36 @@ function _malloc($0) {
   $$0 = 0;
   STACKTOP = sp;return ($$0|0);
  }
- $546 = HEAP32[(2320)>>2]|0;
+ $546 = HEAP32[(2584)>>2]|0;
  $547 = ($546|0)==(0);
  if (!($547)) {
-  $548 = HEAP32[(2312)>>2]|0;
+  $548 = HEAP32[(2576)>>2]|0;
   $549 = (($548) + ($544))|0;
   $550 = ($549>>>0)<=($548>>>0);
   $551 = ($549>>>0)>($546>>>0);
-  $or$cond1$i210 = $550 | $551;
-  if ($or$cond1$i210) {
+  $or$cond1$i = $550 | $551;
+  if ($or$cond1$i) {
    $$0 = 0;
    STACKTOP = sp;return ($$0|0);
   }
  }
- $552 = HEAP32[(2324)>>2]|0;
+ $552 = HEAP32[(2588)>>2]|0;
  $553 = $552 & 4;
  $554 = ($553|0)==(0);
- L255: do {
+ L244: do {
   if ($554) {
-   $555 = HEAP32[(1904)>>2]|0;
+   $555 = HEAP32[(2168)>>2]|0;
    $556 = ($555|0)==(0|0);
-   L257: do {
+   L246: do {
     if ($556) {
-     label = 172;
+     label = 163;
     } else {
-     $$0$i17$i = (2328);
+     $$0$i$i = (2592);
      while(1) {
-      $557 = HEAP32[$$0$i17$i>>2]|0;
+      $557 = HEAP32[$$0$i$i>>2]|0;
       $558 = ($557>>>0)>($555>>>0);
       if (!($558)) {
-       $559 = ((($$0$i17$i)) + 4|0);
+       $559 = ((($$0$i$i)) + 4|0);
        $560 = HEAP32[$559>>2]|0;
        $561 = (($557) + ($560)|0);
        $562 = ($561>>>0)>($555>>>0);
@@ -15736,14 +15769,14 @@ function _malloc($0) {
         break;
        }
       }
-      $563 = ((($$0$i17$i)) + 8|0);
+      $563 = ((($$0$i$i)) + 8|0);
       $564 = HEAP32[$563>>2]|0;
       $565 = ($564|0)==(0|0);
       if ($565) {
-       label = 172;
-       break L257;
+       label = 163;
+       break L246;
       } else {
-       $$0$i17$i = $564;
+       $$0$i$i = $564;
       }
      }
      $588 = (($541) - ($524))|0;
@@ -15751,31 +15784,37 @@ function _malloc($0) {
      $590 = ($589>>>0)<(2147483647);
      if ($590) {
       $591 = (_sbrk(($589|0))|0);
-      $592 = HEAP32[$$0$i17$i>>2]|0;
+      $592 = HEAP32[$$0$i$i>>2]|0;
       $593 = HEAP32[$559>>2]|0;
       $594 = (($592) + ($593)|0);
       $595 = ($591|0)==($594|0);
       if ($595) {
        $596 = ($591|0)==((-1)|0);
-       if (!($596)) {
-        $$723947$i = $589;$$748$i = $591;
-        label = 190;
-        break L255;
+       if ($596) {
+        $$2234253237$i = $589;
+       } else {
+        $$723948$i = $589;$$749$i = $591;
+        label = 180;
+        break L244;
        }
       } else {
        $$2247$ph$i = $591;$$2253$ph$i = $589;
-       label = 180;
+       label = 171;
       }
+     } else {
+      $$2234253237$i = 0;
      }
     }
    } while(0);
    do {
-    if ((label|0) == 172) {
+    if ((label|0) == 163) {
      $566 = (_sbrk(0)|0);
      $567 = ($566|0)==((-1)|0);
-     if (!($567)) {
+     if ($567) {
+      $$2234253237$i = 0;
+     } else {
       $568 = $566;
-      $569 = HEAP32[(2356)>>2]|0;
+      $569 = HEAP32[(2620)>>2]|0;
       $570 = (($569) + -1)|0;
       $571 = $570 & $568;
       $572 = ($571|0)==(0);
@@ -15785,87 +15824,94 @@ function _malloc($0) {
       $576 = (($575) - ($568))|0;
       $577 = $572 ? 0 : $576;
       $$$i = (($577) + ($544))|0;
-      $578 = HEAP32[(2312)>>2]|0;
+      $578 = HEAP32[(2576)>>2]|0;
       $579 = (($$$i) + ($578))|0;
       $580 = ($$$i>>>0)>($$0197>>>0);
       $581 = ($$$i>>>0)<(2147483647);
-      $or$cond$i211 = $580 & $581;
-      if ($or$cond$i211) {
-       $582 = HEAP32[(2320)>>2]|0;
+      $or$cond$i214 = $580 & $581;
+      if ($or$cond$i214) {
+       $582 = HEAP32[(2584)>>2]|0;
        $583 = ($582|0)==(0);
        if (!($583)) {
         $584 = ($579>>>0)<=($578>>>0);
         $585 = ($579>>>0)>($582>>>0);
-        $or$cond2$i = $584 | $585;
-        if ($or$cond2$i) {
+        $or$cond2$i215 = $584 | $585;
+        if ($or$cond2$i215) {
+         $$2234253237$i = 0;
          break;
         }
        }
        $586 = (_sbrk(($$$i|0))|0);
        $587 = ($586|0)==($566|0);
        if ($587) {
-        $$723947$i = $$$i;$$748$i = $566;
-        label = 190;
-        break L255;
+        $$723948$i = $$$i;$$749$i = $566;
+        label = 180;
+        break L244;
        } else {
         $$2247$ph$i = $586;$$2253$ph$i = $$$i;
-        label = 180;
+        label = 171;
        }
+      } else {
+       $$2234253237$i = 0;
       }
      }
     }
    } while(0);
-   L274: do {
-    if ((label|0) == 180) {
+   do {
+    if ((label|0) == 171) {
      $597 = (0 - ($$2253$ph$i))|0;
      $598 = ($$2247$ph$i|0)!=((-1)|0);
      $599 = ($$2253$ph$i>>>0)<(2147483647);
      $or$cond7$i = $599 & $598;
      $600 = ($539>>>0)>($$2253$ph$i>>>0);
      $or$cond10$i = $600 & $or$cond7$i;
-     do {
-      if ($or$cond10$i) {
-       $601 = HEAP32[(2360)>>2]|0;
-       $602 = (($540) - ($$2253$ph$i))|0;
-       $603 = (($602) + ($601))|0;
-       $604 = (0 - ($601))|0;
-       $605 = $603 & $604;
-       $606 = ($605>>>0)<(2147483647);
-       if ($606) {
-        $607 = (_sbrk(($605|0))|0);
-        $608 = ($607|0)==((-1)|0);
-        if ($608) {
-         (_sbrk(($597|0))|0);
-         break L274;
-        } else {
-         $609 = (($605) + ($$2253$ph$i))|0;
-         $$5256$i = $609;
-         break;
-        }
-       } else {
-        $$5256$i = $$2253$ph$i;
-       }
+     if (!($or$cond10$i)) {
+      $610 = ($$2247$ph$i|0)==((-1)|0);
+      if ($610) {
+       $$2234253237$i = 0;
+       break;
       } else {
-       $$5256$i = $$2253$ph$i;
+       $$723948$i = $$2253$ph$i;$$749$i = $$2247$ph$i;
+       label = 180;
+       break L244;
       }
-     } while(0);
-     $610 = ($$2247$ph$i|0)==((-1)|0);
-     if (!($610)) {
-      $$723947$i = $$5256$i;$$748$i = $$2247$ph$i;
-      label = 190;
-      break L255;
+     }
+     $601 = HEAP32[(2624)>>2]|0;
+     $602 = (($540) - ($$2253$ph$i))|0;
+     $603 = (($602) + ($601))|0;
+     $604 = (0 - ($601))|0;
+     $605 = $603 & $604;
+     $606 = ($605>>>0)<(2147483647);
+     if (!($606)) {
+      $$723948$i = $$2253$ph$i;$$749$i = $$2247$ph$i;
+      label = 180;
+      break L244;
+     }
+     $607 = (_sbrk(($605|0))|0);
+     $608 = ($607|0)==((-1)|0);
+     if ($608) {
+      (_sbrk(($597|0))|0);
+      $$2234253237$i = 0;
+      break;
+     } else {
+      $609 = (($605) + ($$2253$ph$i))|0;
+      $$723948$i = $609;$$749$i = $$2247$ph$i;
+      label = 180;
+      break L244;
      }
     }
    } while(0);
-   $611 = HEAP32[(2324)>>2]|0;
+   $611 = HEAP32[(2588)>>2]|0;
    $612 = $611 | 4;
-   HEAP32[(2324)>>2] = $612;
-   label = 187;
+   HEAP32[(2588)>>2] = $612;
+   $$4236$i = $$2234253237$i;
+   label = 178;
   } else {
-   label = 187;
+   $$4236$i = 0;
+   label = 178;
   }
  } while(0);
- if ((label|0) == 187) {
+ if ((label|0) == 178) {
   $613 = ($544>>>0)<(2147483647);
   if ($613) {
    $614 = (_sbrk(($544|0))|0);
@@ -15875,366 +15921,369 @@ function _malloc($0) {
    $or$cond5$i = $616 & $617;
    $618 = ($614>>>0)<($615>>>0);
    $or$cond11$i = $618 & $or$cond5$i;
-   if ($or$cond11$i) {
-    $619 = $615;
-    $620 = $614;
-    $621 = (($619) - ($620))|0;
-    $622 = (($$0197) + 40)|0;
-    $$not$i = ($621>>>0)>($622>>>0);
-    if ($$not$i) {
-     $$723947$i = $621;$$748$i = $614;
-     label = 190;
-    }
+   $619 = $615;
+   $620 = $614;
+   $621 = (($619) - ($620))|0;
+   $622 = (($$0197) + 40)|0;
+   $623 = ($621>>>0)>($622>>>0);
+   $$$4236$i = $623 ? $621 : $$4236$i;
+   $or$cond11$not$i = $or$cond11$i ^ 1;
+   $624 = ($614|0)==((-1)|0);
+   $not$$i216 = $623 ^ 1;
+   $625 = $624 | $not$$i216;
+   $or$cond50$i = $625 | $or$cond11$not$i;
+   if (!($or$cond50$i)) {
+    $$723948$i = $$$4236$i;$$749$i = $614;
+    label = 180;
    }
   }
  }
- if ((label|0) == 190) {
-  $623 = HEAP32[(2312)>>2]|0;
-  $624 = (($623) + ($$723947$i))|0;
-  HEAP32[(2312)>>2] = $624;
-  $625 = HEAP32[(2316)>>2]|0;
-  $626 = ($624>>>0)>($625>>>0);
-  if ($626) {
-   HEAP32[(2316)>>2] = $624;
+ if ((label|0) == 180) {
+  $626 = HEAP32[(2576)>>2]|0;
+  $627 = (($626) + ($$723948$i))|0;
+  HEAP32[(2576)>>2] = $627;
+  $628 = HEAP32[(2580)>>2]|0;
+  $629 = ($627>>>0)>($628>>>0);
+  if ($629) {
+   HEAP32[(2580)>>2] = $627;
   }
-  $627 = HEAP32[(1904)>>2]|0;
-  $628 = ($627|0)==(0|0);
+  $630 = HEAP32[(2168)>>2]|0;
+  $631 = ($630|0)==(0|0);
   do {
-   if ($628) {
-    $629 = HEAP32[(1896)>>2]|0;
-    $630 = ($629|0)==(0|0);
-    $631 = ($$748$i>>>0)<($629>>>0);
-    $or$cond12$i = $630 | $631;
+   if ($631) {
+    $632 = HEAP32[(2160)>>2]|0;
+    $633 = ($632|0)==(0|0);
+    $634 = ($$749$i>>>0)<($632>>>0);
+    $or$cond12$i = $633 | $634;
     if ($or$cond12$i) {
-     HEAP32[(1896)>>2] = $$748$i;
+     HEAP32[(2160)>>2] = $$749$i;
     }
-    HEAP32[(2328)>>2] = $$748$i;
-    HEAP32[(2332)>>2] = $$723947$i;
-    HEAP32[(2340)>>2] = 0;
-    $632 = HEAP32[588]|0;
-    HEAP32[(1916)>>2] = $632;
-    HEAP32[(1912)>>2] = -1;
+    HEAP32[(2592)>>2] = $$749$i;
+    HEAP32[(2596)>>2] = $$723948$i;
+    HEAP32[(2604)>>2] = 0;
+    $635 = HEAP32[654]|0;
+    HEAP32[(2180)>>2] = $635;
+    HEAP32[(2176)>>2] = -1;
     $$01$i$i = 0;
     while(1) {
-     $633 = $$01$i$i << 1;
-     $634 = (1920 + ($633<<2)|0);
-     $635 = ((($634)) + 12|0);
-     HEAP32[$635>>2] = $634;
-     $636 = ((($634)) + 8|0);
-     HEAP32[$636>>2] = $634;
-     $637 = (($$01$i$i) + 1)|0;
-     $exitcond$i$i = ($637|0)==(32);
+     $636 = $$01$i$i << 1;
+     $637 = (2184 + ($636<<2)|0);
+     $638 = ((($637)) + 12|0);
+     HEAP32[$638>>2] = $637;
+     $639 = ((($637)) + 8|0);
+     HEAP32[$639>>2] = $637;
+     $640 = (($$01$i$i) + 1)|0;
+     $exitcond$i$i = ($640|0)==(32);
      if ($exitcond$i$i) {
       break;
      } else {
-      $$01$i$i = $637;
+      $$01$i$i = $640;
      }
     }
-    $638 = (($$723947$i) + -40)|0;
-    $639 = ((($$748$i)) + 8|0);
-    $640 = $639;
-    $641 = $640 & 7;
-    $642 = ($641|0)==(0);
-    $643 = (0 - ($640))|0;
+    $641 = (($$723948$i) + -40)|0;
+    $642 = ((($$749$i)) + 8|0);
+    $643 = $642;
     $644 = $643 & 7;
-    $645 = $642 ? 0 : $644;
-    $646 = (($$748$i) + ($645)|0);
-    $647 = (($638) - ($645))|0;
-    HEAP32[(1904)>>2] = $646;
-    HEAP32[(1892)>>2] = $647;
-    $648 = $647 | 1;
-    $649 = ((($646)) + 4|0);
-    HEAP32[$649>>2] = $648;
-    $650 = (($646) + ($647)|0);
-    $651 = ((($650)) + 4|0);
-    HEAP32[$651>>2] = 40;
-    $652 = HEAP32[(2368)>>2]|0;
-    HEAP32[(1908)>>2] = $652;
+    $645 = ($644|0)==(0);
+    $646 = (0 - ($643))|0;
+    $647 = $646 & 7;
+    $648 = $645 ? 0 : $647;
+    $649 = (($$749$i) + ($648)|0);
+    $650 = (($641) - ($648))|0;
+    HEAP32[(2168)>>2] = $649;
+    HEAP32[(2156)>>2] = $650;
+    $651 = $650 | 1;
+    $652 = ((($649)) + 4|0);
+    HEAP32[$652>>2] = $651;
+    $653 = (($649) + ($650)|0);
+    $654 = ((($653)) + 4|0);
+    HEAP32[$654>>2] = 40;
+    $655 = HEAP32[(2632)>>2]|0;
+    HEAP32[(2172)>>2] = $655;
    } else {
-    $$024370$i = (2328);
+    $$024371$i = (2592);
     while(1) {
-     $653 = HEAP32[$$024370$i>>2]|0;
-     $654 = ((($$024370$i)) + 4|0);
-     $655 = HEAP32[$654>>2]|0;
-     $656 = (($653) + ($655)|0);
-     $657 = ($$748$i|0)==($656|0);
-     if ($657) {
-      label = 200;
+     $656 = HEAP32[$$024371$i>>2]|0;
+     $657 = ((($$024371$i)) + 4|0);
+     $658 = HEAP32[$657>>2]|0;
+     $659 = (($656) + ($658)|0);
+     $660 = ($$749$i|0)==($659|0);
+     if ($660) {
+      label = 190;
       break;
      }
-     $658 = ((($$024370$i)) + 8|0);
-     $659 = HEAP32[$658>>2]|0;
-     $660 = ($659|0)==(0|0);
-     if ($660) {
+     $661 = ((($$024371$i)) + 8|0);
+     $662 = HEAP32[$661>>2]|0;
+     $663 = ($662|0)==(0|0);
+     if ($663) {
       break;
      } else {
-      $$024370$i = $659;
+      $$024371$i = $662;
      }
     }
-    if ((label|0) == 200) {
-     $661 = ((($$024370$i)) + 12|0);
-     $662 = HEAP32[$661>>2]|0;
-     $663 = $662 & 8;
-     $664 = ($663|0)==(0);
-     if ($664) {
-      $665 = ($627>>>0)>=($653>>>0);
-      $666 = ($627>>>0)<($$748$i>>>0);
-      $or$cond50$i = $666 & $665;
-      if ($or$cond50$i) {
-       $667 = (($655) + ($$723947$i))|0;
-       HEAP32[$654>>2] = $667;
-       $668 = HEAP32[(1892)>>2]|0;
-       $669 = ((($627)) + 8|0);
-       $670 = $669;
-       $671 = $670 & 7;
-       $672 = ($671|0)==(0);
-       $673 = (0 - ($670))|0;
+    if ((label|0) == 190) {
+     $664 = ((($$024371$i)) + 12|0);
+     $665 = HEAP32[$664>>2]|0;
+     $666 = $665 & 8;
+     $667 = ($666|0)==(0);
+     if ($667) {
+      $668 = ($630>>>0)>=($656>>>0);
+      $669 = ($630>>>0)<($$749$i>>>0);
+      $or$cond51$i = $669 & $668;
+      if ($or$cond51$i) {
+       $670 = (($658) + ($$723948$i))|0;
+       HEAP32[$657>>2] = $670;
+       $671 = HEAP32[(2156)>>2]|0;
+       $672 = ((($630)) + 8|0);
+       $673 = $672;
        $674 = $673 & 7;
-       $675 = $672 ? 0 : $674;
-       $676 = (($627) + ($675)|0);
-       $677 = (($$723947$i) - ($675))|0;
-       $678 = (($677) + ($668))|0;
-       HEAP32[(1904)>>2] = $676;
-       HEAP32[(1892)>>2] = $678;
-       $679 = $678 | 1;
-       $680 = ((($676)) + 4|0);
-       HEAP32[$680>>2] = $679;
-       $681 = (($676) + ($678)|0);
-       $682 = ((($681)) + 4|0);
-       HEAP32[$682>>2] = 40;
-       $683 = HEAP32[(2368)>>2]|0;
-       HEAP32[(1908)>>2] = $683;
+       $675 = ($674|0)==(0);
+       $676 = (0 - ($673))|0;
+       $677 = $676 & 7;
+       $678 = $675 ? 0 : $677;
+       $679 = (($630) + ($678)|0);
+       $680 = (($$723948$i) - ($678))|0;
+       $681 = (($671) + ($680))|0;
+       HEAP32[(2168)>>2] = $679;
+       HEAP32[(2156)>>2] = $681;
+       $682 = $681 | 1;
+       $683 = ((($679)) + 4|0);
+       HEAP32[$683>>2] = $682;
+       $684 = (($679) + ($681)|0);
+       $685 = ((($684)) + 4|0);
+       HEAP32[$685>>2] = 40;
+       $686 = HEAP32[(2632)>>2]|0;
+       HEAP32[(2172)>>2] = $686;
        break;
       }
      }
     }
-    $684 = HEAP32[(1896)>>2]|0;
-    $685 = ($$748$i>>>0)<($684>>>0);
-    if ($685) {
-     HEAP32[(1896)>>2] = $$748$i;
-     $749 = $$748$i;
+    $687 = HEAP32[(2160)>>2]|0;
+    $688 = ($$749$i>>>0)<($687>>>0);
+    if ($688) {
+     HEAP32[(2160)>>2] = $$749$i;
+     $752 = $$749$i;
     } else {
-     $749 = $684;
+     $752 = $687;
     }
-    $686 = (($$748$i) + ($$723947$i)|0);
-    $$124469$i = (2328);
+    $689 = (($$749$i) + ($$723948$i)|0);
+    $$124470$i = (2592);
     while(1) {
-     $687 = HEAP32[$$124469$i>>2]|0;
-     $688 = ($687|0)==($686|0);
-     if ($688) {
-      label = 208;
+     $690 = HEAP32[$$124470$i>>2]|0;
+     $691 = ($690|0)==($689|0);
+     if ($691) {
+      label = 198;
       break;
      }
-     $689 = ((($$124469$i)) + 8|0);
-     $690 = HEAP32[$689>>2]|0;
-     $691 = ($690|0)==(0|0);
-     if ($691) {
-      $$0$i$i$i = (2328);
+     $692 = ((($$124470$i)) + 8|0);
+     $693 = HEAP32[$692>>2]|0;
+     $694 = ($693|0)==(0|0);
+     if ($694) {
       break;
      } else {
-      $$124469$i = $690;
+      $$124470$i = $693;
      }
     }
-    if ((label|0) == 208) {
-     $692 = ((($$124469$i)) + 12|0);
-     $693 = HEAP32[$692>>2]|0;
-     $694 = $693 & 8;
-     $695 = ($694|0)==(0);
-     if ($695) {
-      HEAP32[$$124469$i>>2] = $$748$i;
-      $696 = ((($$124469$i)) + 4|0);
-      $697 = HEAP32[$696>>2]|0;
-      $698 = (($697) + ($$723947$i))|0;
-      HEAP32[$696>>2] = $698;
-      $699 = ((($$748$i)) + 8|0);
-      $700 = $699;
-      $701 = $700 & 7;
-      $702 = ($701|0)==(0);
-      $703 = (0 - ($700))|0;
+    if ((label|0) == 198) {
+     $695 = ((($$124470$i)) + 12|0);
+     $696 = HEAP32[$695>>2]|0;
+     $697 = $696 & 8;
+     $698 = ($697|0)==(0);
+     if ($698) {
+      HEAP32[$$124470$i>>2] = $$749$i;
+      $699 = ((($$124470$i)) + 4|0);
+      $700 = HEAP32[$699>>2]|0;
+      $701 = (($700) + ($$723948$i))|0;
+      HEAP32[$699>>2] = $701;
+      $702 = ((($$749$i)) + 8|0);
+      $703 = $702;
       $704 = $703 & 7;
-      $705 = $702 ? 0 : $704;
-      $706 = (($$748$i) + ($705)|0);
-      $707 = ((($686)) + 8|0);
-      $708 = $707;
-      $709 = $708 & 7;
-      $710 = ($709|0)==(0);
-      $711 = (0 - ($708))|0;
+      $705 = ($704|0)==(0);
+      $706 = (0 - ($703))|0;
+      $707 = $706 & 7;
+      $708 = $705 ? 0 : $707;
+      $709 = (($$749$i) + ($708)|0);
+      $710 = ((($689)) + 8|0);
+      $711 = $710;
       $712 = $711 & 7;
-      $713 = $710 ? 0 : $712;
-      $714 = (($686) + ($713)|0);
-      $715 = $714;
-      $716 = $706;
-      $717 = (($715) - ($716))|0;
-      $718 = (($706) + ($$0197)|0);
-      $719 = (($717) - ($$0197))|0;
-      $720 = $$0197 | 3;
-      $721 = ((($706)) + 4|0);
-      HEAP32[$721>>2] = $720;
-      $722 = ($714|0)==($627|0);
+      $713 = ($712|0)==(0);
+      $714 = (0 - ($711))|0;
+      $715 = $714 & 7;
+      $716 = $713 ? 0 : $715;
+      $717 = (($689) + ($716)|0);
+      $718 = $717;
+      $719 = $709;
+      $720 = (($718) - ($719))|0;
+      $721 = (($709) + ($$0197)|0);
+      $722 = (($720) - ($$0197))|0;
+      $723 = $$0197 | 3;
+      $724 = ((($709)) + 4|0);
+      HEAP32[$724>>2] = $723;
+      $725 = ($717|0)==($630|0);
       do {
-       if ($722) {
-        $723 = HEAP32[(1892)>>2]|0;
-        $724 = (($723) + ($719))|0;
-        HEAP32[(1892)>>2] = $724;
-        HEAP32[(1904)>>2] = $718;
-        $725 = $724 | 1;
-        $726 = ((($718)) + 4|0);
-        HEAP32[$726>>2] = $725;
+       if ($725) {
+        $726 = HEAP32[(2156)>>2]|0;
+        $727 = (($726) + ($722))|0;
+        HEAP32[(2156)>>2] = $727;
+        HEAP32[(2168)>>2] = $721;
+        $728 = $727 | 1;
+        $729 = ((($721)) + 4|0);
+        HEAP32[$729>>2] = $728;
        } else {
-        $727 = HEAP32[(1900)>>2]|0;
-        $728 = ($714|0)==($727|0);
-        if ($728) {
-         $729 = HEAP32[(1888)>>2]|0;
-         $730 = (($729) + ($719))|0;
-         HEAP32[(1888)>>2] = $730;
-         HEAP32[(1900)>>2] = $718;
-         $731 = $730 | 1;
-         $732 = ((($718)) + 4|0);
-         HEAP32[$732>>2] = $731;
-         $733 = (($718) + ($730)|0);
-         HEAP32[$733>>2] = $730;
+        $730 = HEAP32[(2164)>>2]|0;
+        $731 = ($717|0)==($730|0);
+        if ($731) {
+         $732 = HEAP32[(2152)>>2]|0;
+         $733 = (($732) + ($722))|0;
+         HEAP32[(2152)>>2] = $733;
+         HEAP32[(2164)>>2] = $721;
+         $734 = $733 | 1;
+         $735 = ((($721)) + 4|0);
+         HEAP32[$735>>2] = $734;
+         $736 = (($721) + ($733)|0);
+         HEAP32[$736>>2] = $733;
          break;
         }
-        $734 = ((($714)) + 4|0);
-        $735 = HEAP32[$734>>2]|0;
-        $736 = $735 & 3;
-        $737 = ($736|0)==(1);
-        if ($737) {
-         $738 = $735 & -8;
-         $739 = $735 >>> 3;
-         $740 = ($735>>>0)<(256);
-         L326: do {
-          if ($740) {
-           $741 = ((($714)) + 8|0);
-           $742 = HEAP32[$741>>2]|0;
-           $743 = ((($714)) + 12|0);
-           $744 = HEAP32[$743>>2]|0;
-           $745 = $739 << 1;
-           $746 = (1920 + ($745<<2)|0);
-           $747 = ($742|0)==($746|0);
+        $737 = ((($717)) + 4|0);
+        $738 = HEAP32[$737>>2]|0;
+        $739 = $738 & 3;
+        $740 = ($739|0)==(1);
+        if ($740) {
+         $741 = $738 & -8;
+         $742 = $738 >>> 3;
+         $743 = ($738>>>0)<(256);
+         L314: do {
+          if ($743) {
+           $744 = ((($717)) + 8|0);
+           $745 = HEAP32[$744>>2]|0;
+           $746 = ((($717)) + 12|0);
+           $747 = HEAP32[$746>>2]|0;
+           $748 = $742 << 1;
+           $749 = (2184 + ($748<<2)|0);
+           $750 = ($745|0)==($749|0);
            do {
-            if (!($747)) {
-             $748 = ($742>>>0)<($749>>>0);
-             if ($748) {
+            if (!($750)) {
+             $751 = ($745>>>0)<($752>>>0);
+             if ($751) {
               _abort();
               // unreachable;
              }
-             $750 = ((($742)) + 12|0);
-             $751 = HEAP32[$750>>2]|0;
-             $752 = ($751|0)==($714|0);
-             if ($752) {
+             $753 = ((($745)) + 12|0);
+             $754 = HEAP32[$753>>2]|0;
+             $755 = ($754|0)==($717|0);
+             if ($755) {
               break;
              }
              _abort();
              // unreachable;
             }
            } while(0);
-           $753 = ($744|0)==($742|0);
-           if ($753) {
-            $754 = 1 << $739;
-            $755 = $754 ^ -1;
-            $756 = HEAP32[470]|0;
-            $757 = $756 & $755;
-            HEAP32[470] = $757;
+           $756 = ($747|0)==($745|0);
+           if ($756) {
+            $757 = 1 << $742;
+            $758 = $757 ^ -1;
+            $759 = HEAP32[536]|0;
+            $760 = $759 & $758;
+            HEAP32[536] = $760;
             break;
            }
-           $758 = ($744|0)==($746|0);
+           $761 = ($747|0)==($749|0);
            do {
-            if ($758) {
-             $$pre9$i$i = ((($744)) + 8|0);
-             $$pre$phi10$i$iZ2D = $$pre9$i$i;
+            if ($761) {
+             $$pre10$i$i = ((($747)) + 8|0);
+             $$pre$phi11$i$iZ2D = $$pre10$i$i;
             } else {
-             $759 = ($744>>>0)<($749>>>0);
-             if ($759) {
+             $762 = ($747>>>0)<($752>>>0);
+             if ($762) {
               _abort();
               // unreachable;
              }
-             $760 = ((($744)) + 8|0);
-             $761 = HEAP32[$760>>2]|0;
-             $762 = ($761|0)==($714|0);
-             if ($762) {
-              $$pre$phi10$i$iZ2D = $760;
+             $763 = ((($747)) + 8|0);
+             $764 = HEAP32[$763>>2]|0;
+             $765 = ($764|0)==($717|0);
+             if ($765) {
+              $$pre$phi11$i$iZ2D = $763;
               break;
              }
              _abort();
              // unreachable;
             }
            } while(0);
-           $763 = ((($742)) + 12|0);
-           HEAP32[$763>>2] = $744;
-           HEAP32[$$pre$phi10$i$iZ2D>>2] = $742;
+           $766 = ((($745)) + 12|0);
+           HEAP32[$766>>2] = $747;
+           HEAP32[$$pre$phi11$i$iZ2D>>2] = $745;
           } else {
-           $764 = ((($714)) + 24|0);
-           $765 = HEAP32[$764>>2]|0;
-           $766 = ((($714)) + 12|0);
-           $767 = HEAP32[$766>>2]|0;
-           $768 = ($767|0)==($714|0);
+           $767 = ((($717)) + 24|0);
+           $768 = HEAP32[$767>>2]|0;
+           $769 = ((($717)) + 12|0);
+           $770 = HEAP32[$769>>2]|0;
+           $771 = ($770|0)==($717|0);
            do {
-            if ($768) {
-             $778 = ((($714)) + 16|0);
-             $779 = ((($778)) + 4|0);
-             $780 = HEAP32[$779>>2]|0;
-             $781 = ($780|0)==(0|0);
-             if ($781) {
-              $782 = HEAP32[$778>>2]|0;
-              $783 = ($782|0)==(0|0);
-              if ($783) {
+            if ($771) {
+             $781 = ((($717)) + 16|0);
+             $782 = ((($781)) + 4|0);
+             $783 = HEAP32[$782>>2]|0;
+             $784 = ($783|0)==(0|0);
+             if ($784) {
+              $785 = HEAP32[$781>>2]|0;
+              $786 = ($785|0)==(0|0);
+              if ($786) {
                $$3$i$i = 0;
                break;
               } else {
-               $$1290$i$i = $782;$$1292$i$i = $778;
+               $$1291$i$i = $785;$$1293$i$i = $781;
               }
              } else {
-              $$1290$i$i = $780;$$1292$i$i = $779;
+              $$1291$i$i = $783;$$1293$i$i = $782;
              }
              while(1) {
-              $784 = ((($$1290$i$i)) + 20|0);
-              $785 = HEAP32[$784>>2]|0;
-              $786 = ($785|0)==(0|0);
-              if (!($786)) {
-               $$1290$i$i = $785;$$1292$i$i = $784;
-               continue;
-              }
-              $787 = ((($$1290$i$i)) + 16|0);
+              $787 = ((($$1291$i$i)) + 20|0);
               $788 = HEAP32[$787>>2]|0;
               $789 = ($788|0)==(0|0);
-              if ($789) {
+              if (!($789)) {
+               $$1291$i$i = $788;$$1293$i$i = $787;
+               continue;
+              }
+              $790 = ((($$1291$i$i)) + 16|0);
+              $791 = HEAP32[$790>>2]|0;
+              $792 = ($791|0)==(0|0);
+              if ($792) {
                break;
               } else {
-               $$1290$i$i = $788;$$1292$i$i = $787;
+               $$1291$i$i = $791;$$1293$i$i = $790;
               }
              }
-             $790 = ($$1292$i$i>>>0)<($749>>>0);
-             if ($790) {
+             $793 = ($$1293$i$i>>>0)<($752>>>0);
+             if ($793) {
               _abort();
               // unreachable;
              } else {
-              HEAP32[$$1292$i$i>>2] = 0;
-              $$3$i$i = $$1290$i$i;
+              HEAP32[$$1293$i$i>>2] = 0;
+              $$3$i$i = $$1291$i$i;
               break;
              }
             } else {
-             $769 = ((($714)) + 8|0);
-             $770 = HEAP32[$769>>2]|0;
-             $771 = ($770>>>0)<($749>>>0);
-             if ($771) {
-              _abort();
-              // unreachable;
-             }
-             $772 = ((($770)) + 12|0);
+             $772 = ((($717)) + 8|0);
              $773 = HEAP32[$772>>2]|0;
-             $774 = ($773|0)==($714|0);
-             if (!($774)) {
+             $774 = ($773>>>0)<($752>>>0);
+             if ($774) {
               _abort();
               // unreachable;
              }
-             $775 = ((($767)) + 8|0);
+             $775 = ((($773)) + 12|0);
              $776 = HEAP32[$775>>2]|0;
-             $777 = ($776|0)==($714|0);
-             if ($777) {
-              HEAP32[$772>>2] = $767;
+             $777 = ($776|0)==($717|0);
+             if (!($777)) {
+              _abort();
+              // unreachable;
+             }
+             $778 = ((($770)) + 8|0);
+             $779 = HEAP32[$778>>2]|0;
+             $780 = ($779|0)==($717|0);
+             if ($780) {
               HEAP32[$775>>2] = $770;
-              $$3$i$i = $767;
+              HEAP32[$778>>2] = $773;
+              $$3$i$i = $770;
               break;
              } else {
               _abort();
@@ -16242,269 +16291,269 @@ function _malloc($0) {
              }
             }
            } while(0);
-           $791 = ($765|0)==(0|0);
-           if ($791) {
+           $794 = ($768|0)==(0|0);
+           if ($794) {
             break;
            }
-           $792 = ((($714)) + 28|0);
-           $793 = HEAP32[$792>>2]|0;
-           $794 = (2184 + ($793<<2)|0);
-           $795 = HEAP32[$794>>2]|0;
-           $796 = ($714|0)==($795|0);
+           $795 = ((($717)) + 28|0);
+           $796 = HEAP32[$795>>2]|0;
+           $797 = (2448 + ($796<<2)|0);
+           $798 = HEAP32[$797>>2]|0;
+           $799 = ($717|0)==($798|0);
            do {
-            if ($796) {
-             HEAP32[$794>>2] = $$3$i$i;
+            if ($799) {
+             HEAP32[$797>>2] = $$3$i$i;
              $cond$i$i = ($$3$i$i|0)==(0|0);
              if (!($cond$i$i)) {
               break;
              }
-             $797 = 1 << $793;
-             $798 = $797 ^ -1;
-             $799 = HEAP32[(1884)>>2]|0;
-             $800 = $799 & $798;
-             HEAP32[(1884)>>2] = $800;
-             break L326;
+             $800 = 1 << $796;
+             $801 = $800 ^ -1;
+             $802 = HEAP32[(2148)>>2]|0;
+             $803 = $802 & $801;
+             HEAP32[(2148)>>2] = $803;
+             break L314;
             } else {
-             $801 = HEAP32[(1896)>>2]|0;
-             $802 = ($765>>>0)<($801>>>0);
-             if ($802) {
+             $804 = HEAP32[(2160)>>2]|0;
+             $805 = ($768>>>0)<($804>>>0);
+             if ($805) {
               _abort();
               // unreachable;
-             }
-             $803 = ((($765)) + 16|0);
-             $804 = HEAP32[$803>>2]|0;
-             $805 = ($804|0)==($714|0);
-             if ($805) {
-              HEAP32[$803>>2] = $$3$i$i;
              } else {
-              $806 = ((($765)) + 20|0);
-              HEAP32[$806>>2] = $$3$i$i;
-             }
-             $807 = ($$3$i$i|0)==(0|0);
-             if ($807) {
-              break L326;
+              $806 = ((($768)) + 16|0);
+              $807 = HEAP32[$806>>2]|0;
+              $not$$i17$i = ($807|0)!=($717|0);
+              $$sink1$i$i = $not$$i17$i&1;
+              $808 = (((($768)) + 16|0) + ($$sink1$i$i<<2)|0);
+              HEAP32[$808>>2] = $$3$i$i;
+              $809 = ($$3$i$i|0)==(0|0);
+              if ($809) {
+               break L314;
+              } else {
+               break;
+              }
              }
             }
            } while(0);
-           $808 = HEAP32[(1896)>>2]|0;
-           $809 = ($$3$i$i>>>0)<($808>>>0);
-           if ($809) {
+           $810 = HEAP32[(2160)>>2]|0;
+           $811 = ($$3$i$i>>>0)<($810>>>0);
+           if ($811) {
             _abort();
             // unreachable;
            }
-           $810 = ((($$3$i$i)) + 24|0);
-           HEAP32[$810>>2] = $765;
-           $811 = ((($714)) + 16|0);
-           $812 = HEAP32[$811>>2]|0;
-           $813 = ($812|0)==(0|0);
+           $812 = ((($$3$i$i)) + 24|0);
+           HEAP32[$812>>2] = $768;
+           $813 = ((($717)) + 16|0);
+           $814 = HEAP32[$813>>2]|0;
+           $815 = ($814|0)==(0|0);
            do {
-            if (!($813)) {
-             $814 = ($812>>>0)<($808>>>0);
-             if ($814) {
+            if (!($815)) {
+             $816 = ($814>>>0)<($810>>>0);
+             if ($816) {
               _abort();
               // unreachable;
              } else {
-              $815 = ((($$3$i$i)) + 16|0);
-              HEAP32[$815>>2] = $812;
-              $816 = ((($812)) + 24|0);
-              HEAP32[$816>>2] = $$3$i$i;
+              $817 = ((($$3$i$i)) + 16|0);
+              HEAP32[$817>>2] = $814;
+              $818 = ((($814)) + 24|0);
+              HEAP32[$818>>2] = $$3$i$i;
               break;
              }
             }
            } while(0);
-           $817 = ((($811)) + 4|0);
-           $818 = HEAP32[$817>>2]|0;
-           $819 = ($818|0)==(0|0);
-           if ($819) {
+           $819 = ((($813)) + 4|0);
+           $820 = HEAP32[$819>>2]|0;
+           $821 = ($820|0)==(0|0);
+           if ($821) {
             break;
            }
-           $820 = HEAP32[(1896)>>2]|0;
-           $821 = ($818>>>0)<($820>>>0);
-           if ($821) {
+           $822 = HEAP32[(2160)>>2]|0;
+           $823 = ($820>>>0)<($822>>>0);
+           if ($823) {
             _abort();
             // unreachable;
            } else {
-            $822 = ((($$3$i$i)) + 20|0);
-            HEAP32[$822>>2] = $818;
-            $823 = ((($818)) + 24|0);
-            HEAP32[$823>>2] = $$3$i$i;
+            $824 = ((($$3$i$i)) + 20|0);
+            HEAP32[$824>>2] = $820;
+            $825 = ((($820)) + 24|0);
+            HEAP32[$825>>2] = $$3$i$i;
             break;
            }
           }
          } while(0);
-         $824 = (($714) + ($738)|0);
-         $825 = (($738) + ($719))|0;
-         $$0$i18$i = $824;$$0286$i$i = $825;
+         $826 = (($717) + ($741)|0);
+         $827 = (($741) + ($722))|0;
+         $$0$i18$i = $826;$$0287$i$i = $827;
         } else {
-         $$0$i18$i = $714;$$0286$i$i = $719;
+         $$0$i18$i = $717;$$0287$i$i = $722;
         }
-        $826 = ((($$0$i18$i)) + 4|0);
-        $827 = HEAP32[$826>>2]|0;
-        $828 = $827 & -2;
-        HEAP32[$826>>2] = $828;
-        $829 = $$0286$i$i | 1;
-        $830 = ((($718)) + 4|0);
-        HEAP32[$830>>2] = $829;
-        $831 = (($718) + ($$0286$i$i)|0);
-        HEAP32[$831>>2] = $$0286$i$i;
-        $832 = $$0286$i$i >>> 3;
-        $833 = ($$0286$i$i>>>0)<(256);
-        if ($833) {
-         $834 = $832 << 1;
-         $835 = (1920 + ($834<<2)|0);
-         $836 = HEAP32[470]|0;
-         $837 = 1 << $832;
-         $838 = $836 & $837;
-         $839 = ($838|0)==(0);
+        $828 = ((($$0$i18$i)) + 4|0);
+        $829 = HEAP32[$828>>2]|0;
+        $830 = $829 & -2;
+        HEAP32[$828>>2] = $830;
+        $831 = $$0287$i$i | 1;
+        $832 = ((($721)) + 4|0);
+        HEAP32[$832>>2] = $831;
+        $833 = (($721) + ($$0287$i$i)|0);
+        HEAP32[$833>>2] = $$0287$i$i;
+        $834 = $$0287$i$i >>> 3;
+        $835 = ($$0287$i$i>>>0)<(256);
+        if ($835) {
+         $836 = $834 << 1;
+         $837 = (2184 + ($836<<2)|0);
+         $838 = HEAP32[536]|0;
+         $839 = 1 << $834;
+         $840 = $838 & $839;
+         $841 = ($840|0)==(0);
          do {
-          if ($839) {
-           $840 = $836 | $837;
-           HEAP32[470] = $840;
-           $$pre$i19$i = ((($835)) + 8|0);
-           $$0294$i$i = $835;$$pre$phi$i20$iZ2D = $$pre$i19$i;
+          if ($841) {
+           $842 = $838 | $839;
+           HEAP32[536] = $842;
+           $$pre$i19$i = ((($837)) + 8|0);
+           $$0295$i$i = $837;$$pre$phi$i20$iZ2D = $$pre$i19$i;
           } else {
-           $841 = ((($835)) + 8|0);
-           $842 = HEAP32[$841>>2]|0;
-           $843 = HEAP32[(1896)>>2]|0;
-           $844 = ($842>>>0)<($843>>>0);
-           if (!($844)) {
-            $$0294$i$i = $842;$$pre$phi$i20$iZ2D = $841;
+           $843 = ((($837)) + 8|0);
+           $844 = HEAP32[$843>>2]|0;
+           $845 = HEAP32[(2160)>>2]|0;
+           $846 = ($844>>>0)<($845>>>0);
+           if (!($846)) {
+            $$0295$i$i = $844;$$pre$phi$i20$iZ2D = $843;
             break;
            }
            _abort();
            // unreachable;
           }
          } while(0);
-         HEAP32[$$pre$phi$i20$iZ2D>>2] = $718;
-         $845 = ((($$0294$i$i)) + 12|0);
-         HEAP32[$845>>2] = $718;
-         $846 = ((($718)) + 8|0);
-         HEAP32[$846>>2] = $$0294$i$i;
-         $847 = ((($718)) + 12|0);
-         HEAP32[$847>>2] = $835;
+         HEAP32[$$pre$phi$i20$iZ2D>>2] = $721;
+         $847 = ((($$0295$i$i)) + 12|0);
+         HEAP32[$847>>2] = $721;
+         $848 = ((($721)) + 8|0);
+         HEAP32[$848>>2] = $$0295$i$i;
+         $849 = ((($721)) + 12|0);
+         HEAP32[$849>>2] = $837;
          break;
         }
-        $848 = $$0286$i$i >>> 8;
-        $849 = ($848|0)==(0);
+        $850 = $$0287$i$i >>> 8;
+        $851 = ($850|0)==(0);
         do {
-         if ($849) {
-          $$0295$i$i = 0;
+         if ($851) {
+          $$0296$i$i = 0;
          } else {
-          $850 = ($$0286$i$i>>>0)>(16777215);
-          if ($850) {
-           $$0295$i$i = 31;
+          $852 = ($$0287$i$i>>>0)>(16777215);
+          if ($852) {
+           $$0296$i$i = 31;
            break;
           }
-          $851 = (($848) + 1048320)|0;
-          $852 = $851 >>> 16;
-          $853 = $852 & 8;
-          $854 = $848 << $853;
-          $855 = (($854) + 520192)|0;
-          $856 = $855 >>> 16;
-          $857 = $856 & 4;
-          $858 = $857 | $853;
-          $859 = $854 << $857;
-          $860 = (($859) + 245760)|0;
-          $861 = $860 >>> 16;
-          $862 = $861 & 2;
-          $863 = $858 | $862;
-          $864 = (14 - ($863))|0;
-          $865 = $859 << $862;
-          $866 = $865 >>> 15;
-          $867 = (($864) + ($866))|0;
-          $868 = $867 << 1;
-          $869 = (($867) + 7)|0;
-          $870 = $$0286$i$i >>> $869;
-          $871 = $870 & 1;
-          $872 = $871 | $868;
-          $$0295$i$i = $872;
+          $853 = (($850) + 1048320)|0;
+          $854 = $853 >>> 16;
+          $855 = $854 & 8;
+          $856 = $850 << $855;
+          $857 = (($856) + 520192)|0;
+          $858 = $857 >>> 16;
+          $859 = $858 & 4;
+          $860 = $859 | $855;
+          $861 = $856 << $859;
+          $862 = (($861) + 245760)|0;
+          $863 = $862 >>> 16;
+          $864 = $863 & 2;
+          $865 = $860 | $864;
+          $866 = (14 - ($865))|0;
+          $867 = $861 << $864;
+          $868 = $867 >>> 15;
+          $869 = (($866) + ($868))|0;
+          $870 = $869 << 1;
+          $871 = (($869) + 7)|0;
+          $872 = $$0287$i$i >>> $871;
+          $873 = $872 & 1;
+          $874 = $873 | $870;
+          $$0296$i$i = $874;
          }
         } while(0);
-        $873 = (2184 + ($$0295$i$i<<2)|0);
-        $874 = ((($718)) + 28|0);
-        HEAP32[$874>>2] = $$0295$i$i;
-        $875 = ((($718)) + 16|0);
-        $876 = ((($875)) + 4|0);
-        HEAP32[$876>>2] = 0;
-        HEAP32[$875>>2] = 0;
-        $877 = HEAP32[(1884)>>2]|0;
-        $878 = 1 << $$0295$i$i;
-        $879 = $877 & $878;
-        $880 = ($879|0)==(0);
-        if ($880) {
-         $881 = $877 | $878;
-         HEAP32[(1884)>>2] = $881;
-         HEAP32[$873>>2] = $718;
-         $882 = ((($718)) + 24|0);
-         HEAP32[$882>>2] = $873;
-         $883 = ((($718)) + 12|0);
-         HEAP32[$883>>2] = $718;
-         $884 = ((($718)) + 8|0);
-         HEAP32[$884>>2] = $718;
+        $875 = (2448 + ($$0296$i$i<<2)|0);
+        $876 = ((($721)) + 28|0);
+        HEAP32[$876>>2] = $$0296$i$i;
+        $877 = ((($721)) + 16|0);
+        $878 = ((($877)) + 4|0);
+        HEAP32[$878>>2] = 0;
+        HEAP32[$877>>2] = 0;
+        $879 = HEAP32[(2148)>>2]|0;
+        $880 = 1 << $$0296$i$i;
+        $881 = $879 & $880;
+        $882 = ($881|0)==(0);
+        if ($882) {
+         $883 = $879 | $880;
+         HEAP32[(2148)>>2] = $883;
+         HEAP32[$875>>2] = $721;
+         $884 = ((($721)) + 24|0);
+         HEAP32[$884>>2] = $875;
+         $885 = ((($721)) + 12|0);
+         HEAP32[$885>>2] = $721;
+         $886 = ((($721)) + 8|0);
+         HEAP32[$886>>2] = $721;
          break;
         }
-        $885 = HEAP32[$873>>2]|0;
-        $886 = ($$0295$i$i|0)==(31);
-        $887 = $$0295$i$i >>> 1;
-        $888 = (25 - ($887))|0;
-        $889 = $886 ? 0 : $888;
-        $890 = $$0286$i$i << $889;
-        $$0287$i$i = $890;$$0288$i$i = $885;
+        $887 = HEAP32[$875>>2]|0;
+        $888 = ($$0296$i$i|0)==(31);
+        $889 = $$0296$i$i >>> 1;
+        $890 = (25 - ($889))|0;
+        $891 = $888 ? 0 : $890;
+        $892 = $$0287$i$i << $891;
+        $$0288$i$i = $892;$$0289$i$i = $887;
         while(1) {
-         $891 = ((($$0288$i$i)) + 4|0);
-         $892 = HEAP32[$891>>2]|0;
-         $893 = $892 & -8;
-         $894 = ($893|0)==($$0286$i$i|0);
-         if ($894) {
-          label = 278;
+         $893 = ((($$0289$i$i)) + 4|0);
+         $894 = HEAP32[$893>>2]|0;
+         $895 = $894 & -8;
+         $896 = ($895|0)==($$0287$i$i|0);
+         if ($896) {
+          label = 265;
           break;
          }
-         $895 = $$0287$i$i >>> 31;
-         $896 = (((($$0288$i$i)) + 16|0) + ($895<<2)|0);
-         $897 = $$0287$i$i << 1;
-         $898 = HEAP32[$896>>2]|0;
-         $899 = ($898|0)==(0|0);
-         if ($899) {
-          label = 275;
+         $897 = $$0288$i$i >>> 31;
+         $898 = (((($$0289$i$i)) + 16|0) + ($897<<2)|0);
+         $899 = $$0288$i$i << 1;
+         $900 = HEAP32[$898>>2]|0;
+         $901 = ($900|0)==(0|0);
+         if ($901) {
+          label = 262;
           break;
          } else {
-          $$0287$i$i = $897;$$0288$i$i = $898;
+          $$0288$i$i = $899;$$0289$i$i = $900;
          }
         }
-        if ((label|0) == 275) {
-         $900 = HEAP32[(1896)>>2]|0;
-         $901 = ($896>>>0)<($900>>>0);
-         if ($901) {
+        if ((label|0) == 262) {
+         $902 = HEAP32[(2160)>>2]|0;
+         $903 = ($898>>>0)<($902>>>0);
+         if ($903) {
           _abort();
           // unreachable;
          } else {
-          HEAP32[$896>>2] = $718;
-          $902 = ((($718)) + 24|0);
-          HEAP32[$902>>2] = $$0288$i$i;
-          $903 = ((($718)) + 12|0);
-          HEAP32[$903>>2] = $718;
-          $904 = ((($718)) + 8|0);
-          HEAP32[$904>>2] = $718;
+          HEAP32[$898>>2] = $721;
+          $904 = ((($721)) + 24|0);
+          HEAP32[$904>>2] = $$0289$i$i;
+          $905 = ((($721)) + 12|0);
+          HEAP32[$905>>2] = $721;
+          $906 = ((($721)) + 8|0);
+          HEAP32[$906>>2] = $721;
           break;
          }
         }
-        else if ((label|0) == 278) {
-         $905 = ((($$0288$i$i)) + 8|0);
-         $906 = HEAP32[$905>>2]|0;
-         $907 = HEAP32[(1896)>>2]|0;
-         $908 = ($906>>>0)>=($907>>>0);
-         $not$$i22$i = ($$0288$i$i>>>0)>=($907>>>0);
-         $909 = $908 & $not$$i22$i;
-         if ($909) {
-          $910 = ((($906)) + 12|0);
-          HEAP32[$910>>2] = $718;
-          HEAP32[$905>>2] = $718;
-          $911 = ((($718)) + 8|0);
-          HEAP32[$911>>2] = $906;
-          $912 = ((($718)) + 12|0);
-          HEAP32[$912>>2] = $$0288$i$i;
-          $913 = ((($718)) + 24|0);
-          HEAP32[$913>>2] = 0;
+        else if ((label|0) == 265) {
+         $907 = ((($$0289$i$i)) + 8|0);
+         $908 = HEAP32[$907>>2]|0;
+         $909 = HEAP32[(2160)>>2]|0;
+         $910 = ($908>>>0)>=($909>>>0);
+         $not$7$i$i = ($$0289$i$i>>>0)>=($909>>>0);
+         $911 = $910 & $not$7$i$i;
+         if ($911) {
+          $912 = ((($908)) + 12|0);
+          HEAP32[$912>>2] = $721;
+          HEAP32[$907>>2] = $721;
+          $913 = ((($721)) + 8|0);
+          HEAP32[$913>>2] = $908;
+          $914 = ((($721)) + 12|0);
+          HEAP32[$914>>2] = $$0289$i$i;
+          $915 = ((($721)) + 24|0);
+          HEAP32[$915>>2] = 0;
           break;
          } else {
           _abort();
@@ -16513,247 +16562,246 @@ function _malloc($0) {
         }
        }
       } while(0);
-      $1044 = ((($706)) + 8|0);
-      $$0 = $1044;
+      $1047 = ((($709)) + 8|0);
+      $$0 = $1047;
       STACKTOP = sp;return ($$0|0);
-     } else {
-      $$0$i$i$i = (2328);
      }
     }
+    $$0$i$i$i = (2592);
     while(1) {
-     $914 = HEAP32[$$0$i$i$i>>2]|0;
-     $915 = ($914>>>0)>($627>>>0);
-     if (!($915)) {
-      $916 = ((($$0$i$i$i)) + 4|0);
-      $917 = HEAP32[$916>>2]|0;
-      $918 = (($914) + ($917)|0);
-      $919 = ($918>>>0)>($627>>>0);
-      if ($919) {
+     $916 = HEAP32[$$0$i$i$i>>2]|0;
+     $917 = ($916>>>0)>($630>>>0);
+     if (!($917)) {
+      $918 = ((($$0$i$i$i)) + 4|0);
+      $919 = HEAP32[$918>>2]|0;
+      $920 = (($916) + ($919)|0);
+      $921 = ($920>>>0)>($630>>>0);
+      if ($921) {
        break;
       }
      }
-     $920 = ((($$0$i$i$i)) + 8|0);
-     $921 = HEAP32[$920>>2]|0;
-     $$0$i$i$i = $921;
+     $922 = ((($$0$i$i$i)) + 8|0);
+     $923 = HEAP32[$922>>2]|0;
+     $$0$i$i$i = $923;
     }
-    $922 = ((($918)) + -47|0);
-    $923 = ((($922)) + 8|0);
-    $924 = $923;
-    $925 = $924 & 7;
-    $926 = ($925|0)==(0);
-    $927 = (0 - ($924))|0;
-    $928 = $927 & 7;
-    $929 = $926 ? 0 : $928;
-    $930 = (($922) + ($929)|0);
-    $931 = ((($627)) + 16|0);
-    $932 = ($930>>>0)<($931>>>0);
-    $933 = $932 ? $627 : $930;
-    $934 = ((($933)) + 8|0);
-    $935 = ((($933)) + 24|0);
-    $936 = (($$723947$i) + -40)|0;
-    $937 = ((($$748$i)) + 8|0);
-    $938 = $937;
-    $939 = $938 & 7;
-    $940 = ($939|0)==(0);
-    $941 = (0 - ($938))|0;
-    $942 = $941 & 7;
-    $943 = $940 ? 0 : $942;
-    $944 = (($$748$i) + ($943)|0);
-    $945 = (($936) - ($943))|0;
-    HEAP32[(1904)>>2] = $944;
-    HEAP32[(1892)>>2] = $945;
-    $946 = $945 | 1;
-    $947 = ((($944)) + 4|0);
-    HEAP32[$947>>2] = $946;
-    $948 = (($944) + ($945)|0);
-    $949 = ((($948)) + 4|0);
-    HEAP32[$949>>2] = 40;
-    $950 = HEAP32[(2368)>>2]|0;
-    HEAP32[(1908)>>2] = $950;
-    $951 = ((($933)) + 4|0);
-    HEAP32[$951>>2] = 27;
-    ;HEAP32[$934>>2]=HEAP32[(2328)>>2]|0;HEAP32[$934+4>>2]=HEAP32[(2328)+4>>2]|0;HEAP32[$934+8>>2]=HEAP32[(2328)+8>>2]|0;HEAP32[$934+12>>2]=HEAP32[(2328)+12>>2]|0;
-    HEAP32[(2328)>>2] = $$748$i;
-    HEAP32[(2332)>>2] = $$723947$i;
-    HEAP32[(2340)>>2] = 0;
-    HEAP32[(2336)>>2] = $934;
-    $$0$i$i = $935;
+    $924 = ((($920)) + -47|0);
+    $925 = ((($924)) + 8|0);
+    $926 = $925;
+    $927 = $926 & 7;
+    $928 = ($927|0)==(0);
+    $929 = (0 - ($926))|0;
+    $930 = $929 & 7;
+    $931 = $928 ? 0 : $930;
+    $932 = (($924) + ($931)|0);
+    $933 = ((($630)) + 16|0);
+    $934 = ($932>>>0)<($933>>>0);
+    $935 = $934 ? $630 : $932;
+    $936 = ((($935)) + 8|0);
+    $937 = ((($935)) + 24|0);
+    $938 = (($$723948$i) + -40)|0;
+    $939 = ((($$749$i)) + 8|0);
+    $940 = $939;
+    $941 = $940 & 7;
+    $942 = ($941|0)==(0);
+    $943 = (0 - ($940))|0;
+    $944 = $943 & 7;
+    $945 = $942 ? 0 : $944;
+    $946 = (($$749$i) + ($945)|0);
+    $947 = (($938) - ($945))|0;
+    HEAP32[(2168)>>2] = $946;
+    HEAP32[(2156)>>2] = $947;
+    $948 = $947 | 1;
+    $949 = ((($946)) + 4|0);
+    HEAP32[$949>>2] = $948;
+    $950 = (($946) + ($947)|0);
+    $951 = ((($950)) + 4|0);
+    HEAP32[$951>>2] = 40;
+    $952 = HEAP32[(2632)>>2]|0;
+    HEAP32[(2172)>>2] = $952;
+    $953 = ((($935)) + 4|0);
+    HEAP32[$953>>2] = 27;
+    ;HEAP32[$936>>2]=HEAP32[(2592)>>2]|0;HEAP32[$936+4>>2]=HEAP32[(2592)+4>>2]|0;HEAP32[$936+8>>2]=HEAP32[(2592)+8>>2]|0;HEAP32[$936+12>>2]=HEAP32[(2592)+12>>2]|0;
+    HEAP32[(2592)>>2] = $$749$i;
+    HEAP32[(2596)>>2] = $$723948$i;
+    HEAP32[(2604)>>2] = 0;
+    HEAP32[(2600)>>2] = $936;
+    $955 = $937;
     while(1) {
-     $952 = ((($$0$i$i)) + 4|0);
-     HEAP32[$952>>2] = 7;
-     $953 = ((($952)) + 4|0);
-     $954 = ($953>>>0)<($918>>>0);
-     if ($954) {
-      $$0$i$i = $952;
+     $954 = ((($955)) + 4|0);
+     HEAP32[$954>>2] = 7;
+     $956 = ((($955)) + 8|0);
+     $957 = ($956>>>0)<($920>>>0);
+     if ($957) {
+      $955 = $954;
      } else {
       break;
      }
     }
-    $955 = ($933|0)==($627|0);
-    if (!($955)) {
-     $956 = $933;
-     $957 = $627;
-     $958 = (($956) - ($957))|0;
-     $959 = HEAP32[$951>>2]|0;
-     $960 = $959 & -2;
-     HEAP32[$951>>2] = $960;
-     $961 = $958 | 1;
-     $962 = ((($627)) + 4|0);
-     HEAP32[$962>>2] = $961;
-     HEAP32[$933>>2] = $958;
-     $963 = $958 >>> 3;
-     $964 = ($958>>>0)<(256);
-     if ($964) {
-      $965 = $963 << 1;
-      $966 = (1920 + ($965<<2)|0);
-      $967 = HEAP32[470]|0;
-      $968 = 1 << $963;
-      $969 = $967 & $968;
-      $970 = ($969|0)==(0);
-      if ($970) {
-       $971 = $967 | $968;
-       HEAP32[470] = $971;
-       $$pre$i$i = ((($966)) + 8|0);
-       $$0211$i$i = $966;$$pre$phi$i$iZ2D = $$pre$i$i;
+    $958 = ($935|0)==($630|0);
+    if (!($958)) {
+     $959 = $935;
+     $960 = $630;
+     $961 = (($959) - ($960))|0;
+     $962 = HEAP32[$953>>2]|0;
+     $963 = $962 & -2;
+     HEAP32[$953>>2] = $963;
+     $964 = $961 | 1;
+     $965 = ((($630)) + 4|0);
+     HEAP32[$965>>2] = $964;
+     HEAP32[$935>>2] = $961;
+     $966 = $961 >>> 3;
+     $967 = ($961>>>0)<(256);
+     if ($967) {
+      $968 = $966 << 1;
+      $969 = (2184 + ($968<<2)|0);
+      $970 = HEAP32[536]|0;
+      $971 = 1 << $966;
+      $972 = $970 & $971;
+      $973 = ($972|0)==(0);
+      if ($973) {
+       $974 = $970 | $971;
+       HEAP32[536] = $974;
+       $$pre$i$i = ((($969)) + 8|0);
+       $$0211$i$i = $969;$$pre$phi$i$iZ2D = $$pre$i$i;
       } else {
-       $972 = ((($966)) + 8|0);
-       $973 = HEAP32[$972>>2]|0;
-       $974 = HEAP32[(1896)>>2]|0;
-       $975 = ($973>>>0)<($974>>>0);
-       if ($975) {
+       $975 = ((($969)) + 8|0);
+       $976 = HEAP32[$975>>2]|0;
+       $977 = HEAP32[(2160)>>2]|0;
+       $978 = ($976>>>0)<($977>>>0);
+       if ($978) {
         _abort();
         // unreachable;
        } else {
-        $$0211$i$i = $973;$$pre$phi$i$iZ2D = $972;
+        $$0211$i$i = $976;$$pre$phi$i$iZ2D = $975;
        }
       }
-      HEAP32[$$pre$phi$i$iZ2D>>2] = $627;
-      $976 = ((($$0211$i$i)) + 12|0);
-      HEAP32[$976>>2] = $627;
-      $977 = ((($627)) + 8|0);
-      HEAP32[$977>>2] = $$0211$i$i;
-      $978 = ((($627)) + 12|0);
-      HEAP32[$978>>2] = $966;
+      HEAP32[$$pre$phi$i$iZ2D>>2] = $630;
+      $979 = ((($$0211$i$i)) + 12|0);
+      HEAP32[$979>>2] = $630;
+      $980 = ((($630)) + 8|0);
+      HEAP32[$980>>2] = $$0211$i$i;
+      $981 = ((($630)) + 12|0);
+      HEAP32[$981>>2] = $969;
       break;
      }
-     $979 = $958 >>> 8;
-     $980 = ($979|0)==(0);
-     if ($980) {
+     $982 = $961 >>> 8;
+     $983 = ($982|0)==(0);
+     if ($983) {
       $$0212$i$i = 0;
      } else {
-      $981 = ($958>>>0)>(16777215);
-      if ($981) {
+      $984 = ($961>>>0)>(16777215);
+      if ($984) {
        $$0212$i$i = 31;
       } else {
-       $982 = (($979) + 1048320)|0;
-       $983 = $982 >>> 16;
-       $984 = $983 & 8;
-       $985 = $979 << $984;
-       $986 = (($985) + 520192)|0;
-       $987 = $986 >>> 16;
-       $988 = $987 & 4;
-       $989 = $988 | $984;
-       $990 = $985 << $988;
-       $991 = (($990) + 245760)|0;
-       $992 = $991 >>> 16;
-       $993 = $992 & 2;
-       $994 = $989 | $993;
-       $995 = (14 - ($994))|0;
-       $996 = $990 << $993;
-       $997 = $996 >>> 15;
-       $998 = (($995) + ($997))|0;
-       $999 = $998 << 1;
-       $1000 = (($998) + 7)|0;
-       $1001 = $958 >>> $1000;
-       $1002 = $1001 & 1;
-       $1003 = $1002 | $999;
-       $$0212$i$i = $1003;
+       $985 = (($982) + 1048320)|0;
+       $986 = $985 >>> 16;
+       $987 = $986 & 8;
+       $988 = $982 << $987;
+       $989 = (($988) + 520192)|0;
+       $990 = $989 >>> 16;
+       $991 = $990 & 4;
+       $992 = $991 | $987;
+       $993 = $988 << $991;
+       $994 = (($993) + 245760)|0;
+       $995 = $994 >>> 16;
+       $996 = $995 & 2;
+       $997 = $992 | $996;
+       $998 = (14 - ($997))|0;
+       $999 = $993 << $996;
+       $1000 = $999 >>> 15;
+       $1001 = (($998) + ($1000))|0;
+       $1002 = $1001 << 1;
+       $1003 = (($1001) + 7)|0;
+       $1004 = $961 >>> $1003;
+       $1005 = $1004 & 1;
+       $1006 = $1005 | $1002;
+       $$0212$i$i = $1006;
       }
      }
-     $1004 = (2184 + ($$0212$i$i<<2)|0);
-     $1005 = ((($627)) + 28|0);
-     HEAP32[$1005>>2] = $$0212$i$i;
-     $1006 = ((($627)) + 20|0);
-     HEAP32[$1006>>2] = 0;
-     HEAP32[$931>>2] = 0;
-     $1007 = HEAP32[(1884)>>2]|0;
-     $1008 = 1 << $$0212$i$i;
-     $1009 = $1007 & $1008;
-     $1010 = ($1009|0)==(0);
-     if ($1010) {
-      $1011 = $1007 | $1008;
-      HEAP32[(1884)>>2] = $1011;
-      HEAP32[$1004>>2] = $627;
-      $1012 = ((($627)) + 24|0);
-      HEAP32[$1012>>2] = $1004;
-      $1013 = ((($627)) + 12|0);
-      HEAP32[$1013>>2] = $627;
-      $1014 = ((($627)) + 8|0);
-      HEAP32[$1014>>2] = $627;
+     $1007 = (2448 + ($$0212$i$i<<2)|0);
+     $1008 = ((($630)) + 28|0);
+     HEAP32[$1008>>2] = $$0212$i$i;
+     $1009 = ((($630)) + 20|0);
+     HEAP32[$1009>>2] = 0;
+     HEAP32[$933>>2] = 0;
+     $1010 = HEAP32[(2148)>>2]|0;
+     $1011 = 1 << $$0212$i$i;
+     $1012 = $1010 & $1011;
+     $1013 = ($1012|0)==(0);
+     if ($1013) {
+      $1014 = $1010 | $1011;
+      HEAP32[(2148)>>2] = $1014;
+      HEAP32[$1007>>2] = $630;
+      $1015 = ((($630)) + 24|0);
+      HEAP32[$1015>>2] = $1007;
+      $1016 = ((($630)) + 12|0);
+      HEAP32[$1016>>2] = $630;
+      $1017 = ((($630)) + 8|0);
+      HEAP32[$1017>>2] = $630;
       break;
      }
-     $1015 = HEAP32[$1004>>2]|0;
-     $1016 = ($$0212$i$i|0)==(31);
-     $1017 = $$0212$i$i >>> 1;
-     $1018 = (25 - ($1017))|0;
-     $1019 = $1016 ? 0 : $1018;
-     $1020 = $958 << $1019;
-     $$0206$i$i = $1020;$$0207$i$i = $1015;
+     $1018 = HEAP32[$1007>>2]|0;
+     $1019 = ($$0212$i$i|0)==(31);
+     $1020 = $$0212$i$i >>> 1;
+     $1021 = (25 - ($1020))|0;
+     $1022 = $1019 ? 0 : $1021;
+     $1023 = $961 << $1022;
+     $$0206$i$i = $1023;$$0207$i$i = $1018;
      while(1) {
-      $1021 = ((($$0207$i$i)) + 4|0);
-      $1022 = HEAP32[$1021>>2]|0;
-      $1023 = $1022 & -8;
-      $1024 = ($1023|0)==($958|0);
-      if ($1024) {
-       label = 304;
+      $1024 = ((($$0207$i$i)) + 4|0);
+      $1025 = HEAP32[$1024>>2]|0;
+      $1026 = $1025 & -8;
+      $1027 = ($1026|0)==($961|0);
+      if ($1027) {
+       label = 292;
        break;
       }
-      $1025 = $$0206$i$i >>> 31;
-      $1026 = (((($$0207$i$i)) + 16|0) + ($1025<<2)|0);
-      $1027 = $$0206$i$i << 1;
-      $1028 = HEAP32[$1026>>2]|0;
-      $1029 = ($1028|0)==(0|0);
-      if ($1029) {
-       label = 301;
+      $1028 = $$0206$i$i >>> 31;
+      $1029 = (((($$0207$i$i)) + 16|0) + ($1028<<2)|0);
+      $1030 = $$0206$i$i << 1;
+      $1031 = HEAP32[$1029>>2]|0;
+      $1032 = ($1031|0)==(0|0);
+      if ($1032) {
+       label = 289;
        break;
       } else {
-       $$0206$i$i = $1027;$$0207$i$i = $1028;
+       $$0206$i$i = $1030;$$0207$i$i = $1031;
       }
      }
-     if ((label|0) == 301) {
-      $1030 = HEAP32[(1896)>>2]|0;
-      $1031 = ($1026>>>0)<($1030>>>0);
-      if ($1031) {
+     if ((label|0) == 289) {
+      $1033 = HEAP32[(2160)>>2]|0;
+      $1034 = ($1029>>>0)<($1033>>>0);
+      if ($1034) {
        _abort();
        // unreachable;
       } else {
-       HEAP32[$1026>>2] = $627;
-       $1032 = ((($627)) + 24|0);
-       HEAP32[$1032>>2] = $$0207$i$i;
-       $1033 = ((($627)) + 12|0);
-       HEAP32[$1033>>2] = $627;
-       $1034 = ((($627)) + 8|0);
-       HEAP32[$1034>>2] = $627;
+       HEAP32[$1029>>2] = $630;
+       $1035 = ((($630)) + 24|0);
+       HEAP32[$1035>>2] = $$0207$i$i;
+       $1036 = ((($630)) + 12|0);
+       HEAP32[$1036>>2] = $630;
+       $1037 = ((($630)) + 8|0);
+       HEAP32[$1037>>2] = $630;
        break;
       }
      }
-     else if ((label|0) == 304) {
-      $1035 = ((($$0207$i$i)) + 8|0);
-      $1036 = HEAP32[$1035>>2]|0;
-      $1037 = HEAP32[(1896)>>2]|0;
-      $1038 = ($1036>>>0)>=($1037>>>0);
-      $not$$i$i = ($$0207$i$i>>>0)>=($1037>>>0);
-      $1039 = $1038 & $not$$i$i;
-      if ($1039) {
-       $1040 = ((($1036)) + 12|0);
-       HEAP32[$1040>>2] = $627;
-       HEAP32[$1035>>2] = $627;
-       $1041 = ((($627)) + 8|0);
-       HEAP32[$1041>>2] = $1036;
-       $1042 = ((($627)) + 12|0);
-       HEAP32[$1042>>2] = $$0207$i$i;
-       $1043 = ((($627)) + 24|0);
-       HEAP32[$1043>>2] = 0;
+     else if ((label|0) == 292) {
+      $1038 = ((($$0207$i$i)) + 8|0);
+      $1039 = HEAP32[$1038>>2]|0;
+      $1040 = HEAP32[(2160)>>2]|0;
+      $1041 = ($1039>>>0)>=($1040>>>0);
+      $not$$i$i = ($$0207$i$i>>>0)>=($1040>>>0);
+      $1042 = $1041 & $not$$i$i;
+      if ($1042) {
+       $1043 = ((($1039)) + 12|0);
+       HEAP32[$1043>>2] = $630;
+       HEAP32[$1038>>2] = $630;
+       $1044 = ((($630)) + 8|0);
+       HEAP32[$1044>>2] = $1039;
+       $1045 = ((($630)) + 12|0);
+       HEAP32[$1045>>2] = $$0207$i$i;
+       $1046 = ((($630)) + 24|0);
+       HEAP32[$1046>>2] = 0;
        break;
       } else {
        _abort();
@@ -16763,57 +16811,57 @@ function _malloc($0) {
     }
    }
   } while(0);
-  $1045 = HEAP32[(1892)>>2]|0;
-  $1046 = ($1045>>>0)>($$0197>>>0);
-  if ($1046) {
-   $1047 = (($1045) - ($$0197))|0;
-   HEAP32[(1892)>>2] = $1047;
-   $1048 = HEAP32[(1904)>>2]|0;
-   $1049 = (($1048) + ($$0197)|0);
-   HEAP32[(1904)>>2] = $1049;
-   $1050 = $1047 | 1;
-   $1051 = ((($1049)) + 4|0);
-   HEAP32[$1051>>2] = $1050;
-   $1052 = $$0197 | 3;
-   $1053 = ((($1048)) + 4|0);
-   HEAP32[$1053>>2] = $1052;
-   $1054 = ((($1048)) + 8|0);
-   $$0 = $1054;
+  $1048 = HEAP32[(2156)>>2]|0;
+  $1049 = ($1048>>>0)>($$0197>>>0);
+  if ($1049) {
+   $1050 = (($1048) - ($$0197))|0;
+   HEAP32[(2156)>>2] = $1050;
+   $1051 = HEAP32[(2168)>>2]|0;
+   $1052 = (($1051) + ($$0197)|0);
+   HEAP32[(2168)>>2] = $1052;
+   $1053 = $1050 | 1;
+   $1054 = ((($1052)) + 4|0);
+   HEAP32[$1054>>2] = $1053;
+   $1055 = $$0197 | 3;
+   $1056 = ((($1051)) + 4|0);
+   HEAP32[$1056>>2] = $1055;
+   $1057 = ((($1051)) + 8|0);
+   $$0 = $1057;
    STACKTOP = sp;return ($$0|0);
   }
  }
- $1055 = (___errno_location()|0);
- HEAP32[$1055>>2] = 12;
+ $1058 = (___errno_location()|0);
+ HEAP32[$1058>>2] = 12;
  $$0 = 0;
  STACKTOP = sp;return ($$0|0);
 }
 function _free($0) {
  $0 = $0|0;
- var $$0211$i = 0, $$0211$in$i = 0, $$0381 = 0, $$0382 = 0, $$0394 = 0, $$0401 = 0, $$1 = 0, $$1380 = 0, $$1385 = 0, $$1388 = 0, $$1396 = 0, $$1400 = 0, $$2 = 0, $$3 = 0, $$3398 = 0, $$pre = 0, $$pre$phi439Z2D = 0, $$pre$phi441Z2D = 0, $$pre$phiZ2D = 0, $$pre438 = 0;
- var $$pre440 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0, $114 = 0, $115 = 0;
- var $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0, $132 = 0, $133 = 0;
- var $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0, $150 = 0, $151 = 0;
- var $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0, $169 = 0, $17 = 0;
- var $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0, $187 = 0, $188 = 0;
- var $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0, $204 = 0, $205 = 0;
- var $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0, $222 = 0, $223 = 0;
- var $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0, $240 = 0, $241 = 0;
- var $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0, $259 = 0, $26 = 0;
- var $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0, $277 = 0, $278 = 0;
- var $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0, $295 = 0, $296 = 0;
- var $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0, $312 = 0, $313 = 0;
- var $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $319 = 0, $32 = 0, $320 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0;
+ var $$0212$i = 0, $$0212$in$i = 0, $$0383 = 0, $$0384 = 0, $$0396 = 0, $$0403 = 0, $$1 = 0, $$1382 = 0, $$1387 = 0, $$1390 = 0, $$1398 = 0, $$1402 = 0, $$2 = 0, $$3 = 0, $$3400 = 0, $$pre = 0, $$pre$phi443Z2D = 0, $$pre$phi445Z2D = 0, $$pre$phiZ2D = 0, $$pre442 = 0;
+ var $$pre444 = 0, $$sink3 = 0, $$sink5 = 0, $1 = 0, $10 = 0, $100 = 0, $101 = 0, $102 = 0, $103 = 0, $104 = 0, $105 = 0, $106 = 0, $107 = 0, $108 = 0, $109 = 0, $11 = 0, $110 = 0, $111 = 0, $112 = 0, $113 = 0;
+ var $114 = 0, $115 = 0, $116 = 0, $117 = 0, $118 = 0, $119 = 0, $12 = 0, $120 = 0, $121 = 0, $122 = 0, $123 = 0, $124 = 0, $125 = 0, $126 = 0, $127 = 0, $128 = 0, $129 = 0, $13 = 0, $130 = 0, $131 = 0;
+ var $132 = 0, $133 = 0, $134 = 0, $135 = 0, $136 = 0, $137 = 0, $138 = 0, $139 = 0, $14 = 0, $140 = 0, $141 = 0, $142 = 0, $143 = 0, $144 = 0, $145 = 0, $146 = 0, $147 = 0, $148 = 0, $149 = 0, $15 = 0;
+ var $150 = 0, $151 = 0, $152 = 0, $153 = 0, $154 = 0, $155 = 0, $156 = 0, $157 = 0, $158 = 0, $159 = 0, $16 = 0, $160 = 0, $161 = 0, $162 = 0, $163 = 0, $164 = 0, $165 = 0, $166 = 0, $167 = 0, $168 = 0;
+ var $169 = 0, $17 = 0, $170 = 0, $171 = 0, $172 = 0, $173 = 0, $174 = 0, $175 = 0, $176 = 0, $177 = 0, $178 = 0, $179 = 0, $18 = 0, $180 = 0, $181 = 0, $182 = 0, $183 = 0, $184 = 0, $185 = 0, $186 = 0;
+ var $187 = 0, $188 = 0, $189 = 0, $19 = 0, $190 = 0, $191 = 0, $192 = 0, $193 = 0, $194 = 0, $195 = 0, $196 = 0, $197 = 0, $198 = 0, $199 = 0, $2 = 0, $20 = 0, $200 = 0, $201 = 0, $202 = 0, $203 = 0;
+ var $204 = 0, $205 = 0, $206 = 0, $207 = 0, $208 = 0, $209 = 0, $21 = 0, $210 = 0, $211 = 0, $212 = 0, $213 = 0, $214 = 0, $215 = 0, $216 = 0, $217 = 0, $218 = 0, $219 = 0, $22 = 0, $220 = 0, $221 = 0;
+ var $222 = 0, $223 = 0, $224 = 0, $225 = 0, $226 = 0, $227 = 0, $228 = 0, $229 = 0, $23 = 0, $230 = 0, $231 = 0, $232 = 0, $233 = 0, $234 = 0, $235 = 0, $236 = 0, $237 = 0, $238 = 0, $239 = 0, $24 = 0;
+ var $240 = 0, $241 = 0, $242 = 0, $243 = 0, $244 = 0, $245 = 0, $246 = 0, $247 = 0, $248 = 0, $249 = 0, $25 = 0, $250 = 0, $251 = 0, $252 = 0, $253 = 0, $254 = 0, $255 = 0, $256 = 0, $257 = 0, $258 = 0;
+ var $259 = 0, $26 = 0, $260 = 0, $261 = 0, $262 = 0, $263 = 0, $264 = 0, $265 = 0, $266 = 0, $267 = 0, $268 = 0, $269 = 0, $27 = 0, $270 = 0, $271 = 0, $272 = 0, $273 = 0, $274 = 0, $275 = 0, $276 = 0;
+ var $277 = 0, $278 = 0, $279 = 0, $28 = 0, $280 = 0, $281 = 0, $282 = 0, $283 = 0, $284 = 0, $285 = 0, $286 = 0, $287 = 0, $288 = 0, $289 = 0, $29 = 0, $290 = 0, $291 = 0, $292 = 0, $293 = 0, $294 = 0;
+ var $295 = 0, $296 = 0, $297 = 0, $298 = 0, $299 = 0, $3 = 0, $30 = 0, $300 = 0, $301 = 0, $302 = 0, $303 = 0, $304 = 0, $305 = 0, $306 = 0, $307 = 0, $308 = 0, $309 = 0, $31 = 0, $310 = 0, $311 = 0;
+ var $312 = 0, $313 = 0, $314 = 0, $315 = 0, $316 = 0, $317 = 0, $318 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $4 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0;
  var $44 = 0, $45 = 0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $5 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $6 = 0, $60 = 0, $61 = 0;
  var $62 = 0, $63 = 0, $64 = 0, $65 = 0, $66 = 0, $67 = 0, $68 = 0, $69 = 0, $7 = 0, $70 = 0, $71 = 0, $72 = 0, $73 = 0, $74 = 0, $75 = 0, $76 = 0, $77 = 0, $78 = 0, $79 = 0, $8 = 0;
  var $80 = 0, $81 = 0, $82 = 0, $83 = 0, $84 = 0, $85 = 0, $86 = 0, $87 = 0, $88 = 0, $89 = 0, $9 = 0, $90 = 0, $91 = 0, $92 = 0, $93 = 0, $94 = 0, $95 = 0, $96 = 0, $97 = 0, $98 = 0;
- var $99 = 0, $cond418 = 0, $cond419 = 0, $not$ = 0, label = 0, sp = 0;
+ var $99 = 0, $cond421 = 0, $cond422 = 0, $not$ = 0, $not$405 = 0, $not$437 = 0, label = 0, sp = 0;
  sp = STACKTOP;
  $1 = ($0|0)==(0|0);
  if ($1) {
   return;
  }
  $2 = ((($0)) + -8|0);
- $3 = HEAP32[(1896)>>2]|0;
+ $3 = HEAP32[(2160)>>2]|0;
  $4 = ($2>>>0)<($3>>>0);
  if ($4) {
   _abort();
@@ -16831,7 +16879,7 @@ function _free($0) {
  $10 = (($2) + ($9)|0);
  $11 = $6 & 1;
  $12 = ($11|0)==(0);
- do {
+ L10: do {
   if ($12) {
    $13 = HEAP32[$2>>2]|0;
    $14 = ($7|0)==(0);
@@ -16846,25 +16894,25 @@ function _free($0) {
     _abort();
     // unreachable;
    }
-   $19 = HEAP32[(1900)>>2]|0;
+   $19 = HEAP32[(2164)>>2]|0;
    $20 = ($16|0)==($19|0);
    if ($20) {
-    $105 = ((($10)) + 4|0);
-    $106 = HEAP32[$105>>2]|0;
-    $107 = $106 & 3;
-    $108 = ($107|0)==(3);
-    if (!($108)) {
-     $$1 = $16;$$1380 = $17;
+    $104 = ((($10)) + 4|0);
+    $105 = HEAP32[$104>>2]|0;
+    $106 = $105 & 3;
+    $107 = ($106|0)==(3);
+    if (!($107)) {
+     $$1 = $16;$$1382 = $17;$112 = $16;
      break;
     }
-    HEAP32[(1888)>>2] = $17;
-    $109 = $106 & -2;
-    HEAP32[$105>>2] = $109;
+    $108 = (($16) + ($17)|0);
+    $109 = ((($16)) + 4|0);
     $110 = $17 | 1;
-    $111 = ((($16)) + 4|0);
-    HEAP32[$111>>2] = $110;
-    $112 = (($16) + ($17)|0);
-    HEAP32[$112>>2] = $17;
+    $111 = $105 & -2;
+    HEAP32[(2152)>>2] = $17;
+    HEAP32[$104>>2] = $111;
+    HEAP32[$109>>2] = $110;
+    HEAP32[$108>>2] = $17;
     return;
    }
    $21 = $13 >>> 3;
@@ -16875,7 +16923,7 @@ function _free($0) {
     $25 = ((($16)) + 12|0);
     $26 = HEAP32[$25>>2]|0;
     $27 = $21 << 1;
-    $28 = (1920 + ($27<<2)|0);
+    $28 = (2184 + ($27<<2)|0);
     $29 = ($24|0)==($28|0);
     if (!($29)) {
      $30 = ($24>>>0)<($3>>>0);
@@ -16895,16 +16943,16 @@ function _free($0) {
     if ($34) {
      $35 = 1 << $21;
      $36 = $35 ^ -1;
-     $37 = HEAP32[470]|0;
+     $37 = HEAP32[536]|0;
      $38 = $37 & $36;
-     HEAP32[470] = $38;
-     $$1 = $16;$$1380 = $17;
+     HEAP32[536] = $38;
+     $$1 = $16;$$1382 = $17;$112 = $16;
      break;
     }
     $39 = ($26|0)==($28|0);
     if ($39) {
-     $$pre440 = ((($26)) + 8|0);
-     $$pre$phi441Z2D = $$pre440;
+     $$pre444 = ((($26)) + 8|0);
+     $$pre$phi445Z2D = $$pre444;
     } else {
      $40 = ($26>>>0)<($3>>>0);
      if ($40) {
@@ -16915,7 +16963,7 @@ function _free($0) {
      $42 = HEAP32[$41>>2]|0;
      $43 = ($42|0)==($16|0);
      if ($43) {
-      $$pre$phi441Z2D = $41;
+      $$pre$phi445Z2D = $41;
      } else {
       _abort();
       // unreachable;
@@ -16923,8 +16971,8 @@ function _free($0) {
     }
     $44 = ((($24)) + 12|0);
     HEAP32[$44>>2] = $26;
-    HEAP32[$$pre$phi441Z2D>>2] = $24;
-    $$1 = $16;$$1380 = $17;
+    HEAP32[$$pre$phi445Z2D>>2] = $24;
+    $$1 = $16;$$1382 = $17;$112 = $16;
     break;
    }
    $45 = ((($16)) + 24|0);
@@ -16945,35 +16993,35 @@ function _free($0) {
        $$3 = 0;
        break;
       } else {
-       $$1385 = $63;$$1388 = $59;
+       $$1387 = $63;$$1390 = $59;
       }
      } else {
-      $$1385 = $61;$$1388 = $60;
+      $$1387 = $61;$$1390 = $60;
      }
      while(1) {
-      $65 = ((($$1385)) + 20|0);
+      $65 = ((($$1387)) + 20|0);
       $66 = HEAP32[$65>>2]|0;
       $67 = ($66|0)==(0|0);
       if (!($67)) {
-       $$1385 = $66;$$1388 = $65;
+       $$1387 = $66;$$1390 = $65;
        continue;
       }
-      $68 = ((($$1385)) + 16|0);
+      $68 = ((($$1387)) + 16|0);
       $69 = HEAP32[$68>>2]|0;
       $70 = ($69|0)==(0|0);
       if ($70) {
        break;
       } else {
-       $$1385 = $69;$$1388 = $68;
+       $$1387 = $69;$$1390 = $68;
       }
      }
-     $71 = ($$1388>>>0)<($3>>>0);
+     $71 = ($$1390>>>0)<($3>>>0);
      if ($71) {
       _abort();
       // unreachable;
      } else {
-      HEAP32[$$1388>>2] = 0;
-      $$3 = $$1385;
+      HEAP32[$$1390>>2] = 0;
+      $$3 = $$1387;
       break;
      }
     } else {
@@ -17007,99 +17055,101 @@ function _free($0) {
    } while(0);
    $72 = ($46|0)==(0|0);
    if ($72) {
-    $$1 = $16;$$1380 = $17;
+    $$1 = $16;$$1382 = $17;$112 = $16;
    } else {
     $73 = ((($16)) + 28|0);
     $74 = HEAP32[$73>>2]|0;
-    $75 = (2184 + ($74<<2)|0);
+    $75 = (2448 + ($74<<2)|0);
     $76 = HEAP32[$75>>2]|0;
     $77 = ($16|0)==($76|0);
-    if ($77) {
-     HEAP32[$75>>2] = $$3;
-     $cond418 = ($$3|0)==(0|0);
-     if ($cond418) {
-      $78 = 1 << $74;
-      $79 = $78 ^ -1;
-      $80 = HEAP32[(1884)>>2]|0;
-      $81 = $80 & $79;
-      HEAP32[(1884)>>2] = $81;
-      $$1 = $16;$$1380 = $17;
-      break;
-     }
-    } else {
-     $82 = HEAP32[(1896)>>2]|0;
-     $83 = ($46>>>0)<($82>>>0);
-     if ($83) {
-      _abort();
-      // unreachable;
-     }
-     $84 = ((($46)) + 16|0);
-     $85 = HEAP32[$84>>2]|0;
-     $86 = ($85|0)==($16|0);
-     if ($86) {
-      HEAP32[$84>>2] = $$3;
-     } else {
-      $87 = ((($46)) + 20|0);
-      HEAP32[$87>>2] = $$3;
-     }
-     $88 = ($$3|0)==(0|0);
-     if ($88) {
-      $$1 = $16;$$1380 = $17;
-      break;
-     }
-    }
-    $89 = HEAP32[(1896)>>2]|0;
-    $90 = ($$3>>>0)<($89>>>0);
-    if ($90) {
-     _abort();
-     // unreachable;
-    }
-    $91 = ((($$3)) + 24|0);
-    HEAP32[$91>>2] = $46;
-    $92 = ((($16)) + 16|0);
-    $93 = HEAP32[$92>>2]|0;
-    $94 = ($93|0)==(0|0);
     do {
-     if (!($94)) {
-      $95 = ($93>>>0)<($89>>>0);
-      if ($95) {
+     if ($77) {
+      HEAP32[$75>>2] = $$3;
+      $cond421 = ($$3|0)==(0|0);
+      if ($cond421) {
+       $78 = 1 << $74;
+       $79 = $78 ^ -1;
+       $80 = HEAP32[(2148)>>2]|0;
+       $81 = $80 & $79;
+       HEAP32[(2148)>>2] = $81;
+       $$1 = $16;$$1382 = $17;$112 = $16;
+       break L10;
+      }
+     } else {
+      $82 = HEAP32[(2160)>>2]|0;
+      $83 = ($46>>>0)<($82>>>0);
+      if ($83) {
        _abort();
        // unreachable;
       } else {
-       $96 = ((($$3)) + 16|0);
-       HEAP32[$96>>2] = $93;
-       $97 = ((($93)) + 24|0);
-       HEAP32[$97>>2] = $$3;
+       $84 = ((($46)) + 16|0);
+       $85 = HEAP32[$84>>2]|0;
+       $not$405 = ($85|0)!=($16|0);
+       $$sink3 = $not$405&1;
+       $86 = (((($46)) + 16|0) + ($$sink3<<2)|0);
+       HEAP32[$86>>2] = $$3;
+       $87 = ($$3|0)==(0|0);
+       if ($87) {
+        $$1 = $16;$$1382 = $17;$112 = $16;
+        break L10;
+       } else {
+        break;
+       }
+      }
+     }
+    } while(0);
+    $88 = HEAP32[(2160)>>2]|0;
+    $89 = ($$3>>>0)<($88>>>0);
+    if ($89) {
+     _abort();
+     // unreachable;
+    }
+    $90 = ((($$3)) + 24|0);
+    HEAP32[$90>>2] = $46;
+    $91 = ((($16)) + 16|0);
+    $92 = HEAP32[$91>>2]|0;
+    $93 = ($92|0)==(0|0);
+    do {
+     if (!($93)) {
+      $94 = ($92>>>0)<($88>>>0);
+      if ($94) {
+       _abort();
+       // unreachable;
+      } else {
+       $95 = ((($$3)) + 16|0);
+       HEAP32[$95>>2] = $92;
+       $96 = ((($92)) + 24|0);
+       HEAP32[$96>>2] = $$3;
        break;
       }
      }
     } while(0);
-    $98 = ((($92)) + 4|0);
-    $99 = HEAP32[$98>>2]|0;
-    $100 = ($99|0)==(0|0);
-    if ($100) {
-     $$1 = $16;$$1380 = $17;
+    $97 = ((($91)) + 4|0);
+    $98 = HEAP32[$97>>2]|0;
+    $99 = ($98|0)==(0|0);
+    if ($99) {
+     $$1 = $16;$$1382 = $17;$112 = $16;
     } else {
-     $101 = HEAP32[(1896)>>2]|0;
-     $102 = ($99>>>0)<($101>>>0);
-     if ($102) {
+     $100 = HEAP32[(2160)>>2]|0;
+     $101 = ($98>>>0)<($100>>>0);
+     if ($101) {
       _abort();
       // unreachable;
      } else {
-      $103 = ((($$3)) + 20|0);
-      HEAP32[$103>>2] = $99;
-      $104 = ((($99)) + 24|0);
-      HEAP32[$104>>2] = $$3;
-      $$1 = $16;$$1380 = $17;
+      $102 = ((($$3)) + 20|0);
+      HEAP32[$102>>2] = $98;
+      $103 = ((($98)) + 24|0);
+      HEAP32[$103>>2] = $$3;
+      $$1 = $16;$$1382 = $17;$112 = $16;
       break;
      }
     }
    }
   } else {
-   $$1 = $2;$$1380 = $9;
+   $$1 = $2;$$1382 = $9;$112 = $2;
   }
  } while(0);
- $113 = ($$1>>>0)<($10>>>0);
+ $113 = ($112>>>0)<($10>>>0);
  if (!($113)) {
   _abort();
   // unreachable;
@@ -17115,174 +17165,173 @@ function _free($0) {
  $118 = $115 & 2;
  $119 = ($118|0)==(0);
  if ($119) {
-  $120 = HEAP32[(1904)>>2]|0;
+  $120 = HEAP32[(2168)>>2]|0;
   $121 = ($10|0)==($120|0);
+  $122 = HEAP32[(2164)>>2]|0;
   if ($121) {
-   $122 = HEAP32[(1892)>>2]|0;
-   $123 = (($122) + ($$1380))|0;
-   HEAP32[(1892)>>2] = $123;
-   HEAP32[(1904)>>2] = $$1;
-   $124 = $123 | 1;
-   $125 = ((($$1)) + 4|0);
-   HEAP32[$125>>2] = $124;
-   $126 = HEAP32[(1900)>>2]|0;
-   $127 = ($$1|0)==($126|0);
+   $123 = HEAP32[(2156)>>2]|0;
+   $124 = (($123) + ($$1382))|0;
+   HEAP32[(2156)>>2] = $124;
+   HEAP32[(2168)>>2] = $$1;
+   $125 = $124 | 1;
+   $126 = ((($$1)) + 4|0);
+   HEAP32[$126>>2] = $125;
+   $127 = ($$1|0)==($122|0);
    if (!($127)) {
     return;
    }
-   HEAP32[(1900)>>2] = 0;
-   HEAP32[(1888)>>2] = 0;
+   HEAP32[(2164)>>2] = 0;
+   HEAP32[(2152)>>2] = 0;
    return;
   }
-  $128 = HEAP32[(1900)>>2]|0;
-  $129 = ($10|0)==($128|0);
-  if ($129) {
-   $130 = HEAP32[(1888)>>2]|0;
-   $131 = (($130) + ($$1380))|0;
-   HEAP32[(1888)>>2] = $131;
-   HEAP32[(1900)>>2] = $$1;
-   $132 = $131 | 1;
-   $133 = ((($$1)) + 4|0);
-   HEAP32[$133>>2] = $132;
-   $134 = (($$1) + ($131)|0);
-   HEAP32[$134>>2] = $131;
+  $128 = ($10|0)==($122|0);
+  if ($128) {
+   $129 = HEAP32[(2152)>>2]|0;
+   $130 = (($129) + ($$1382))|0;
+   HEAP32[(2152)>>2] = $130;
+   HEAP32[(2164)>>2] = $112;
+   $131 = $130 | 1;
+   $132 = ((($$1)) + 4|0);
+   HEAP32[$132>>2] = $131;
+   $133 = (($112) + ($130)|0);
+   HEAP32[$133>>2] = $130;
    return;
   }
-  $135 = $115 & -8;
-  $136 = (($135) + ($$1380))|0;
-  $137 = $115 >>> 3;
-  $138 = ($115>>>0)<(256);
-  do {
-   if ($138) {
-    $139 = ((($10)) + 8|0);
-    $140 = HEAP32[$139>>2]|0;
-    $141 = ((($10)) + 12|0);
-    $142 = HEAP32[$141>>2]|0;
-    $143 = $137 << 1;
-    $144 = (1920 + ($143<<2)|0);
-    $145 = ($140|0)==($144|0);
-    if (!($145)) {
-     $146 = HEAP32[(1896)>>2]|0;
-     $147 = ($140>>>0)<($146>>>0);
-     if ($147) {
+  $134 = $115 & -8;
+  $135 = (($134) + ($$1382))|0;
+  $136 = $115 >>> 3;
+  $137 = ($115>>>0)<(256);
+  L108: do {
+   if ($137) {
+    $138 = ((($10)) + 8|0);
+    $139 = HEAP32[$138>>2]|0;
+    $140 = ((($10)) + 12|0);
+    $141 = HEAP32[$140>>2]|0;
+    $142 = $136 << 1;
+    $143 = (2184 + ($142<<2)|0);
+    $144 = ($139|0)==($143|0);
+    if (!($144)) {
+     $145 = HEAP32[(2160)>>2]|0;
+     $146 = ($139>>>0)<($145>>>0);
+     if ($146) {
       _abort();
       // unreachable;
      }
-     $148 = ((($140)) + 12|0);
-     $149 = HEAP32[$148>>2]|0;
-     $150 = ($149|0)==($10|0);
-     if (!($150)) {
+     $147 = ((($139)) + 12|0);
+     $148 = HEAP32[$147>>2]|0;
+     $149 = ($148|0)==($10|0);
+     if (!($149)) {
       _abort();
       // unreachable;
      }
     }
-    $151 = ($142|0)==($140|0);
-    if ($151) {
-     $152 = 1 << $137;
-     $153 = $152 ^ -1;
-     $154 = HEAP32[470]|0;
-     $155 = $154 & $153;
-     HEAP32[470] = $155;
+    $150 = ($141|0)==($139|0);
+    if ($150) {
+     $151 = 1 << $136;
+     $152 = $151 ^ -1;
+     $153 = HEAP32[536]|0;
+     $154 = $153 & $152;
+     HEAP32[536] = $154;
      break;
     }
-    $156 = ($142|0)==($144|0);
-    if ($156) {
-     $$pre438 = ((($142)) + 8|0);
-     $$pre$phi439Z2D = $$pre438;
+    $155 = ($141|0)==($143|0);
+    if ($155) {
+     $$pre442 = ((($141)) + 8|0);
+     $$pre$phi443Z2D = $$pre442;
     } else {
-     $157 = HEAP32[(1896)>>2]|0;
-     $158 = ($142>>>0)<($157>>>0);
-     if ($158) {
+     $156 = HEAP32[(2160)>>2]|0;
+     $157 = ($141>>>0)<($156>>>0);
+     if ($157) {
       _abort();
       // unreachable;
      }
-     $159 = ((($142)) + 8|0);
-     $160 = HEAP32[$159>>2]|0;
-     $161 = ($160|0)==($10|0);
-     if ($161) {
-      $$pre$phi439Z2D = $159;
+     $158 = ((($141)) + 8|0);
+     $159 = HEAP32[$158>>2]|0;
+     $160 = ($159|0)==($10|0);
+     if ($160) {
+      $$pre$phi443Z2D = $158;
      } else {
       _abort();
       // unreachable;
      }
     }
-    $162 = ((($140)) + 12|0);
-    HEAP32[$162>>2] = $142;
-    HEAP32[$$pre$phi439Z2D>>2] = $140;
+    $161 = ((($139)) + 12|0);
+    HEAP32[$161>>2] = $141;
+    HEAP32[$$pre$phi443Z2D>>2] = $139;
    } else {
-    $163 = ((($10)) + 24|0);
-    $164 = HEAP32[$163>>2]|0;
-    $165 = ((($10)) + 12|0);
-    $166 = HEAP32[$165>>2]|0;
-    $167 = ($166|0)==($10|0);
+    $162 = ((($10)) + 24|0);
+    $163 = HEAP32[$162>>2]|0;
+    $164 = ((($10)) + 12|0);
+    $165 = HEAP32[$164>>2]|0;
+    $166 = ($165|0)==($10|0);
     do {
-     if ($167) {
-      $178 = ((($10)) + 16|0);
-      $179 = ((($178)) + 4|0);
-      $180 = HEAP32[$179>>2]|0;
-      $181 = ($180|0)==(0|0);
-      if ($181) {
-       $182 = HEAP32[$178>>2]|0;
-       $183 = ($182|0)==(0|0);
-       if ($183) {
-        $$3398 = 0;
+     if ($166) {
+      $177 = ((($10)) + 16|0);
+      $178 = ((($177)) + 4|0);
+      $179 = HEAP32[$178>>2]|0;
+      $180 = ($179|0)==(0|0);
+      if ($180) {
+       $181 = HEAP32[$177>>2]|0;
+       $182 = ($181|0)==(0|0);
+       if ($182) {
+        $$3400 = 0;
         break;
        } else {
-        $$1396 = $182;$$1400 = $178;
+        $$1398 = $181;$$1402 = $177;
        }
       } else {
-       $$1396 = $180;$$1400 = $179;
+       $$1398 = $179;$$1402 = $178;
       }
       while(1) {
-       $184 = ((($$1396)) + 20|0);
-       $185 = HEAP32[$184>>2]|0;
-       $186 = ($185|0)==(0|0);
-       if (!($186)) {
-        $$1396 = $185;$$1400 = $184;
+       $183 = ((($$1398)) + 20|0);
+       $184 = HEAP32[$183>>2]|0;
+       $185 = ($184|0)==(0|0);
+       if (!($185)) {
+        $$1398 = $184;$$1402 = $183;
         continue;
        }
-       $187 = ((($$1396)) + 16|0);
-       $188 = HEAP32[$187>>2]|0;
-       $189 = ($188|0)==(0|0);
-       if ($189) {
+       $186 = ((($$1398)) + 16|0);
+       $187 = HEAP32[$186>>2]|0;
+       $188 = ($187|0)==(0|0);
+       if ($188) {
         break;
        } else {
-        $$1396 = $188;$$1400 = $187;
+        $$1398 = $187;$$1402 = $186;
        }
       }
-      $190 = HEAP32[(1896)>>2]|0;
-      $191 = ($$1400>>>0)<($190>>>0);
-      if ($191) {
+      $189 = HEAP32[(2160)>>2]|0;
+      $190 = ($$1402>>>0)<($189>>>0);
+      if ($190) {
        _abort();
        // unreachable;
       } else {
-       HEAP32[$$1400>>2] = 0;
-       $$3398 = $$1396;
+       HEAP32[$$1402>>2] = 0;
+       $$3400 = $$1398;
        break;
       }
      } else {
-      $168 = ((($10)) + 8|0);
-      $169 = HEAP32[$168>>2]|0;
-      $170 = HEAP32[(1896)>>2]|0;
-      $171 = ($169>>>0)<($170>>>0);
-      if ($171) {
+      $167 = ((($10)) + 8|0);
+      $168 = HEAP32[$167>>2]|0;
+      $169 = HEAP32[(2160)>>2]|0;
+      $170 = ($168>>>0)<($169>>>0);
+      if ($170) {
        _abort();
        // unreachable;
       }
-      $172 = ((($169)) + 12|0);
-      $173 = HEAP32[$172>>2]|0;
-      $174 = ($173|0)==($10|0);
-      if (!($174)) {
+      $171 = ((($168)) + 12|0);
+      $172 = HEAP32[$171>>2]|0;
+      $173 = ($172|0)==($10|0);
+      if (!($173)) {
        _abort();
        // unreachable;
       }
-      $175 = ((($166)) + 8|0);
-      $176 = HEAP32[$175>>2]|0;
-      $177 = ($176|0)==($10|0);
-      if ($177) {
-       HEAP32[$172>>2] = $166;
-       HEAP32[$175>>2] = $169;
-       $$3398 = $166;
+      $174 = ((($165)) + 8|0);
+      $175 = HEAP32[$174>>2]|0;
+      $176 = ($175|0)==($10|0);
+      if ($176) {
+       HEAP32[$171>>2] = $165;
+       HEAP32[$174>>2] = $168;
+       $$3400 = $165;
        break;
       } else {
        _abort();
@@ -17290,268 +17339,270 @@ function _free($0) {
       }
      }
     } while(0);
-    $192 = ($164|0)==(0|0);
-    if (!($192)) {
-     $193 = ((($10)) + 28|0);
-     $194 = HEAP32[$193>>2]|0;
-     $195 = (2184 + ($194<<2)|0);
-     $196 = HEAP32[$195>>2]|0;
-     $197 = ($10|0)==($196|0);
-     if ($197) {
-      HEAP32[$195>>2] = $$3398;
-      $cond419 = ($$3398|0)==(0|0);
-      if ($cond419) {
-       $198 = 1 << $194;
-       $199 = $198 ^ -1;
-       $200 = HEAP32[(1884)>>2]|0;
-       $201 = $200 & $199;
-       HEAP32[(1884)>>2] = $201;
-       break;
-      }
-     } else {
-      $202 = HEAP32[(1896)>>2]|0;
-      $203 = ($164>>>0)<($202>>>0);
-      if ($203) {
-       _abort();
-       // unreachable;
-      }
-      $204 = ((($164)) + 16|0);
-      $205 = HEAP32[$204>>2]|0;
-      $206 = ($205|0)==($10|0);
-      if ($206) {
-       HEAP32[$204>>2] = $$3398;
-      } else {
-       $207 = ((($164)) + 20|0);
-       HEAP32[$207>>2] = $$3398;
-      }
-      $208 = ($$3398|0)==(0|0);
-      if ($208) {
-       break;
-      }
-     }
-     $209 = HEAP32[(1896)>>2]|0;
-     $210 = ($$3398>>>0)<($209>>>0);
-     if ($210) {
-      _abort();
-      // unreachable;
-     }
-     $211 = ((($$3398)) + 24|0);
-     HEAP32[$211>>2] = $164;
-     $212 = ((($10)) + 16|0);
-     $213 = HEAP32[$212>>2]|0;
-     $214 = ($213|0)==(0|0);
+    $191 = ($163|0)==(0|0);
+    if (!($191)) {
+     $192 = ((($10)) + 28|0);
+     $193 = HEAP32[$192>>2]|0;
+     $194 = (2448 + ($193<<2)|0);
+     $195 = HEAP32[$194>>2]|0;
+     $196 = ($10|0)==($195|0);
      do {
-      if (!($214)) {
-       $215 = ($213>>>0)<($209>>>0);
-       if ($215) {
+      if ($196) {
+       HEAP32[$194>>2] = $$3400;
+       $cond422 = ($$3400|0)==(0|0);
+       if ($cond422) {
+        $197 = 1 << $193;
+        $198 = $197 ^ -1;
+        $199 = HEAP32[(2148)>>2]|0;
+        $200 = $199 & $198;
+        HEAP32[(2148)>>2] = $200;
+        break L108;
+       }
+      } else {
+       $201 = HEAP32[(2160)>>2]|0;
+       $202 = ($163>>>0)<($201>>>0);
+       if ($202) {
         _abort();
         // unreachable;
        } else {
-        $216 = ((($$3398)) + 16|0);
-        HEAP32[$216>>2] = $213;
-        $217 = ((($213)) + 24|0);
-        HEAP32[$217>>2] = $$3398;
+        $203 = ((($163)) + 16|0);
+        $204 = HEAP32[$203>>2]|0;
+        $not$ = ($204|0)!=($10|0);
+        $$sink5 = $not$&1;
+        $205 = (((($163)) + 16|0) + ($$sink5<<2)|0);
+        HEAP32[$205>>2] = $$3400;
+        $206 = ($$3400|0)==(0|0);
+        if ($206) {
+         break L108;
+        } else {
+         break;
+        }
+       }
+      }
+     } while(0);
+     $207 = HEAP32[(2160)>>2]|0;
+     $208 = ($$3400>>>0)<($207>>>0);
+     if ($208) {
+      _abort();
+      // unreachable;
+     }
+     $209 = ((($$3400)) + 24|0);
+     HEAP32[$209>>2] = $163;
+     $210 = ((($10)) + 16|0);
+     $211 = HEAP32[$210>>2]|0;
+     $212 = ($211|0)==(0|0);
+     do {
+      if (!($212)) {
+       $213 = ($211>>>0)<($207>>>0);
+       if ($213) {
+        _abort();
+        // unreachable;
+       } else {
+        $214 = ((($$3400)) + 16|0);
+        HEAP32[$214>>2] = $211;
+        $215 = ((($211)) + 24|0);
+        HEAP32[$215>>2] = $$3400;
         break;
        }
       }
      } while(0);
-     $218 = ((($212)) + 4|0);
-     $219 = HEAP32[$218>>2]|0;
-     $220 = ($219|0)==(0|0);
-     if (!($220)) {
-      $221 = HEAP32[(1896)>>2]|0;
-      $222 = ($219>>>0)<($221>>>0);
-      if ($222) {
+     $216 = ((($210)) + 4|0);
+     $217 = HEAP32[$216>>2]|0;
+     $218 = ($217|0)==(0|0);
+     if (!($218)) {
+      $219 = HEAP32[(2160)>>2]|0;
+      $220 = ($217>>>0)<($219>>>0);
+      if ($220) {
        _abort();
        // unreachable;
       } else {
-       $223 = ((($$3398)) + 20|0);
-       HEAP32[$223>>2] = $219;
-       $224 = ((($219)) + 24|0);
-       HEAP32[$224>>2] = $$3398;
+       $221 = ((($$3400)) + 20|0);
+       HEAP32[$221>>2] = $217;
+       $222 = ((($217)) + 24|0);
+       HEAP32[$222>>2] = $$3400;
        break;
       }
      }
     }
    }
   } while(0);
-  $225 = $136 | 1;
-  $226 = ((($$1)) + 4|0);
-  HEAP32[$226>>2] = $225;
-  $227 = (($$1) + ($136)|0);
-  HEAP32[$227>>2] = $136;
-  $228 = HEAP32[(1900)>>2]|0;
-  $229 = ($$1|0)==($228|0);
-  if ($229) {
-   HEAP32[(1888)>>2] = $136;
+  $223 = $135 | 1;
+  $224 = ((($$1)) + 4|0);
+  HEAP32[$224>>2] = $223;
+  $225 = (($112) + ($135)|0);
+  HEAP32[$225>>2] = $135;
+  $226 = HEAP32[(2164)>>2]|0;
+  $227 = ($$1|0)==($226|0);
+  if ($227) {
+   HEAP32[(2152)>>2] = $135;
    return;
   } else {
-   $$2 = $136;
+   $$2 = $135;
   }
  } else {
-  $230 = $115 & -2;
-  HEAP32[$114>>2] = $230;
-  $231 = $$1380 | 1;
-  $232 = ((($$1)) + 4|0);
-  HEAP32[$232>>2] = $231;
-  $233 = (($$1) + ($$1380)|0);
-  HEAP32[$233>>2] = $$1380;
-  $$2 = $$1380;
+  $228 = $115 & -2;
+  HEAP32[$114>>2] = $228;
+  $229 = $$1382 | 1;
+  $230 = ((($$1)) + 4|0);
+  HEAP32[$230>>2] = $229;
+  $231 = (($112) + ($$1382)|0);
+  HEAP32[$231>>2] = $$1382;
+  $$2 = $$1382;
  }
- $234 = $$2 >>> 3;
- $235 = ($$2>>>0)<(256);
- if ($235) {
-  $236 = $234 << 1;
-  $237 = (1920 + ($236<<2)|0);
-  $238 = HEAP32[470]|0;
-  $239 = 1 << $234;
-  $240 = $238 & $239;
-  $241 = ($240|0)==(0);
-  if ($241) {
-   $242 = $238 | $239;
-   HEAP32[470] = $242;
-   $$pre = ((($237)) + 8|0);
-   $$0401 = $237;$$pre$phiZ2D = $$pre;
+ $232 = $$2 >>> 3;
+ $233 = ($$2>>>0)<(256);
+ if ($233) {
+  $234 = $232 << 1;
+  $235 = (2184 + ($234<<2)|0);
+  $236 = HEAP32[536]|0;
+  $237 = 1 << $232;
+  $238 = $236 & $237;
+  $239 = ($238|0)==(0);
+  if ($239) {
+   $240 = $236 | $237;
+   HEAP32[536] = $240;
+   $$pre = ((($235)) + 8|0);
+   $$0403 = $235;$$pre$phiZ2D = $$pre;
   } else {
-   $243 = ((($237)) + 8|0);
-   $244 = HEAP32[$243>>2]|0;
-   $245 = HEAP32[(1896)>>2]|0;
-   $246 = ($244>>>0)<($245>>>0);
-   if ($246) {
+   $241 = ((($235)) + 8|0);
+   $242 = HEAP32[$241>>2]|0;
+   $243 = HEAP32[(2160)>>2]|0;
+   $244 = ($242>>>0)<($243>>>0);
+   if ($244) {
     _abort();
     // unreachable;
    } else {
-    $$0401 = $244;$$pre$phiZ2D = $243;
+    $$0403 = $242;$$pre$phiZ2D = $241;
    }
   }
   HEAP32[$$pre$phiZ2D>>2] = $$1;
-  $247 = ((($$0401)) + 12|0);
-  HEAP32[$247>>2] = $$1;
-  $248 = ((($$1)) + 8|0);
-  HEAP32[$248>>2] = $$0401;
-  $249 = ((($$1)) + 12|0);
-  HEAP32[$249>>2] = $237;
+  $245 = ((($$0403)) + 12|0);
+  HEAP32[$245>>2] = $$1;
+  $246 = ((($$1)) + 8|0);
+  HEAP32[$246>>2] = $$0403;
+  $247 = ((($$1)) + 12|0);
+  HEAP32[$247>>2] = $235;
   return;
  }
- $250 = $$2 >>> 8;
- $251 = ($250|0)==(0);
- if ($251) {
-  $$0394 = 0;
+ $248 = $$2 >>> 8;
+ $249 = ($248|0)==(0);
+ if ($249) {
+  $$0396 = 0;
  } else {
-  $252 = ($$2>>>0)>(16777215);
-  if ($252) {
-   $$0394 = 31;
+  $250 = ($$2>>>0)>(16777215);
+  if ($250) {
+   $$0396 = 31;
   } else {
-   $253 = (($250) + 1048320)|0;
-   $254 = $253 >>> 16;
-   $255 = $254 & 8;
-   $256 = $250 << $255;
-   $257 = (($256) + 520192)|0;
-   $258 = $257 >>> 16;
-   $259 = $258 & 4;
-   $260 = $259 | $255;
-   $261 = $256 << $259;
-   $262 = (($261) + 245760)|0;
-   $263 = $262 >>> 16;
-   $264 = $263 & 2;
-   $265 = $260 | $264;
-   $266 = (14 - ($265))|0;
-   $267 = $261 << $264;
-   $268 = $267 >>> 15;
-   $269 = (($266) + ($268))|0;
-   $270 = $269 << 1;
-   $271 = (($269) + 7)|0;
-   $272 = $$2 >>> $271;
-   $273 = $272 & 1;
-   $274 = $273 | $270;
-   $$0394 = $274;
+   $251 = (($248) + 1048320)|0;
+   $252 = $251 >>> 16;
+   $253 = $252 & 8;
+   $254 = $248 << $253;
+   $255 = (($254) + 520192)|0;
+   $256 = $255 >>> 16;
+   $257 = $256 & 4;
+   $258 = $257 | $253;
+   $259 = $254 << $257;
+   $260 = (($259) + 245760)|0;
+   $261 = $260 >>> 16;
+   $262 = $261 & 2;
+   $263 = $258 | $262;
+   $264 = (14 - ($263))|0;
+   $265 = $259 << $262;
+   $266 = $265 >>> 15;
+   $267 = (($264) + ($266))|0;
+   $268 = $267 << 1;
+   $269 = (($267) + 7)|0;
+   $270 = $$2 >>> $269;
+   $271 = $270 & 1;
+   $272 = $271 | $268;
+   $$0396 = $272;
   }
  }
- $275 = (2184 + ($$0394<<2)|0);
- $276 = ((($$1)) + 28|0);
- HEAP32[$276>>2] = $$0394;
- $277 = ((($$1)) + 16|0);
- $278 = ((($$1)) + 20|0);
- HEAP32[$278>>2] = 0;
- HEAP32[$277>>2] = 0;
- $279 = HEAP32[(1884)>>2]|0;
- $280 = 1 << $$0394;
- $281 = $279 & $280;
- $282 = ($281|0)==(0);
+ $273 = (2448 + ($$0396<<2)|0);
+ $274 = ((($$1)) + 28|0);
+ HEAP32[$274>>2] = $$0396;
+ $275 = ((($$1)) + 16|0);
+ $276 = ((($$1)) + 20|0);
+ HEAP32[$276>>2] = 0;
+ HEAP32[$275>>2] = 0;
+ $277 = HEAP32[(2148)>>2]|0;
+ $278 = 1 << $$0396;
+ $279 = $277 & $278;
+ $280 = ($279|0)==(0);
  do {
-  if ($282) {
-   $283 = $279 | $280;
-   HEAP32[(1884)>>2] = $283;
-   HEAP32[$275>>2] = $$1;
-   $284 = ((($$1)) + 24|0);
-   HEAP32[$284>>2] = $275;
-   $285 = ((($$1)) + 12|0);
-   HEAP32[$285>>2] = $$1;
-   $286 = ((($$1)) + 8|0);
-   HEAP32[$286>>2] = $$1;
+  if ($280) {
+   $281 = $277 | $278;
+   HEAP32[(2148)>>2] = $281;
+   HEAP32[$273>>2] = $$1;
+   $282 = ((($$1)) + 24|0);
+   HEAP32[$282>>2] = $273;
+   $283 = ((($$1)) + 12|0);
+   HEAP32[$283>>2] = $$1;
+   $284 = ((($$1)) + 8|0);
+   HEAP32[$284>>2] = $$1;
   } else {
-   $287 = HEAP32[$275>>2]|0;
-   $288 = ($$0394|0)==(31);
-   $289 = $$0394 >>> 1;
-   $290 = (25 - ($289))|0;
-   $291 = $288 ? 0 : $290;
-   $292 = $$2 << $291;
-   $$0381 = $292;$$0382 = $287;
+   $285 = HEAP32[$273>>2]|0;
+   $286 = ($$0396|0)==(31);
+   $287 = $$0396 >>> 1;
+   $288 = (25 - ($287))|0;
+   $289 = $286 ? 0 : $288;
+   $290 = $$2 << $289;
+   $$0383 = $290;$$0384 = $285;
    while(1) {
-    $293 = ((($$0382)) + 4|0);
-    $294 = HEAP32[$293>>2]|0;
-    $295 = $294 & -8;
-    $296 = ($295|0)==($$2|0);
-    if ($296) {
-     label = 130;
+    $291 = ((($$0384)) + 4|0);
+    $292 = HEAP32[$291>>2]|0;
+    $293 = $292 & -8;
+    $294 = ($293|0)==($$2|0);
+    if ($294) {
+     label = 124;
      break;
     }
-    $297 = $$0381 >>> 31;
-    $298 = (((($$0382)) + 16|0) + ($297<<2)|0);
-    $299 = $$0381 << 1;
-    $300 = HEAP32[$298>>2]|0;
-    $301 = ($300|0)==(0|0);
-    if ($301) {
-     label = 127;
+    $295 = $$0383 >>> 31;
+    $296 = (((($$0384)) + 16|0) + ($295<<2)|0);
+    $297 = $$0383 << 1;
+    $298 = HEAP32[$296>>2]|0;
+    $299 = ($298|0)==(0|0);
+    if ($299) {
+     label = 121;
      break;
     } else {
-     $$0381 = $299;$$0382 = $300;
+     $$0383 = $297;$$0384 = $298;
     }
    }
-   if ((label|0) == 127) {
-    $302 = HEAP32[(1896)>>2]|0;
-    $303 = ($298>>>0)<($302>>>0);
-    if ($303) {
+   if ((label|0) == 121) {
+    $300 = HEAP32[(2160)>>2]|0;
+    $301 = ($296>>>0)<($300>>>0);
+    if ($301) {
      _abort();
      // unreachable;
     } else {
-     HEAP32[$298>>2] = $$1;
-     $304 = ((($$1)) + 24|0);
-     HEAP32[$304>>2] = $$0382;
-     $305 = ((($$1)) + 12|0);
-     HEAP32[$305>>2] = $$1;
-     $306 = ((($$1)) + 8|0);
-     HEAP32[$306>>2] = $$1;
+     HEAP32[$296>>2] = $$1;
+     $302 = ((($$1)) + 24|0);
+     HEAP32[$302>>2] = $$0384;
+     $303 = ((($$1)) + 12|0);
+     HEAP32[$303>>2] = $$1;
+     $304 = ((($$1)) + 8|0);
+     HEAP32[$304>>2] = $$1;
      break;
     }
    }
-   else if ((label|0) == 130) {
-    $307 = ((($$0382)) + 8|0);
-    $308 = HEAP32[$307>>2]|0;
-    $309 = HEAP32[(1896)>>2]|0;
-    $310 = ($308>>>0)>=($309>>>0);
-    $not$ = ($$0382>>>0)>=($309>>>0);
-    $311 = $310 & $not$;
-    if ($311) {
-     $312 = ((($308)) + 12|0);
-     HEAP32[$312>>2] = $$1;
-     HEAP32[$307>>2] = $$1;
-     $313 = ((($$1)) + 8|0);
-     HEAP32[$313>>2] = $308;
-     $314 = ((($$1)) + 12|0);
-     HEAP32[$314>>2] = $$0382;
-     $315 = ((($$1)) + 24|0);
-     HEAP32[$315>>2] = 0;
+   else if ((label|0) == 124) {
+    $305 = ((($$0384)) + 8|0);
+    $306 = HEAP32[$305>>2]|0;
+    $307 = HEAP32[(2160)>>2]|0;
+    $308 = ($306>>>0)>=($307>>>0);
+    $not$437 = ($$0384>>>0)>=($307>>>0);
+    $309 = $308 & $not$437;
+    if ($309) {
+     $310 = ((($306)) + 12|0);
+     HEAP32[$310>>2] = $$1;
+     HEAP32[$305>>2] = $$1;
+     $311 = ((($$1)) + 8|0);
+     HEAP32[$311>>2] = $306;
+     $312 = ((($$1)) + 12|0);
+     HEAP32[$312>>2] = $$0384;
+     $313 = ((($$1)) + 24|0);
+     HEAP32[$313>>2] = 0;
      break;
     } else {
      _abort();
@@ -17560,26 +17611,26 @@ function _free($0) {
    }
   }
  } while(0);
- $316 = HEAP32[(1912)>>2]|0;
- $317 = (($316) + -1)|0;
- HEAP32[(1912)>>2] = $317;
- $318 = ($317|0)==(0);
- if ($318) {
-  $$0211$in$i = (2336);
+ $314 = HEAP32[(2176)>>2]|0;
+ $315 = (($314) + -1)|0;
+ HEAP32[(2176)>>2] = $315;
+ $316 = ($315|0)==(0);
+ if ($316) {
+  $$0212$in$i = (2600);
  } else {
   return;
  }
  while(1) {
-  $$0211$i = HEAP32[$$0211$in$i>>2]|0;
-  $319 = ($$0211$i|0)==(0|0);
-  $320 = ((($$0211$i)) + 8|0);
-  if ($319) {
+  $$0212$i = HEAP32[$$0212$in$i>>2]|0;
+  $317 = ($$0212$i|0)==(0|0);
+  $318 = ((($$0212$i)) + 8|0);
+  if ($317) {
    break;
   } else {
-   $$0211$in$i = $320;
+   $$0212$in$i = $318;
   }
  }
- HEAP32[(1912)>>2] = -1;
+ HEAP32[(2176)>>2] = -1;
  return;
 }
 function runPostSets() {
@@ -17606,31 +17657,51 @@ function _i64Add(a, b, c, d) {
 }
 function _memset(ptr, value, num) {
     ptr = ptr|0; value = value|0; num = num|0;
-    var stop = 0, value4 = 0, stop4 = 0, unaligned = 0;
-    stop = (ptr + num)|0;
-    if ((num|0) >= 20) {
-      // This is unaligned, but quite large, so work hard to get to aligned settings
-      value = value & 0xff;
-      unaligned = ptr & 3;
-      value4 = value | (value << 8) | (value << 16) | (value << 24);
-      stop4 = stop & ~3;
-      if (unaligned) {
-        unaligned = (ptr + 4 - unaligned)|0;
-        while ((ptr|0) < (unaligned|0)) { // no need to check for stop, since we have large num
-          HEAP8[((ptr)>>0)]=value;
-          ptr = (ptr+1)|0;
-        }
+    var end = 0, aligned_end = 0, block_aligned_end = 0, value4 = 0;
+    end = (ptr + num)|0;
+
+    value = value & 0xff;
+    if ((num|0) >= 67 /* 64 bytes for an unrolled loop + 3 bytes for unaligned head*/) {
+      while ((ptr&3) != 0) {
+        HEAP8[((ptr)>>0)]=value;
+        ptr = (ptr+1)|0;
       }
-      while ((ptr|0) < (stop4|0)) {
+
+      aligned_end = (end & -4)|0;
+      block_aligned_end = (aligned_end - 64)|0;
+      value4 = value | (value << 8) | (value << 16) | (value << 24);
+
+      while((ptr|0) <= (block_aligned_end|0)) {
+        HEAP32[((ptr)>>2)]=value4;
+        HEAP32[(((ptr)+(4))>>2)]=value4;
+        HEAP32[(((ptr)+(8))>>2)]=value4;
+        HEAP32[(((ptr)+(12))>>2)]=value4;
+        HEAP32[(((ptr)+(16))>>2)]=value4;
+        HEAP32[(((ptr)+(20))>>2)]=value4;
+        HEAP32[(((ptr)+(24))>>2)]=value4;
+        HEAP32[(((ptr)+(28))>>2)]=value4;
+        HEAP32[(((ptr)+(32))>>2)]=value4;
+        HEAP32[(((ptr)+(36))>>2)]=value4;
+        HEAP32[(((ptr)+(40))>>2)]=value4;
+        HEAP32[(((ptr)+(44))>>2)]=value4;
+        HEAP32[(((ptr)+(48))>>2)]=value4;
+        HEAP32[(((ptr)+(52))>>2)]=value4;
+        HEAP32[(((ptr)+(56))>>2)]=value4;
+        HEAP32[(((ptr)+(60))>>2)]=value4;
+        ptr = (ptr + 64)|0;
+      }
+
+      while ((ptr|0) < (aligned_end|0) ) {
         HEAP32[((ptr)>>2)]=value4;
         ptr = (ptr+4)|0;
       }
     }
-    while ((ptr|0) < (stop|0)) {
+    // The remaining bytes.
+    while ((ptr|0) < (end|0)) {
       HEAP8[((ptr)>>0)]=value;
       ptr = (ptr+1)|0;
     }
-    return (ptr-num)|0;
+    return (end-num)|0;
 }
 function _bitshift64Lshr(low, high, bits) {
     low = low|0; high = high|0; bits = bits|0;
@@ -17657,9 +17728,20 @@ function _bitshift64Shl(low, high, bits) {
 function _memcpy(dest, src, num) {
     dest = dest|0; src = src|0; num = num|0;
     var ret = 0;
-    if ((num|0) >= 4096) return _emscripten_memcpy_big(dest|0, src|0, num|0)|0;
+    var aligned_dest_end = 0;
+    var block_aligned_dest_end = 0;
+    var dest_end = 0;
+    // Test against a benchmarked cutoff limit for when HEAPU8.set() becomes faster to use.
+    if ((num|0) >=
+      8192
+    ) {
+      return _emscripten_memcpy_big(dest|0, src|0, num|0)|0;
+    }
+
     ret = dest|0;
+    dest_end = (dest + num)|0;
     if ((dest&3) == (src&3)) {
+      // The initial unaligned < 4-byte front.
       while (dest & 3) {
         if ((num|0) == 0) return ret|0;
         HEAP8[((dest)>>0)]=((HEAP8[((src)>>0)])|0);
@@ -17667,18 +17749,50 @@ function _memcpy(dest, src, num) {
         src = (src+1)|0;
         num = (num-1)|0;
       }
-      while ((num|0) >= 4) {
+      aligned_dest_end = (dest_end & -4)|0;
+      block_aligned_dest_end = (aligned_dest_end - 64)|0;
+      while ((dest|0) <= (block_aligned_dest_end|0) ) {
+        HEAP32[((dest)>>2)]=((HEAP32[((src)>>2)])|0);
+        HEAP32[(((dest)+(4))>>2)]=((HEAP32[(((src)+(4))>>2)])|0);
+        HEAP32[(((dest)+(8))>>2)]=((HEAP32[(((src)+(8))>>2)])|0);
+        HEAP32[(((dest)+(12))>>2)]=((HEAP32[(((src)+(12))>>2)])|0);
+        HEAP32[(((dest)+(16))>>2)]=((HEAP32[(((src)+(16))>>2)])|0);
+        HEAP32[(((dest)+(20))>>2)]=((HEAP32[(((src)+(20))>>2)])|0);
+        HEAP32[(((dest)+(24))>>2)]=((HEAP32[(((src)+(24))>>2)])|0);
+        HEAP32[(((dest)+(28))>>2)]=((HEAP32[(((src)+(28))>>2)])|0);
+        HEAP32[(((dest)+(32))>>2)]=((HEAP32[(((src)+(32))>>2)])|0);
+        HEAP32[(((dest)+(36))>>2)]=((HEAP32[(((src)+(36))>>2)])|0);
+        HEAP32[(((dest)+(40))>>2)]=((HEAP32[(((src)+(40))>>2)])|0);
+        HEAP32[(((dest)+(44))>>2)]=((HEAP32[(((src)+(44))>>2)])|0);
+        HEAP32[(((dest)+(48))>>2)]=((HEAP32[(((src)+(48))>>2)])|0);
+        HEAP32[(((dest)+(52))>>2)]=((HEAP32[(((src)+(52))>>2)])|0);
+        HEAP32[(((dest)+(56))>>2)]=((HEAP32[(((src)+(56))>>2)])|0);
+        HEAP32[(((dest)+(60))>>2)]=((HEAP32[(((src)+(60))>>2)])|0);
+        dest = (dest+64)|0;
+        src = (src+64)|0;
+      }
+      while ((dest|0) < (aligned_dest_end|0) ) {
         HEAP32[((dest)>>2)]=((HEAP32[((src)>>2)])|0);
         dest = (dest+4)|0;
         src = (src+4)|0;
-        num = (num-4)|0;
+      }
+    } else {
+      // In the unaligned copy case, unroll a bit as well.
+      aligned_dest_end = (dest_end - 4)|0;
+      while ((dest|0) < (aligned_dest_end|0) ) {
+        HEAP8[((dest)>>0)]=((HEAP8[((src)>>0)])|0);
+        HEAP8[(((dest)+(1))>>0)]=((HEAP8[(((src)+(1))>>0)])|0);
+        HEAP8[(((dest)+(2))>>0)]=((HEAP8[(((src)+(2))>>0)])|0);
+        HEAP8[(((dest)+(3))>>0)]=((HEAP8[(((src)+(3))>>0)])|0);
+        dest = (dest+4)|0;
+        src = (src+4)|0;
       }
     }
-    while ((num|0) > 0) {
+    // The remaining unaligned < 4 byte tail.
+    while ((dest|0) < (dest_end|0)) {
       HEAP8[((dest)>>0)]=((HEAP8[((src)>>0)])|0);
       dest = (dest+1)|0;
       src = (src+1)|0;
-      num = (num-1)|0;
     }
     return ret|0;
 }
@@ -17967,9 +18081,6 @@ function ___uremdi3($a$0, $a$1, $b$0, $b$1) {
     STACKTOP = __stackBase__;
     return (tempRet0 = HEAP32[$rem + 4 >> 2] | 0, HEAP32[$rem >> 2] | 0) | 0;
 }
-function _pthread_self() {
-    return 0;
-}
 
   
 
@@ -17977,47 +18088,56 @@ function _pthread_self() {
 // EMSCRIPTEN_END_FUNCS
 
 
-  return { _llvm_cttz_i32: _llvm_cttz_i32, _sphincsjs_secret_key_bytes: _sphincsjs_secret_key_bytes, _bitshift64Lshr: _bitshift64Lshr, _sphincsjs_signature_bytes: _sphincsjs_signature_bytes, _bitshift64Shl: _bitshift64Shl, _memset: _memset, _sbrk: _sbrk, _memcpy: _memcpy, ___muldi3: ___muldi3, ___uremdi3: ___uremdi3, _crypto_sign_sphincs_open: _crypto_sign_sphincs_open, _i64Subtract: _i64Subtract, ___udivmoddi4: ___udivmoddi4, _randombytes_stir: _randombytes_stir, _i64Add: _i64Add, _crypto_sign_sphincs_keypair: _crypto_sign_sphincs_keypair, _pthread_self: _pthread_self, ___muldsi3: ___muldsi3, _crypto_sign_sphincs: _crypto_sign_sphincs, _free: _free, _sphincsjs_public_key_bytes: _sphincsjs_public_key_bytes, _malloc: _malloc, runPostSets: runPostSets, stackAlloc: stackAlloc, stackSave: stackSave, stackRestore: stackRestore, establishStackSpace: establishStackSpace, setThrew: setThrew, setTempRet0: setTempRet0, getTempRet0: getTempRet0 };
+  return { _llvm_cttz_i32: _llvm_cttz_i32, _sphincsjs_secret_key_bytes: _sphincsjs_secret_key_bytes, _bitshift64Lshr: _bitshift64Lshr, _sphincsjs_signature_bytes: _sphincsjs_signature_bytes, _bitshift64Shl: _bitshift64Shl, _memset: _memset, _sbrk: _sbrk, _memcpy: _memcpy, ___muldi3: ___muldi3, ___uremdi3: ___uremdi3, _crypto_sign_sphincs_open: _crypto_sign_sphincs_open, _i64Subtract: _i64Subtract, ___udivmoddi4: ___udivmoddi4, _randombytes_stir: _randombytes_stir, _i64Add: _i64Add, _crypto_sign_sphincs_keypair: _crypto_sign_sphincs_keypair, _emscripten_get_global_libc: _emscripten_get_global_libc, ___muldsi3: ___muldsi3, _crypto_sign_sphincs: _crypto_sign_sphincs, _free: _free, _sphincsjs_public_key_bytes: _sphincsjs_public_key_bytes, _malloc: _malloc, runPostSets: runPostSets, stackAlloc: stackAlloc, stackSave: stackSave, stackRestore: stackRestore, establishStackSpace: establishStackSpace, setTempRet0: setTempRet0, getTempRet0: getTempRet0, setThrew: setThrew, stackAlloc: stackAlloc, stackSave: stackSave, stackRestore: stackRestore, establishStackSpace: establishStackSpace, setThrew: setThrew, setTempRet0: setTempRet0, getTempRet0: getTempRet0 };
 })
 // EMSCRIPTEN_END_ASM
 (Module.asmGlobalArg, Module.asmLibraryArg, buffer);
 
+var getTempRet0 = Module["getTempRet0"] = asm["getTempRet0"];
 var _llvm_cttz_i32 = Module["_llvm_cttz_i32"] = asm["_llvm_cttz_i32"];
 var _sphincsjs_secret_key_bytes = Module["_sphincsjs_secret_key_bytes"] = asm["_sphincsjs_secret_key_bytes"];
+var setThrew = Module["setThrew"] = asm["setThrew"];
 var _bitshift64Lshr = Module["_bitshift64Lshr"] = asm["_bitshift64Lshr"];
 var _sphincsjs_signature_bytes = Module["_sphincsjs_signature_bytes"] = asm["_sphincsjs_signature_bytes"];
 var _bitshift64Shl = Module["_bitshift64Shl"] = asm["_bitshift64Shl"];
 var _memset = Module["_memset"] = asm["_memset"];
 var _sbrk = Module["_sbrk"] = asm["_sbrk"];
 var _memcpy = Module["_memcpy"] = asm["_memcpy"];
+var stackAlloc = Module["stackAlloc"] = asm["stackAlloc"];
 var ___muldi3 = Module["___muldi3"] = asm["___muldi3"];
 var ___uremdi3 = Module["___uremdi3"] = asm["___uremdi3"];
 var _crypto_sign_sphincs_open = Module["_crypto_sign_sphincs_open"] = asm["_crypto_sign_sphincs_open"];
 var _i64Subtract = Module["_i64Subtract"] = asm["_i64Subtract"];
 var ___udivmoddi4 = Module["___udivmoddi4"] = asm["___udivmoddi4"];
+var setTempRet0 = Module["setTempRet0"] = asm["setTempRet0"];
 var _randombytes_stir = Module["_randombytes_stir"] = asm["_randombytes_stir"];
 var _i64Add = Module["_i64Add"] = asm["_i64Add"];
 var _crypto_sign_sphincs_keypair = Module["_crypto_sign_sphincs_keypair"] = asm["_crypto_sign_sphincs_keypair"];
-var _pthread_self = Module["_pthread_self"] = asm["_pthread_self"];
+var _emscripten_get_global_libc = Module["_emscripten_get_global_libc"] = asm["_emscripten_get_global_libc"];
+var stackSave = Module["stackSave"] = asm["stackSave"];
 var ___muldsi3 = Module["___muldsi3"] = asm["___muldsi3"];
 var _crypto_sign_sphincs = Module["_crypto_sign_sphincs"] = asm["_crypto_sign_sphincs"];
 var _free = Module["_free"] = asm["_free"];
 var runPostSets = Module["runPostSets"] = asm["runPostSets"];
+var establishStackSpace = Module["establishStackSpace"] = asm["establishStackSpace"];
 var _sphincsjs_public_key_bytes = Module["_sphincsjs_public_key_bytes"] = asm["_sphincsjs_public_key_bytes"];
+var stackRestore = Module["stackRestore"] = asm["stackRestore"];
 var _malloc = Module["_malloc"] = asm["_malloc"];
 ;
 
-Runtime.stackAlloc = asm['stackAlloc'];
-Runtime.stackSave = asm['stackSave'];
-Runtime.stackRestore = asm['stackRestore'];
-Runtime.establishStackSpace = asm['establishStackSpace'];
+Runtime.stackAlloc = Module['stackAlloc'];
+Runtime.stackSave = Module['stackSave'];
+Runtime.stackRestore = Module['stackRestore'];
+Runtime.establishStackSpace = Module['establishStackSpace'];
 
-Runtime.setTempRet0 = asm['setTempRet0'];
-Runtime.getTempRet0 = asm['getTempRet0'];
+Runtime.setTempRet0 = Module['setTempRet0'];
+Runtime.getTempRet0 = Module['getTempRet0'];
 
 
 
 // === Auto-generated postamble setup entry stuff ===
+
+Module['asm'] = asm;
 
 
 
@@ -18081,8 +18201,12 @@ Module['callMain'] = Module.callMain = function callMain(args) {
       Module['noExitRuntime'] = true;
       return;
     } else {
-      if (e && typeof e === 'object' && e.stack) Module.printErr('exception thrown: ' + [e, e.stack]);
-      throw e;
+      var toLog = e;
+      if (e && typeof e === 'object' && e.stack) {
+        toLog = [e, e.stack];
+      }
+      Module.printErr('exception thrown: ' + toLog);
+      Module['quit'](1, e);
     }
   } finally {
     calledMain = true;
@@ -18158,11 +18282,8 @@ function exit(status, implicit) {
 
   if (ENVIRONMENT_IS_NODE) {
     process['exit'](status);
-  } else if (ENVIRONMENT_IS_SHELL && typeof quit === 'function') {
-    quit(status);
   }
-  // if we reach here, we must throw an exception to halt the current execution
-  throw new ExitStatus(status);
+  Module['quit'](status, new ExitStatus(status));
 }
 Module['exit'] = Module.exit = exit;
 
@@ -18219,7 +18340,7 @@ run();
 // {{MODULE_ADDITIONS}}
 
 
-// EMSCRIPTEN_GENERATED_FUNCTIONS: ["_i64Subtract","_i64Add","_memset","_bitshift64Lshr","_bitshift64Shl","_memcpy","___muldsi3","___muldi3","_sbrk","_llvm_cttz_i32","___udivmoddi4","___uremdi3","_pthread_self"]
+// EMSCRIPTEN_GENERATED_FUNCTIONS: ["_i64Subtract","_i64Add","_memset","_bitshift64Lshr","_bitshift64Shl","_memcpy","___muldsi3","___muldi3","_sbrk","_llvm_cttz_i32","___udivmoddi4","___uremdi3"]
 
 
 ;

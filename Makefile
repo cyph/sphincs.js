@@ -8,10 +8,10 @@ all:
 	git clone -b OpenSSL_1_0_2-stable https://github.com/openssl/openssl.git
 	cd openssl ; emconfigure ./config no-asm no-threads no-shared no-dso no-sse2
 
-	wget https://bench.cr.yp.to/supercop/supercop-20161026.tar.xz
-	unxz < supercop-20161026.tar.xz | tar -xf -
-	mv supercop-20161026 c_src
-	rm supercop-20161026.tar.xz
+	wget https://bench.cr.yp.to/supercop/supercop-20170228.tar.xz
+	unxz < supercop-20170228.tar.xz | tar -xf -
+	mv supercop-20170228 c_src
+	rm supercop-20170228.tar.xz
 
 	sed -i 's|crypto_hash|crypto_hash_blake256_ref|g' c_src/crypto_hash/blake256/ref/hash.c
 	sed -i 's|sigma|sigma_blake256_ref|g' c_src/crypto_hash/blake256/ref/hash.c
@@ -41,7 +41,7 @@ all:
 			-s NO_DYNAMIC_EXECUTION=1 -s RUNNING_JS_OPTS=1 -s ASSERTIONS=0 \
 			-s AGGRESSIVE_VARIABLE_ELIMINATION=1 -s ALIASING_FUNCTION_POINTERS=1 \
 			-s FUNCTION_POINTER_ALIGNMENT=1 -s DISABLE_EXCEPTION_CATCHING=1 \
-			 -s RESERVED_FUNCTION_POINTERS=8 -s NO_FILESYSTEM=1 \
+			-s RESERVED_FUNCTION_POINTERS=8 -s NO_FILESYSTEM=1 \
 			-Ilibsodium/src/libsodium/include/sodium \
 			-Iopenssl/include \
 			-Ic_src -Ic_src/include -Ic_src/crypto_stream/chacha12/e/ref \
