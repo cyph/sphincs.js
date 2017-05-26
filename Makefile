@@ -2,10 +2,10 @@ all:
 	rm -rf dist c_src libsodium openssl 2> /dev/null
 	mkdir dist
 
-	git clone -b stable https://github.com/jedisct1/libsodium.git
+	git clone --depth 1 -b stable https://github.com/jedisct1/libsodium
 	cd libsodium ; emconfigure ./configure --enable-minimal --disable-shared
 
-	git clone -b OpenSSL_1_0_2-stable https://github.com/openssl/openssl.git
+	git clone --depth 1 -b OpenSSL_1_0_2-stable https://github.com/openssl/openssl
 	cd openssl ; emconfigure ./config no-asm no-threads no-shared no-dso no-sse2
 
 	wget https://bench.cr.yp.to/supercop/supercop-20170228.tar.xz
@@ -29,7 +29,7 @@ all:
 		perl -pe 's/(crypto_sign_sphincs.*unsigned long )long ([a-z])/\1\2/g' > sphincs_sign.c.new
 	mv sphincs_sign.c.new c_src/crypto_sign/sphincs256/ref/sign.c
 
-	git clone https://github.com/ahf/sphincs.git erlang-binding
+	git clone --depth 1 https://github.com/ahf/sphincs erlang-binding
 	mv erlang-binding/c_src/crypto_core/include/* c_src/include/
 	mv erlang-binding/c_src/crypto_stream/chacha12/ref/api.c c_src/crypto_stream/chacha12/e/ref/stream.c
 	rm -rf erlang-binding
