@@ -23,17 +23,25 @@ function dataFree (buffer) {
 }
 
 
-Module._randombytes_stir();
+var publicKeyBytes, privateKeyBytes, bytes;
+
+var initiated	= moduleReady.then(function () {
+	Module._randombytes_stir();
+
+	publicKeyBytes	= Module._sphincsjs_public_key_bytes();
+	privateKeyBytes	= Module._sphincsjs_secret_key_bytes();
+	bytes			= Module._sphincsjs_signature_bytes();
+});
 
 
 var sphincs	= {
-	publicKeyBytes: Module._sphincsjs_public_key_bytes(),
-	privateKeyBytes: Module._sphincsjs_secret_key_bytes(),
-	bytes: Module._sphincsjs_signature_bytes(),
+	publicKeyBytes: initiated.then(function () { return publicKeyBytes; }),
+	privateKeyBytes: initiated.then(function () { return privateKeyBytes; }),
+	bytes: initiated.then(function () { return bytes; }),
 
-	keyPair: function () {
-		var publicKeyBuffer		= Module._malloc(sphincs.publicKeyBytes);
-		var privateKeyBuffer	= Module._malloc(sphincs.privateKeyBytes);
+	keyPair: function () { return initiated.then(function () {
+		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
+		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
 		try {
 			var returnValue	= Module._crypto_sign_sphincs_keypair(
@@ -42,22 +50,22 @@ var sphincs	= {
 			);
 
 			return dataReturn(returnValue, {
-				publicKey: dataResult(publicKeyBuffer, sphincs.publicKeyBytes),
-				privateKey: dataResult(privateKeyBuffer, sphincs.privateKeyBytes)
+				publicKey: dataResult(publicKeyBuffer, publicKeyBytes),
+				privateKey: dataResult(privateKeyBuffer, privateKeyBytes)
 			});
 		}
 		finally {
 			dataFree(publicKeyBuffer);
 			dataFree(privateKeyBuffer);
 		}
-	},
+	}); },
 
-	sign: function (message, privateKey) {
-		var signedBytes		= message.length + sphincs.bytes;
+	sign: function (message, privateKey) { return initiated.then(function () {
+		var signedBytes		= message.length + bytes;
 
 		var signedBuffer		= Module._malloc(signedBytes);
 		var messageBuffer		= Module._malloc(message.length);
-		var privateKeyBuffer	= Module._malloc(sphincs.privateKeyBytes);
+		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
 		Module.writeArrayToMemory(message, messageBuffer);
 		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
@@ -78,22 +86,24 @@ var sphincs	= {
 			dataFree(messageBuffer);
 			dataFree(privateKeyBuffer);
 		}
-	},
+	}); },
 
 	signDetached: function (message, privateKey) {
-		return new Uint8Array(
-			sphincs.sign(message, privateKey).buffer,
-			0,
-			sphincs.bytes
-		);
+		return sphincs.sign(message, privateKey).then(function (signed) {
+			return new Uint8Array(
+				signed.buffer,
+				0,
+				bytes
+			);
+		});
 	},
 
-	open: function (signed, publicKey) {
-		var openedBytes	= signed.length - sphincs.bytes;
+	open: function (signed, publicKey) { return initiated.then(function () {
+		var openedBytes	= signed.length - bytes;
 
 		var openedBuffer	= Module._malloc(openedBytes);
 		var signedBuffer	= Module._malloc(signed.length);
-		var publicKeyBuffer	= Module._malloc(sphincs.publicKeyBytes);
+		var publicKeyBuffer	= Module._malloc(publicKeyBytes);
 
 		Module.writeArrayToMemory(signed, signedBuffer);
 		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
@@ -114,23 +124,32 @@ var sphincs	= {
 			dataFree(signedBuffer);
 			dataFree(publicKeyBuffer);
 		}
-	},
+	}); },
 
 	verifyDetached: function (signature, message, publicKey) {
-		var signed	= new Uint8Array(sphincs.bytes + message.length);
-		signed.set(signature);
-		signed.set(message, sphincs.bytes);
+		return initiated.then(function () {
+			var signed	= new Uint8Array(bytes + message.length);
+			signed.set(signature);
+			signed.set(message, bytes);
 
-		try {
-			sphincs.open(signed, publicKey);
-			return true; 
-		}
-		catch (_) {
-			return false;
-		}
-		finally {
-			dataFree(signed);
-		}
+			return sphincs.open(
+				signed,
+				publicKey
+			).catch(function () {}).then(function (opened) {
+				try {
+					return opened !== undefined;
+				}
+				finally {
+					var arrs	= opened ? [signed, opened] : [signed];
+					for (var i = 0 ; i < arrs.length ; ++i) {
+						var arr	= arrs[i];
+						for (var j = 0 ; j < arr.length ; ++j) {
+							arr[j]	= 0;
+						}
+					}
+				}
+			});
+		});
 	}
 };
 

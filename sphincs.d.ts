@@ -1,28 +1,32 @@
 declare module 'sphincs' {
 	interface ISPHINCS {
 		/** Signature length. */
-		bytes: number;
+		bytes: Promise<number>;
 
 		/** Private key length. */
-		privateKeyBytes: number;
+		privateKeyBytes: Promise<number>;
 
 		/** Public key length. */
-		publicKeyBytes: number;
+		publicKeyBytes: Promise<number>;
 
 		/** Generates key pair. */
-		keyPair () : {privateKey: Uint8Array; publicKey: Uint8Array};
+		keyPair () : Promise<{privateKey: Uint8Array; publicKey: Uint8Array}>;
 
 		/** Verifies signed message against publicKey and returns it. */
-		open (signed: Uint8Array, publicKey: Uint8Array) : Uint8Array;
+		open (signed: Uint8Array, publicKey: Uint8Array) : Promise<Uint8Array>;
 
 		/** Signs message with privateKey and returns combined message. */
-		sign (message: Uint8Array, privateKey: Uint8Array) : Uint8Array;
+		sign (message: Uint8Array, privateKey: Uint8Array) : Promise<Uint8Array>;
 
 		/** Signs message with privateKey and returns signature. */
-		signDetached (message: Uint8Array, privateKey: Uint8Array) : Uint8Array;
+		signDetached (message: Uint8Array, privateKey: Uint8Array) : Promise<Uint8Array>;
 
 		/** Verifies detached signature against publicKey. */
-		verifyDetached (signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array) : boolean;
+		verifyDetached (
+			signature: Uint8Array,
+			message: Uint8Array,
+			publicKey: Uint8Array
+		) : Promise<boolean>;
 	}
 
 	const sphincs: ISPHINCS;
