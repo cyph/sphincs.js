@@ -69,27 +69,20 @@ all:
 
 	cp pre.js dist/sphincs.tmp.js
 	echo " \
-		var moduleReady; \
-		if (typeof WebAssembly !== 'undefined') { \
+		var finalModule; \
+		var moduleReady = Promise.resolve().then(function () { \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.wasm.js >> dist/sphincs.tmp.js
 	echo " \
-			moduleReady = new Promise(function (resolve) { \
-				var interval = setInterval(function () { \
-					if (!Module.usingWasm) { \
-						return; \
-					} \
-					clearInterval(interval); \
-					resolve(); \
-				}, 50); \
+			return Module['wasmReady'].then(function () { \
+				finalModule = Module; \
 			});\
-		} \
-		else { \
+		}).catch(function () { \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.asm.js >> dist/sphincs.tmp.js
 	echo " \
-			moduleReady = Promise.resolve(); \
-		} \
+			finalModule = Module; \
+		}); \
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
 
