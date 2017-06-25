@@ -48,3 +48,12 @@ instead of this.
 		console.log(signature);
 		console.log(isValid);
 	})();
+
+## Changelog
+
+Breaking changes in major versions:
+
+2.0.0:
+
+* As part of upgrading from asm.js to WebAssembly (with asm.js included as a fallback),
+the API is fully asynchronous.
