@@ -25,9 +25,6 @@ all:
 
 	sed -i 's|crypto_sign|crypto_sign_sphincs|g' c_src/crypto_sign/sphincs256/ref/sign.c
 	sed -i 's|crypto_sign_sphincs.h|crypto_sign.h|g' c_src/crypto_sign/sphincs256/ref/sign.c
-	cat c_src/crypto_sign/sphincs256/ref/sign.c | \
-		perl -pe 's/(crypto_sign_sphincs.*unsigned long )long ([a-z])/\1\2/g' > sphincs_sign.c.new
-	mv sphincs_sign.c.new c_src/crypto_sign/sphincs256/ref/sign.c
 
 	git clone --depth 1 https://github.com/ahf/sphincs erlang-binding
 	mv erlang-binding/c_src/crypto_core/include/* c_src/include/
@@ -53,10 +50,10 @@ all:
 			$$(find c_src/crypto_sign/sphincs256/ref -name '"'"'*.c'"'"' -type f) \
 			sphincs.c \
 			-s EXPORTED_FUNCTIONS=\"[ \
-				'"'"'_randombytes_stir'"'"', \
-				'"'"'_crypto_sign_sphincs_keypair'"'"', \
-				'"'"'_crypto_sign_sphincs'"'"', \
-				'"'"'_crypto_sign_sphincs_open'"'"', \
+				'"'"'_sphincsjs_init'"'"', \
+				'"'"'_sphincsjs_keypair'"'"', \
+				'"'"'_sphincsjs_sign'"'"', \
+				'"'"'_sphincsjs_open'"'"', \
 				'"'"'_sphincsjs_public_key_bytes'"'"', \
 				'"'"'_sphincsjs_secret_key_bytes'"'"', \
 				'"'"'_sphincsjs_signature_bytes'"'"' \

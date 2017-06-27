@@ -28,7 +28,7 @@ var Module, publicKeyBytes, privateKeyBytes, bytes;
 var initiated	= moduleReady.then(function () {
 	Module	= finalModule;
 
-	Module._randombytes_stir();
+	Module._sphincsjs_init();
 
 	publicKeyBytes	= Module._sphincsjs_public_key_bytes();
 	privateKeyBytes	= Module._sphincsjs_secret_key_bytes();
@@ -46,7 +46,7 @@ var sphincs	= {
 		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
 		try {
-			var returnValue	= Module._crypto_sign_sphincs_keypair(
+			var returnValue	= Module._sphincsjs_keypair(
 				publicKeyBuffer,
 				privateKeyBuffer
 			);
@@ -73,7 +73,7 @@ var sphincs	= {
 		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
 
 		try {
-			var returnValue	= Module._crypto_sign_sphincs(
+			var returnValue	= Module._sphincsjs_sign(
 				signedBuffer,
 				0,
 				messageBuffer,
@@ -111,7 +111,7 @@ var sphincs	= {
 		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
 
 		try {
-			var returnValue	= Module._crypto_sign_sphincs_open(
+			var returnValue	= Module._sphincsjs_open(
 				openedBuffer,
 				0,
 				signedBuffer,
