@@ -3,7 +3,7 @@
 ## Overview
 
 The [SPHINCS](https://sphincs.cr.yp.to) post-quantum cryptographic signing scheme
-cipher compiled to WebAssembly using [Emscripten](https://github.com/kripken/emscripten).
+compiled to WebAssembly using [Emscripten](https://github.com/kripken/emscripten).
 A simple JavaScript wrapper is provided to make SPHINCS easy to use in Web applications.
 
 N.B. Unless interoperability with other SPHINCS implementations is a hard requirement,
