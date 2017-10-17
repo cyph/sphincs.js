@@ -66,19 +66,22 @@ all:
 
 	cp pre.js dist/sphincs.tmp.js
 	echo " \
-		var finalModule; \
-		var moduleReady = Promise.resolve().then(function () { \
+		var Module = {}; \
+		var _Module = Module; \
+		Module.ready = new Promise(function (resolve, reject) { \
+			var Module = _Module; \
+			Module.onAbort = reject; \
+			Module.onRuntimeInitialized = resolve; \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.wasm.js >> dist/sphincs.tmp.js
 	echo " \
-			return Module['wasmReady'].then(function () { \
-				finalModule = Module; \
-			});\
 		}).catch(function () { \
+			var Module = _Module; \
+			Module.onAbort = undefined; \
+			Module.onRuntimeInitialized = undefined; \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.asm.js >> dist/sphincs.tmp.js
 	echo " \
-			finalModule = Module; \
 		}); \
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
