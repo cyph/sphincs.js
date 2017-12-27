@@ -1,5 +1,9 @@
 ;
 
+function writeArrayToMemory (array, buffer) {
+	Module.HEAP8.set(array, buffer);
+}
+
 function dataReturn (returnValue, result) {
 	if (returnValue === 0) {
 		return result;
@@ -67,8 +71,8 @@ var sphincs	= {
 		var messageBuffer		= Module._malloc(message.length);
 		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
-		Module.writeArrayToMemory(message, messageBuffer);
-		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
+		writeArrayToMemory(message, messageBuffer);
+		writeArrayToMemory(privateKey, privateKeyBuffer);
 
 		try {
 			var returnValue	= Module._sphincsjs_sign(
@@ -105,8 +109,8 @@ var sphincs	= {
 		var signedBuffer	= Module._malloc(signed.length);
 		var publicKeyBuffer	= Module._malloc(publicKeyBytes);
 
-		Module.writeArrayToMemory(signed, signedBuffer);
-		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
+		writeArrayToMemory(signed, signedBuffer);
+		writeArrayToMemory(publicKey, publicKeyBuffer);
 
 		try {
 			var returnValue	= Module._sphincsjs_open(
