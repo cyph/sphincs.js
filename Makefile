@@ -50,6 +50,8 @@ all:
 			$$(find c_src/crypto_sign/sphincs256/ref -name '"'"'*.c'"'"' -type f) \
 			sphincs.c \
 			-s EXPORTED_FUNCTIONS=\"[ \
+				'"'"'_free'"'"', \
+				'"'"'_malloc'"'"', \
 				'"'"'_sphincsjs_init'"'"', \
 				'"'"'_sphincsjs_keypair'"'"', \
 				'"'"'_sphincsjs_sign'"'"', \
