@@ -50,6 +50,9 @@ all:
 			c_src/crypto_stream/chacha12/e/ref/chacha.c \
 			$$(find c_src/crypto_sign/sphincs256/ref -name '"'"'*.c'"'"' -type f) \
 			sphincs.c \
+			-s EXTRA_EXPORTED_RUNTIME_METHODS=\"[ \
+				'"'"'writeArrayToMemory'"'"' \
+			]\" \
 			-s EXPORTED_FUNCTIONS=\"[ \
 				'"'"'_free'"'"', \
 				'"'"'_malloc'"'"', \
