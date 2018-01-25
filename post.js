@@ -65,9 +65,10 @@ var sphincs	= {
 	}); },
 
 	sign: function (message, privateKey) { return initiated.then(function () {
-		var signedBytes		= message.length + bytes;
+		var signedBytes	= message.length + bytes;
 
 		var signedBuffer		= Module._malloc(signedBytes);
+		var signedLengthBuffer	= Module._malloc(8);
 		var messageBuffer		= Module._malloc(message.length);
 		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
@@ -77,7 +78,7 @@ var sphincs	= {
 		try {
 			var returnValue	= Module._sphincsjs_sign(
 				signedBuffer,
-				0,
+				signedLengthBuffer,
 				messageBuffer,
 				message.length,
 				privateKeyBuffer
@@ -87,6 +88,7 @@ var sphincs	= {
 		}
 		finally {
 			dataFree(signedBuffer);
+			dataFree(signedLengthBuffer);
 			dataFree(messageBuffer);
 			dataFree(privateKeyBuffer);
 		}
@@ -105,9 +107,10 @@ var sphincs	= {
 	open: function (signed, publicKey) { return initiated.then(function () {
 		var openedBytes	= signed.length - bytes;
 
-		var openedBuffer	= Module._malloc(openedBytes);
-		var signedBuffer	= Module._malloc(signed.length);
-		var publicKeyBuffer	= Module._malloc(publicKeyBytes);
+		var openedBuffer		= Module._malloc(openedBytes);
+		var openedLengthBuffer	= Module._malloc(8);
+		var signedBuffer		= Module._malloc(signed.length);
+		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
 
 		writeArrayToMemory(signed, signedBuffer);
 		writeArrayToMemory(publicKey, publicKeyBuffer);
@@ -115,7 +118,7 @@ var sphincs	= {
 		try {
 			var returnValue	= Module._sphincsjs_open(
 				openedBuffer,
-				0,
+				openedLengthBuffer,
 				signedBuffer,
 				signed.length,
 				publicKeyBuffer
@@ -125,6 +128,7 @@ var sphincs	= {
 		}
 		finally {
 			dataFree(openedBuffer);
+			dataFree(openedLengthBuffer);
 			dataFree(signedBuffer);
 			dataFree(publicKeyBuffer);
 		}

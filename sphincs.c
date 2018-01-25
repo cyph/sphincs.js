@@ -46,26 +46,20 @@ long sphincsjs_keypair (
 
 long sphincsjs_open (
 	uint8_t *m,
-	unsigned long *mlen,
+	unsigned long long *mlen,
 	const uint8_t *sm,
-	unsigned long smlen,
+	unsigned long long smlen,
 	const uint8_t *pk
 ) {
-	unsigned long long *mlen64;
-	long status	= crypto_sign_sphincs_open(m, mlen64, sm, smlen, pk);
-	*mlen		= (long) *mlen64;
-	return status;
+	return crypto_sign_sphincs_open(m, mlen, sm, smlen, pk);
 }
 
 long sphincsjs_sign (
 	uint8_t *sm,
-	unsigned long *smlen,
+	unsigned long long *smlen,
 	const uint8_t *m,
-	unsigned long mlen,
+	unsigned long long mlen,
 	const uint8_t *sk
 ) {
-	unsigned long long *smlen64;
-	long status	= crypto_sign_sphincs(sm, smlen64, m, mlen, sk);
-	*smlen		= (long) *smlen64;
-	return status;
+	return crypto_sign_sphincs(sm, smlen, m, mlen, sk);
 }
