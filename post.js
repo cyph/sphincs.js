@@ -101,9 +101,7 @@ var sphincs	= {
 	},
 
 	open: function (signed, publicKey) { return initiated.then(function () {
-		var openedBytes	= signed.length - bytes;
-
-		var openedBuffer		= Module._malloc(openedBytes);
+		var openedBuffer		= Module._malloc(signed.length + bytes);
 		var openedLengthBuffer	= Module._malloc(8);
 		var signedBuffer		= Module._malloc(signed.length);
 		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
@@ -120,7 +118,7 @@ var sphincs	= {
 				publicKeyBuffer
 			);
 
-			return dataReturn(returnValue, dataResult(openedBuffer, openedBytes));
+			return dataReturn(returnValue, dataResult(openedBuffer, signed.length - bytes));
 		}
 		finally {
 			dataFree(openedBuffer);

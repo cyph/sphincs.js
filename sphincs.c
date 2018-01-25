@@ -48,7 +48,7 @@ long sphincsjs_open (
 	uint8_t *m,
 	unsigned long long *mlen,
 	const uint8_t *sm,
-	unsigned long long smlen,
+	unsigned long smlen,
 	const uint8_t *pk
 ) {
 	return crypto_sign_sphincs_open(m, mlen, sm, smlen, pk);
@@ -58,7 +58,7 @@ long sphincsjs_sign (
 	uint8_t *sm,
 	unsigned long long *smlen,
 	const uint8_t *m,
-	unsigned long long mlen,
+	unsigned long mlen,
 	const uint8_t *sk
 ) {
 	return crypto_sign_sphincs(sm, smlen, m, mlen, sk);
