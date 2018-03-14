@@ -77,7 +77,15 @@ all:
 		Module.ready = new Promise(function (resolve, reject) { \
 			var Module = _Module; \
 			Module.onAbort = reject; \
-			Module.onRuntimeInitialized = resolve; \
+			Module.onRuntimeInitialized = function () { \
+				try { \
+					Module._sphincsjs_public_key_bytes(); \
+					resolve(); \
+				} \
+				catch (err) { \
+					reject(err); \
+				} \
+			}; \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.wasm.js >> dist/sphincs.tmp.js
 	echo " \
