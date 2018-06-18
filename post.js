@@ -24,6 +24,20 @@ function dataFree (buffer) {
 	}
 }
 
+function malloc () {
+	try {
+		return Module.asm._malloc.apply(null, arguments);
+	} catch (err) {
+		console.error({
+			err: err,
+			Module: Module,
+			arguments: arguments
+		});
+		debugger;
+		throw err;
+	}
+}
+
 
 var publicKeyBytes, privateKeyBytes, bytes;
 
@@ -42,8 +56,8 @@ var sphincs	= {
 	bytes: initiated.then(function () { return bytes; }),
 
 	keyPair: function () { return initiated.then(function () {
-		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
-		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
+		var publicKeyBuffer		= malloc(publicKeyBytes);
+		var privateKeyBuffer	= malloc(privateKeyBytes);
 
 		try {
 			var returnValue	= Module._sphincsjs_keypair(
@@ -65,10 +79,10 @@ var sphincs	= {
 	sign: function (message, privateKey) { return initiated.then(function () {
 		var signedBytes	= message.length + bytes;
 
-		var signedBuffer		= Module._malloc(signedBytes);
-		var signedLengthBuffer	= Module._malloc(8);
-		var messageBuffer		= Module._malloc(message.length);
-		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
+		var signedBuffer		= malloc(signedBytes);
+		var signedLengthBuffer	= malloc(8);
+		var messageBuffer		= malloc(message.length);
+		var privateKeyBuffer	= malloc(privateKeyBytes);
 
 		Module.writeArrayToMemory(message, messageBuffer);
 		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
@@ -103,10 +117,10 @@ var sphincs	= {
 	},
 
 	open: function (signed, publicKey) { return initiated.then(function () {
-		var openedBuffer		= Module._malloc(signed.length + bytes);
-		var openedLengthBuffer	= Module._malloc(8);
-		var signedBuffer		= Module._malloc(signed.length);
-		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
+		var openedBuffer		= malloc(signed.length + bytes);
+		var openedLengthBuffer	= malloc(8);
+		var signedBuffer		= malloc(signed.length);
+		var publicKeyBuffer		= malloc(publicKeyBytes);
 
 		Module.writeArrayToMemory(signed, signedBuffer);
 		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
@@ -128,6 +142,12 @@ var sphincs	= {
 			dataFree(signedBuffer);
 			dataFree(publicKeyBuffer);
 		}
+	}).catch(function(err) {
+		console.error({
+			err: err
+		});
+		debugger;
+		throw err;
 	}); },
 
 	verifyDetached: function (signature, message, publicKey) {
@@ -139,7 +159,13 @@ var sphincs	= {
 			return sphincs.open(
 				signed,
 				publicKey
-			).catch(function () {}).then(function (opened) {
+			).catch(function(err) {
+				console.error({
+					err: err
+				});
+				debugger;
+				return;
+			}).then(function (opened) {
 				try {
 					return opened !== undefined;
 				}

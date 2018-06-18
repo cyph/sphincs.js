@@ -35,7 +35,7 @@ all:
 		args="$$(echo " \
 			-s SINGLE_FILE=1 \
 			-s TOTAL_MEMORY=16777216 -s TOTAL_STACK=8388608 \
-			-s ASSERTIONS=0 \
+			-s ASSERTIONS=1 \
 			-s AGGRESSIVE_VARIABLE_ELIMINATION=1 \
 			-s ALIASING_FUNCTION_POINTERS=0 -s SAFE_HEAP=1 \
 			-s DISABLE_EXCEPTION_CATCHING=1 \
@@ -100,7 +100,7 @@ all:
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
 
-	uglifyjs dist/sphincs.tmp.js -cmo dist/sphincs.js
+	uglifyjs dist/sphincs.tmp.js -bo dist/sphincs.js
 
 	sed -i 's|use asm||g' dist/sphincs.js
 	sed -i 's|require(|eval("require")(|g' dist/sphincs.js
