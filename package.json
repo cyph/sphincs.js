@@ -1,6 +1,6 @@
 {
 	"name": "sphincs",
-	"version": "2.1.6-debug",
+	"version": "2.1.7-debug",
 	"description": "JavaScript wrapper for a WebAssembly build of SPHINCS",
 	"main": "dist/sphincs.js",
 	"types": "./sphincs.d.ts",
