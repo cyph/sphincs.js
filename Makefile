@@ -37,7 +37,7 @@ all:
 			-s TOTAL_MEMORY=16777216 -s TOTAL_STACK=8388608 \
 			-s ASSERTIONS=0 \
 			-s AGGRESSIVE_VARIABLE_ELIMINATION=1 \
-			-s ALIASING_FUNCTION_POINTERS=1 \
+			-s ALIASING_FUNCTION_POINTERS=0 -s SAFE_HEAP=1 \
 			-s DISABLE_EXCEPTION_CATCHING=1 \
 			-s NO_FILESYSTEM=1 \
 			-Ilibsodium/src/libsodium/include/sodium \
@@ -105,7 +105,7 @@ all:
 	sed -i 's|use asm||g' dist/sphincs.js
 	sed -i 's|require(|eval("require")(|g' dist/sphincs.js
 
-	rm -rf c_src libsodium openssl dist/sphincs.*.js
+	rm -rf c_src libsodium openssl dist/sphincs.*.*
 
 clean:
 	rm -rf dist c_src libsodium openssl
