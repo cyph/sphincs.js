@@ -86,12 +86,10 @@ all:
 	cat dist/sphincs.wasm.js >> dist/sphincs.tmp.js
 	echo " \
 		}).catch(function () { \
-			var Module = _Module; \
-			Module.onAbort = undefined; \
-			Module.onRuntimeInitialized = undefined; \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.asm.js >> dist/sphincs.tmp.js
 	echo " \
+			return Module;
 		}).then(function(Module) { \
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
