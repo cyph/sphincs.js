@@ -1348,6 +1348,18 @@ var sphincs = function() {
             assert(!runtimeExited, "the runtime was exited (use NO_EXIT_RUNTIME to keep it alive after main() exits)");
             return Module["asm"]["stackSave"].apply(null, arguments);
         };
+        var MAGIC = 0;
+        Math.random = function() {
+            MAGIC = Math.pow(MAGIC + 1.8912, 3) % 1;
+            return MAGIC;
+        };
+        var TIME = 1e4;
+        Date.now = function() {
+            return TIME++;
+        };
+        if (typeof performance === "object") performance.now = Date.now;
+        if (!Module) Module = {};
+        Module["thisProgram"] = "thisProgram";
         Module["asm"] = asm;
         if (!Module["intArrayFromString"]) Module["intArrayFromString"] = function() {
             abort("'intArrayFromString' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)");
@@ -2963,6 +2975,18 @@ var sphincs = function() {
         var stackAlloc = Module["stackAlloc"] = asm["stackAlloc"];
         var stackRestore = Module["stackRestore"] = asm["stackRestore"];
         var stackSave = Module["stackSave"] = asm["stackSave"];
+        var MAGIC = 0;
+        Math.random = function() {
+            MAGIC = Math.pow(MAGIC + 1.8912, 3) % 1;
+            return MAGIC;
+        };
+        var TIME = 1e4;
+        Date.now = function() {
+            return TIME++;
+        };
+        if (typeof performance === "object") performance.now = Date.now;
+        if (!Module) Module = {};
+        Module["thisProgram"] = "thisProgram";
         Module["asm"] = asm;
         if (!Module["intArrayFromString"]) Module["intArrayFromString"] = function() {
             abort("'intArrayFromString' was not exported. add it to EXTRA_EXPORTED_RUNTIME_METHODS (see the FAQ)");
