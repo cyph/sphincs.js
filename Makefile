@@ -72,20 +72,16 @@ all:
 
 	cp pre.js dist/sphincs.tmp.js
 	echo " \
-		var Module = {}; \
-		var _Module = Module; \
-		Module.ready = new Promise(function (resolve, reject) { \
-			var Module = _Module; \
-			Module.onAbort = reject; \
-			Module.onRuntimeInitialized = function () { \
+		return new Promise(function (resolve, reject) { \
+			var Module = {onAbort: reject, onRuntimeInitialized: function () { \
 				try { \
 					Module._sphincsjs_public_key_bytes(); \
-					resolve(); \
+					resolve(Module); \
 				} \
 				catch (err) { \
 					reject(err); \
 				} \
-			}; \
+			}}; \
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.wasm.js >> dist/sphincs.tmp.js
 	echo " \
@@ -96,7 +92,7 @@ all:
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.asm.js >> dist/sphincs.tmp.js
 	echo " \
-		}); \
+		}).then(function(Module) { \
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
 
