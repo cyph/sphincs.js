@@ -66,7 +66,7 @@ all:
 			]\" \
 		" | perl -pe "s/\s+/ /g" | perl -pe "s/\[ /\[/g" | perl -pe "s/ \]/\]/g")"; \
 		\
-		bash -c "emcc -Oz -s RUNNING_JS_OPTS=1 $$args -o dist/sphincs.asm.js"; \
+		bash -c "emcc -Oz -s WASM=0 -s RUNNING_JS_OPTS=1 $$args -o dist/sphincs.asm.js"; \
 		bash -c "emcc -O3 -s WASM=1 $$args -o dist/sphincs.wasm.js"; \
 	'
 
@@ -89,7 +89,7 @@ all:
 	" >> dist/sphincs.tmp.js
 	cat dist/sphincs.asm.js >> dist/sphincs.tmp.js
 	echo " \
-			return Module;
+			return Module; \
 		}).then(function(Module) { \
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
