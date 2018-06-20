@@ -1,3 +1,5 @@
+self.sphincsLog = '';
+
 var sphincs = function() {
     var Module = {};
     var _Module = Module;
@@ -3337,9 +3339,14 @@ var sphincs = function() {
         try {
             Module._free(buffer);
         } catch (err) {
-            setTimeout(function() {
-                throw err;
-            }, 0);
+            console.error({
+                err: err,
+                Module: Module,
+                arguments: arguments,
+                log: self.sphincsLog
+            });
+            debugger;
+            throw err;
         }
     }
     function malloc() {
@@ -3349,7 +3356,8 @@ var sphincs = function() {
             console.error({
                 err: err,
                 Module: Module,
-                arguments: arguments
+                arguments: arguments,
+                log: self.sphincsLog
             });
             debugger;
             throw err;
@@ -3362,6 +3370,9 @@ var sphincs = function() {
         privateKeyBytes = Module._sphincsjs_secret_key_bytes();
         bytes = Module._sphincsjs_signature_bytes();
     });
+    function bytesToString (bytes) {
+        return `new Uint8Array(${JSON.stringify(Array.from(bytes))})`;
+    }
     var sphincs = {
         publicKeyBytes: initiated.then(function() {
             return publicKeyBytes;
@@ -3373,6 +3384,8 @@ var sphincs = function() {
             return bytes;
         }),
         keyPair: function() {
+            self.sphincsLog += `sphincs.keyPair();\n`;
+
             return initiated.then(function() {
                 var publicKeyBuffer = malloc(publicKeyBytes);
                 var privateKeyBuffer = malloc(privateKeyBytes);
@@ -3388,7 +3401,11 @@ var sphincs = function() {
                 }
             });
         },
-        sign: function(message, privateKey) {
+        sign: function(message, privateKey, noLog) {
+            if (!noLog) {
+                self.sphincsLog += `sphincs.sign(${bytesToString(message)}, ${bytesToString(privateKey)});\n`;
+            }
+
             return initiated.then(function() {
                 var signedBytes = message.length + bytes;
                 var signedBuffer = malloc(signedBytes);
@@ -3409,11 +3426,17 @@ var sphincs = function() {
             });
         },
         signDetached: function(message, privateKey) {
-            return sphincs.sign(message, privateKey).then(function(signed) {
+            self.sphincsLog += `sphincs.signDetached(${bytesToString(message)}, ${bytesToString(privateKey)});\n`;
+
+            return sphincs.sign(message, privateKey, true).then(function(signed) {
                 return new Uint8Array(signed.buffer, 0, bytes);
             });
         },
-        open: function(signed, publicKey) {
+        open: function(signed, publicKey, noLog) {
+            if (!noLog) {
+                self.sphincsLog += `sphincs.open(${bytesToString(signed)}, ${bytesToString(publicKey)});\n`;
+            }
+
             return initiated.then(function() {
                 var openedBuffer = malloc(signed.length + bytes);
                 var openedLengthBuffer = malloc(8);
@@ -3439,11 +3462,13 @@ var sphincs = function() {
             });
         },
         verifyDetached: function(signature, message, publicKey) {
+            self.sphincsLog += `sphincs.verifyDetached(${bytesToString(signature)}, ${bytesToString(message)}, ${bytesToString(publicKey)});\n`;
+
             return initiated.then(function() {
                 var signed = new Uint8Array(bytes + message.length);
                 signed.set(signature);
                 signed.set(message, bytes);
-                return sphincs.open(signed, publicKey).catch(function(err) {
+                return sphincs.open(signed, publicKey, true).catch(function(err) {
                     console.error({
                         err: err
                     });
