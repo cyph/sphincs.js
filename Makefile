@@ -40,6 +40,7 @@ all:
 			-s ALIASING_FUNCTION_POINTERS=1 \
 			-s DISABLE_EXCEPTION_CATCHING=1 \
 			-s NO_FILESYSTEM=1 \
+			-s ERROR_ON_UNDEFINED_SYMBOLS=0 \
 			-Ilibsodium/src/libsodium/include/sodium \
 			-Iopenssl/include \
 			-Ic_src -Ic_src/include -Ic_src/crypto_stream/chacha12/e/ref \
