@@ -94,7 +94,7 @@ all:
 	" >> dist/sphincs.tmp.js
 	cat post.js >> dist/sphincs.tmp.js
 
-	uglifyjs dist/sphincs.tmp.js -cmo dist/sphincs.js
+	terser dist/sphincs.tmp.js -cmo dist/sphincs.js
 
 	sed -i 's|use asm||g' dist/sphincs.js
 	sed -i 's|require(|eval("require")(|g' dist/sphincs.js
