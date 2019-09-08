@@ -1,5 +1,5 @@
 all:
-	rm -rf dist c_src libsodium openssl 2> /dev/null
+	rm -rf dist c_src erlang-binding libsodium openssl supercop* 2> /dev/null
 	mkdir dist
 
 	git clone --depth 1 -b stable https://github.com/jedisct1/libsodium
@@ -105,4 +105,4 @@ all:
 	rm -rf c_src libsodium openssl dist/sphincs.*.js
 
 clean:
-	rm -rf dist c_src libsodium openssl
+	rm -rf dist c_src erlang-binding libsodium openssl supercop*
