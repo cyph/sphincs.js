@@ -1,15 +1,4 @@
-		Module._sphincsjs_init();
-
-		publicKeyBytes	= Module._sphincsjs_public_key_bytes();
-		privateKeyBytes	= Module._sphincsjs_secret_key_bytes();
-		bytes			= Module._sphincsjs_signature_bytes();
-
-		return Module;
-	});
-}
-
-
-var ERROR_RETRY	= {};
+;
 
 function dataReturn (returnValue, result) {
 	if (returnValue === 0) {
@@ -20,64 +9,41 @@ function dataReturn (returnValue, result) {
 	}
 }
 
-function dataResult (Module, buffer, bytes) {
+function dataResult (buffer, bytes) {
 	return new Uint8Array(
 		new Uint8Array(Module.HEAPU8.buffer, buffer, bytes)
 	);
 }
 
-function dataFree (Module, buffer) {
+function dataFree (buffer) {
 	try {
 		Module._free(buffer);
 	}
-	catch (_) {
-		throw ERROR_RETRY;
-	}
-}
-
-function dataMalloc (Module, n) {
-	try {
-		return Module._malloc(n);
-	}
-	catch (_) {
-		throw ERROR_RETRY;
+	catch (err) {
+		setTimeout(function () { throw err; }, 0);
 	}
 }
 
 
-var modulePromise	= getModule();
+var publicKeyBytes, privateKeyBytes, bytes;
 
-function getModuleWrapper (f) {
-	return function fWrapper () {
-		var args				= arguments;
-		var context				= this;
-		var thisModulePromise	= modulePromise;
+var initiated	= Module.ready.then(function () {
+	Module._sphincsjs_init();
 
-		return thisModulePromise.then(function (Module) {
-			return f.apply(context, [Module].concat(Array.prototype.slice.apply(args)));
-		}).catch(function (err) {
-			if (err !== ERROR_RETRY) {
-				throw err;
-			}
-
-			if (modulePromise === thisModulePromise) {
-				modulePromise	= getModule();
-			}
-
-			return fWrapper.apply(context, args);
-		});
-	};
-}
+	publicKeyBytes	= Module._sphincsjs_public_key_bytes();
+	privateKeyBytes	= Module._sphincsjs_secret_key_bytes();
+	bytes			= Module._sphincsjs_signature_bytes();
+});
 
 
 var sphincs	= {
-	publicKeyBytes: modulePromise.then(function () { return publicKeyBytes; }),
-	privateKeyBytes: modulePromise.then(function () { return privateKeyBytes; }),
-	bytes: modulePromise.then(function () { return bytes; }),
+	publicKeyBytes: initiated.then(function () { return publicKeyBytes; }),
+	privateKeyBytes: initiated.then(function () { return privateKeyBytes; }),
+	bytes: initiated.then(function () { return bytes; }),
 
-	keyPair: getModuleWrapper(function (Module) {
-		var publicKeyBuffer		= dataMalloc(Module, publicKeyBytes);
-		var privateKeyBuffer	= dataMalloc(Module, privateKeyBytes);
+	keyPair: function () { return initiated.then(function () {
+		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
+		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
 		try {
 			var returnValue	= Module._sphincsjs_keypair(
@@ -86,23 +52,23 @@ var sphincs	= {
 			);
 
 			return dataReturn(returnValue, {
-				publicKey: dataResult(Module, publicKeyBuffer, publicKeyBytes),
-				privateKey: dataResult(Module, privateKeyBuffer, privateKeyBytes)
+				publicKey: dataResult(publicKeyBuffer, publicKeyBytes),
+				privateKey: dataResult(privateKeyBuffer, privateKeyBytes)
 			});
 		}
 		finally {
-			dataFree(Module, publicKeyBuffer);
-			dataFree(Module, privateKeyBuffer);
+			dataFree(publicKeyBuffer);
+			dataFree(privateKeyBuffer);
 		}
-	}),
+	}); },
 
-	sign: getModuleWrapper(function (Module, message, privateKey) {
+	sign: function (message, privateKey) { return initiated.then(function () {
 		var signedBytes	= message.length + bytes;
 
-		var signedBuffer		= dataMalloc(Module, signedBytes);
-		var signedLengthBuffer	= dataMalloc(Module, 8);
-		var messageBuffer		= dataMalloc(Module, message.length);
-		var privateKeyBuffer	= dataMalloc(Module, privateKeyBytes);
+		var signedBuffer		= Module._malloc(signedBytes);
+		var signedLengthBuffer	= Module._malloc(8);
+		var messageBuffer		= Module._malloc(message.length);
+		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
 
 		Module.writeArrayToMemory(message, messageBuffer);
 		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
@@ -116,27 +82,31 @@ var sphincs	= {
 				privateKeyBuffer
 			);
 
-			return dataReturn(returnValue, dataResult(Module, signedBuffer, signedBytes));
+			return dataReturn(returnValue, dataResult(signedBuffer, signedBytes));
 		}
 		finally {
-			dataFree(Module, signedBuffer);
-			dataFree(Module, signedLengthBuffer);
-			dataFree(Module, messageBuffer);
-			dataFree(Module, privateKeyBuffer);
+			dataFree(signedBuffer);
+			dataFree(signedLengthBuffer);
+			dataFree(messageBuffer);
+			dataFree(privateKeyBuffer);
 		}
-	}),
+	}); },
 
 	signDetached: function (message, privateKey) {
 		return sphincs.sign(message, privateKey).then(function (signed) {
-			return new Uint8Array(signed.buffer, 0, bytes);
+			return new Uint8Array(
+				signed.buffer,
+				0,
+				bytes
+			);
 		});
 	},
 
-	open: getModuleWrapper(function (Module, signed, publicKey) {
-		var openedBuffer		= dataMalloc(Module, signed.length + bytes);
-		var openedLengthBuffer	= dataMalloc(Module, 8);
-		var signedBuffer		= dataMalloc(Module, signed.length);
-		var publicKeyBuffer		= dataMalloc(Module, publicKeyBytes);
+	open: function (signed, publicKey) { return initiated.then(function () {
+		var openedBuffer		= Module._malloc(signed.length + bytes);
+		var openedLengthBuffer	= Module._malloc(8);
+		var signedBuffer		= Module._malloc(signed.length);
+		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
 
 		Module.writeArrayToMemory(signed, signedBuffer);
 		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
@@ -150,34 +120,39 @@ var sphincs	= {
 				publicKeyBuffer
 			);
 
-			return dataReturn(returnValue, dataResult(Module, openedBuffer, signed.length - bytes));
+			return dataReturn(returnValue, dataResult(openedBuffer, signed.length - bytes));
 		}
 		finally {
-			dataFree(Module, openedBuffer);
-			dataFree(Module, openedLengthBuffer);
-			dataFree(Module, signedBuffer);
-			dataFree(Module, publicKeyBuffer);
+			dataFree(openedBuffer);
+			dataFree(openedLengthBuffer);
+			dataFree(signedBuffer);
+			dataFree(publicKeyBuffer);
 		}
-	}),
+	}); },
 
 	verifyDetached: function (signature, message, publicKey) {
-		var signed	= new Uint8Array(bytes + message.length);
-		signed.set(signature);
-		signed.set(message, bytes);
+		return initiated.then(function () {
+			var signed	= new Uint8Array(bytes + message.length);
+			signed.set(signature);
+			signed.set(message, bytes);
 
-		return sphincs.open(signed, publicKey).catch(function () {}).then(function (opened) {
-			try {
-				return opened !== undefined;
-			}
-			finally {
-				var arrs	= opened ? [signed, opened] : [signed];
-				for (var i = 0 ; i < arrs.length ; ++i) {
-					var arr	= arrs[i];
-					for (var j = 0 ; j < arr.length ; ++j) {
-						arr[j]	= 0;
+			return sphincs.open(
+				signed,
+				publicKey
+			).catch(function () {}).then(function (opened) {
+				try {
+					return opened !== undefined;
+				}
+				finally {
+					var arrs	= opened ? [signed, opened] : [signed];
+					for (var i = 0 ; i < arrs.length ; ++i) {
+						var arr	= arrs[i];
+						for (var j = 0 ; j < arr.length ; ++j) {
+							arr[j]	= 0;
+						}
 					}
 				}
-			}
+			});
 		});
 	}
 };
