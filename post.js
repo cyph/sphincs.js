@@ -1,4 +1,20 @@
 ;
+return Module;
+};
+
+var initiated, Module, publicKeyBytes, privateKeyBytes, bytes;
+function resetSphincsModule () {
+	Module		= getSphincsModule();
+	initiated	= Module.ready.then(function () {
+		Module._sphincsjs_init();
+
+		publicKeyBytes	= Module._sphincsjs_public_key_bytes();
+		privateKeyBytes	= Module._sphincsjs_secret_key_bytes();
+		bytes			= Module._sphincsjs_signature_bytes();
+	});
+}
+resetSphincsModule();
+
 
 function dataReturn (returnValue, result) {
 	if (returnValue === 0) {
@@ -17,23 +33,15 @@ function dataResult (buffer, bytes) {
 
 function dataFree (buffer) {
 	try {
-		Module._free(buffer);
+		if (typeof Module._free === 'function') {
+			Module._free(buffer);
+		}
 	}
 	catch (err) {
-		setTimeout(function () { throw err; }, 0);
+		resetSphincsModule();
+		console.error('Re-initializing SPHINCS due to _free failure:', err);
 	}
 }
-
-
-var publicKeyBytes, privateKeyBytes, bytes;
-
-var initiated	= Module.ready.then(function () {
-	Module._sphincsjs_init();
-
-	publicKeyBytes	= Module._sphincsjs_public_key_bytes();
-	privateKeyBytes	= Module._sphincsjs_secret_key_bytes();
-	bytes			= Module._sphincsjs_signature_bytes();
-});
 
 
 var sphincs	= {
@@ -41,11 +49,13 @@ var sphincs	= {
 	privateKeyBytes: initiated.then(function () { return privateKeyBytes; }),
 	bytes: initiated.then(function () { return bytes; }),
 
-	keyPair: function () { return initiated.then(function () {
-		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
-		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
+	keyPair: function (retries) { return initiated.then(function () {
+		var publicKeyBuffer, privateKeyBuffer;
 
 		try {
+			var publicKeyBuffer		= Module._malloc(publicKeyBytes);
+			var privateKeyBuffer	= Module._malloc(privateKeyBytes);
+
 			var returnValue	= Module._sphincsjs_keypair(
 				publicKeyBuffer,
 				privateKeyBuffer
@@ -56,24 +66,36 @@ var sphincs	= {
 				privateKey: dataResult(privateKeyBuffer, privateKeyBytes)
 			});
 		}
+		catch (err) {
+			retries = retries || 0;
+			if (retries >= 2) {
+				throw err;
+			}
+
+			console.error('Ignoring error and retrying sphincs.keyPair:', err);
+			resetSphincsModule();
+			return sphincs.keyPair(retries + 1);
+		}
 		finally {
 			dataFree(publicKeyBuffer);
 			dataFree(privateKeyBuffer);
 		}
 	}); },
 
-	sign: function (message, privateKey) { return initiated.then(function () {
-		var signedBytes	= message.length + bytes;
-
-		var signedBuffer		= Module._malloc(signedBytes);
-		var signedLengthBuffer	= Module._malloc(8);
-		var messageBuffer		= Module._malloc(message.length);
-		var privateKeyBuffer	= Module._malloc(privateKeyBytes);
-
-		Module.writeArrayToMemory(message, messageBuffer);
-		Module.writeArrayToMemory(privateKey, privateKeyBuffer);
+	sign: function (message, privateKey, retries) { return initiated.then(function () {
+		var signedBuffer, signedLengthBuffer, messageBuffer, privateKeyBuffer;
 
 		try {
+			var signedBytes	= message.length + bytes;
+
+			signedBuffer		= Module._malloc(signedBytes);
+			signedLengthBuffer	= Module._malloc(8);
+			messageBuffer		= Module._malloc(message.length);
+			privateKeyBuffer	= Module._malloc(privateKeyBytes);
+
+			Module.writeArrayToMemory(message, messageBuffer);
+			Module.writeArrayToMemory(privateKey, privateKeyBuffer);
+
 			var returnValue	= Module._sphincsjs_sign(
 				signedBuffer,
 				signedLengthBuffer,
@@ -83,6 +105,16 @@ var sphincs	= {
 			);
 
 			return dataReturn(returnValue, dataResult(signedBuffer, signedBytes));
+		}
+		catch (err) {
+			retries = retries || 0;
+			if (retries >= 2) {
+				throw err;
+			}
+
+			console.error('Ignoring error and retrying sphincs.sign:', err);
+			resetSphincsModule();
+			return sphincs.sign(message, privateKey, retries + 1);
 		}
 		finally {
 			dataFree(signedBuffer);
@@ -102,16 +134,18 @@ var sphincs	= {
 		});
 	},
 
-	open: function (signed, publicKey) { return initiated.then(function () {
-		var openedBuffer		= Module._malloc(signed.length + bytes);
-		var openedLengthBuffer	= Module._malloc(8);
-		var signedBuffer		= Module._malloc(signed.length);
-		var publicKeyBuffer		= Module._malloc(publicKeyBytes);
-
-		Module.writeArrayToMemory(signed, signedBuffer);
-		Module.writeArrayToMemory(publicKey, publicKeyBuffer);
+	open: function (signed, publicKey, retries) { return initiated.then(function () {
+		var openedBuffer, openedLengthBuffer, signedBuffer, publicKeyBuffer;
 
 		try {
+			openedBuffer		= Module._malloc(signed.length + bytes);
+			openedLengthBuffer	= Module._malloc(8);
+			signedBuffer		= Module._malloc(signed.length);
+			publicKeyBuffer		= Module._malloc(publicKeyBytes);
+
+			Module.writeArrayToMemory(signed, signedBuffer);
+			Module.writeArrayToMemory(publicKey, publicKeyBuffer);
+
 			var returnValue	= Module._sphincsjs_open(
 				openedBuffer,
 				openedLengthBuffer,
@@ -121,6 +155,16 @@ var sphincs	= {
 			);
 
 			return dataReturn(returnValue, dataResult(openedBuffer, signed.length - bytes));
+		}
+		catch (err) {
+			retries = retries || 0;
+			if (retries >= 2) {
+				throw err;
+			}
+
+			console.error('Ignoring error and retrying sphincs.open:', err);
+			resetSphincsModule();
+			return sphincs.open(signed, publicKey, retries + 1);
 		}
 		finally {
 			dataFree(openedBuffer);
