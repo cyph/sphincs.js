@@ -8,10 +8,10 @@ all:
 	git clone --depth 1 -b OpenSSL_1_0_2-stable https://github.com/openssl/openssl
 	cd openssl ; emconfigure ./config no-asm no-threads no-shared no-dso no-sse2
 
-	wget https://bench.cr.yp.to/supercop/supercop-20190816.tar.xz
-	unxz < supercop-20190816.tar.xz | tar -xf -
-	mv supercop-20190816 c_src
-	rm supercop-20190816.tar.xz
+	wget https://bench.cr.yp.to/supercop/supercop-20191221.tar.xz
+	unxz < supercop-20191221.tar.xz | tar -xf -
+	mv supercop-20191221 c_src
+	rm supercop-20191221.tar.xz
 
 	sed -i 's|crypto_hash|crypto_hash_blake256_ref|g' c_src/crypto_hash/blake256/ref/hash.c
 	sed -i 's|sigma|sigma_blake256_ref|g' c_src/crypto_hash/blake256/ref/hash.c
